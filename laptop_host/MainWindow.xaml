@@ -48,6 +48,8 @@
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <TextBlock Text="X3 connection" FontWeight="SemiBold" />
@@ -73,6 +75,12 @@
 
                 <TextBlock Grid.Row="7" Text="Teams mode" Margin="0,8,0,0" FontWeight="SemiBold" />
                 <TextBlock Grid.Row="7" Grid.Column="1" Margin="0,8,0,0" Text="{Binding TeamsModeText}" />
+
+                <TextBlock Grid.Row="8" Text="Button counter" Margin="0,8,0,0" FontWeight="SemiBold" />
+                <TextBlock Grid.Row="8" Grid.Column="1" Margin="0,8,0,0" Text="{Binding ButtonProtocolText}" />
+
+                <TextBlock Grid.Row="9" Text="Participation" Margin="0,8,0,0" FontWeight="SemiBold" />
+                <TextBlock Grid.Row="9" Grid.Column="1" Margin="0,8,0,0" Text="{Binding ParticipationText}" />
             </Grid>
         </Border>
 
@@ -119,34 +127,6 @@
                         <Button Content="Video"
                                 Click="ToggleVideo_Click" />
                     </UniformGrid>
-                </Grid>
-            </GroupBox>
-            <GroupBox Header="UIA window dump"
-                      Margin="0,0,0,10">
-                <Grid Margin="8">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="120" />
-                        <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="90" />
-                        <ColumnDefinition Width="90" />
-                    </Grid.ColumnDefinitions>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-
-                    <TextBlock Text="Window"
-                               VerticalAlignment="Center"
-                               Margin="0,0,8,0" />
-                    <TextBox Grid.Column="1"
-                             Text="{Binding WindowDumpTargetText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-                             Margin="0,0,8,0" />
-                    <Button Grid.Column="2"
-                            Content="Dump"
-                            Margin="0,0,8,0"
-                            Click="DumpWindow_Click" />
-                    <Button Grid.Column="3"
-                            Content="List"
-                            Click="ListWindows_Click" />
                 </Grid>
             </GroupBox>
             <GroupBox Header="Test status"

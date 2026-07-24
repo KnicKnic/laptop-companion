@@ -1,6 +1,7 @@
 #include "PowerStats.h"
 
 #include "AppLog.h"
+#include "DisplayWorker.h"
 #include "Settings.h"
 
 #include <esp_pm.h>
@@ -140,6 +141,7 @@ bool beginPowerStats() {
 
 PowerStatsSnapshot copyPowerStats() {
   PowerStatsSnapshot snapshot = stats;
+  snapshot.renderRequests = renderRequestCount();
   if (!loadPmProfilingStats(snapshot)) {
     const int64_t nowUs = esp_timer_get_time();
     snapshot.uptimeUs = nowUs > startedAtUs ? static_cast<uint64_t>(nowUs - startedAtUs) : 0;

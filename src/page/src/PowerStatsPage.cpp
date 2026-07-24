@@ -68,8 +68,9 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
            static_cast<unsigned long>(percentOf(power.freq40MhzUs, activeUs)),
            static_cast<unsigned long>(percentOf(power.freq10MhzUs, activeUs)));
   char freqLine2[96];
-  snprintf(freqLine2, sizeof(freqLine2), "Other active freq: %lu%%",
-           static_cast<unsigned long>(percentOf(power.freqOtherUs, activeUs)));
+  snprintf(freqLine2, sizeof(freqLine2), "Other active freq:%lu%%  renders:%lu",
+           static_cast<unsigned long>(percentOf(power.freqOtherUs, activeUs)),
+           static_cast<unsigned long>(power.renderRequests));
 
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 20), content.width, 44},
                         "Power Stats", title);

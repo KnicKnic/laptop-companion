@@ -22,12 +22,33 @@ class CompanionBleService {
 
   struct HostStatus {
     bool teamsDetected = false;
+    uint16_t teamsCounter = 0;
     bool meetingDetected = false;
+    uint16_t meetingCounter = 0;
     std::string meetingName;
     uint8_t microphone = 0;
+    uint16_t microphoneCounter = 0;
     uint8_t camera = 0;
+    uint16_t cameraCounter = 0;
     uint8_t hand = 0;
+    uint16_t handCounter = 0;
     std::string message;
+  };
+
+  struct PendingButtonStatus {
+    bool mutePending = false;
+    uint16_t muteCounter = 0;
+    uint32_t mutePressedAtMs = 0;
+    bool handPending = false;
+    uint16_t handCounter = 0;
+    uint32_t handPressedAtMs = 0;
+    bool cameraPending = false;
+    uint16_t cameraCounter = 0;
+    uint32_t cameraPressedAtMs = 0;
+    bool lastAcknowledgedValid = false;
+    uint8_t lastAcknowledgedButtonId = 0;
+    uint16_t lastAcknowledgedCounter = 0;
+    uint32_t lastAcknowledgedLatencyMs = 0;
   };
 
   struct ActivityStats {
@@ -41,6 +62,11 @@ class CompanionBleService {
     uint32_t hostStateChanges = 0;
     uint32_t buttonSubscribes = 0;
     uint32_t buttonNotifications = 0;
+    uint32_t participationTimerChecks = 0;
+    uint32_t participationSubscribes = 0;
+    uint32_t participationNotificationAttempts = 0;
+    uint32_t participationNotifications = 0;
+    uint32_t participationNotificationFailures = 0;
     uint32_t advertisingRestarts = 0;
   };
 
@@ -55,12 +81,14 @@ class CompanionBleService {
   bool isHostConnected() const { return hostConnected_; }
   bool isAdvertising() const;
   bool isButtonSubscribed() const { return buttonEventSubscribed_; }
-  bool notifyToggleMuteReleased();
-  bool notifyToggleHandReleased();
-  bool notifyToggleCameraReleased();
+  bool notifyToggleMuteReleased(uint16_t* counter = nullptr);
+  bool notifyToggleHandReleased(uint16_t* counter = nullptr);
+  bool notifyToggleCameraReleased(uint16_t* counter = nullptr);
   std::string getStatusText() const;
   HostStatus getHostStatus() const;
+  PendingButtonStatus getPendingButtonStatus() const;
   ActivityStats getActivityStats() const;
+  uint32_t getBluetoothSessionRenderRequests() const;
   std::string formatTimingDiagnostics() const;
   std::string formatActivityDeltaDiagnostics();
 
@@ -75,6 +103,7 @@ class CompanionBleService {
   void onHostHandStateWritten(NimBLECharacteristic* characteristic);
   void onHostStatusMessageWritten(NimBLECharacteristic* characteristic);
   void onButtonEventSubscribed(bool subscribed);
+  void onParticipationSubscribed(bool subscribed);
 
  private:
   CompanionBleService() = default;
@@ -82,7 +111,8 @@ class CompanionBleService {
   void resetSessionState();
   void publishHostStateValues();
   void publishDeviceInfo();
-  void publishButtonEvent(uint8_t buttonId, uint8_t action);
+  bool publishButtonEvent(uint8_t buttonId, uint8_t action, uint16_t* counter);
+  void publishParticipationEventIfDue();
   void requestConnectionParams(ConnectionPowerProfile profile, const char* reason);
   void requestIdleConnectionParamsIfReady(const char* reason);
   bool restartAdvertising(const char* reason);
@@ -106,6 +136,7 @@ class CompanionBleService {
   NimBLECharacteristic* hostHandStateCharacteristic_ = nullptr;
   NimBLECharacteristic* hostStatusMessageCharacteristic_ = nullptr;
   NimBLECharacteristic* buttonEventCharacteristic_ = nullptr;
+  NimBLECharacteristic* participationCharacteristic_ = nullptr;
   NimBLECharacteristic* deviceInfoCharacteristic_ = nullptr;
   TaskHandle_t workerTask_ = nullptr;
   mutable SemaphoreHandle_t stateMutex_ = nullptr;
@@ -115,6 +146,7 @@ class CompanionBleService {
   bool hostConnected_ = false;
   bool hostStateReceived_ = false;
   bool buttonEventSubscribed_ = false;
+  bool participationSubscribed_ = false;
   bool ownsBluetoothStack_ = false;
   bool modemSleepEnabled_ = false;
   bool statusChanged_ = false;
@@ -133,9 +165,14 @@ class CompanionBleService {
   unsigned long lastAdvertisingRestartAtMs_ = 0;
   unsigned long lastConnParamRequestAtMs_ = 0;
   unsigned long responsiveUntilMs_ = 0;
+  unsigned long participationUntilMs_ = 0;
+  unsigned long lastParticipationNotifyAtMs_ = 0;
   bool hasNegotiatedConnParams_ = false;
   uint16_t buttonEventSequence_ = 0;
+  uint32_t participationCounter_ = 0;
+  uint32_t bluetoothSessionRenderBaseline_ = 0;
   HostStatus hostStatus_;
+  PendingButtonStatus pendingButtons_;
   ActivityStats activityStats_;
   ActivityStats previousActivityStats_;
   bool hasPreviousActivityStats_ = false;

@@ -71,6 +71,10 @@ uint32_t requestRender(RenderKind kind, EInkDisplay::RefreshMode mode) {
   return renderSignal.signalWork(request);
 }
 
+uint32_t renderRequestCount() {
+  return renderSignal.latestSequence();
+}
+
 bool waitForRender(uint32_t sequence, TickType_t timeoutTicks) {
   return renderSignal.waitForAtLeast(sequence, timeoutTicks);
 }

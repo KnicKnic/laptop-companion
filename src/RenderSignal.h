@@ -24,6 +24,7 @@ class SequencedRenderSignal {
   RenderRequest waitForWork();
   void completeWork(uint32_t sequence);
   bool waitForAtLeast(uint32_t sequence, TickType_t timeoutTicks);
+  uint32_t latestSequence() const;
 
  private:
   static constexpr UBaseType_t kWorkAvailableQueueDepth = 20;
