@@ -939,8 +939,10 @@ namespace X3LaptopCompanion
             var delaysMs = new[] { 50, 100, 150, 250, 400, 650, 1000 };
             for (var attempt = 0; attempt < delaysMs.Length; attempt++)
             {
-                await Task.Delay(delaysMs[attempt]);
-                var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(false, explicitTargetProcessId));
+                await Task.Delay(delaysMs[attempt]).ConfigureAwait(false);
+                var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(false, explicitTargetProcessId))
+                    .ConfigureAwait(false);
+                var snapshotObservedAt = Stopwatch.GetTimestamp();
                 if (isExiting || Dispatcher.HasShutdownStarted)
                 {
                     return;
@@ -954,19 +956,35 @@ namespace X3LaptopCompanion
                 var canAcknowledgePendingButton = observedExpectedState && pendingButton.HasValue &&
                     PendingButtonMatchesCommand(command);
                 var shouldSendObservedState = observedExpectedState || !pendingButton.HasValue || finalAttempt;
+                var observedLatencyMs = commandStopwatch.ElapsedMilliseconds;
+                long? pendingObservedLatencyMs = null;
+                CompanionButton? observedPendingButton = null;
+                ushort observedPendingCounter = 0;
+                if (canAcknowledgePendingButton)
+                {
+                    observedPendingButton = pendingButton;
+                    observedPendingCounter = pendingButtonCounter;
+                    pendingObservedLatencyMs = pendingButtonReceivedTimestamp > 0
+                        ? ElapsedMillisecondsBetween(pendingButtonReceivedTimestamp, snapshotObservedAt)
+                        : observedLatencyMs;
+                }
+
                 HostLog.Write("Post-command Teams state refresh. command=" + commandName +
                     " attempt=" + (attempt + 1) + " delayMs=" + delaysMs[attempt] +
                     " expected=" + FormatTriState(expectedState) +
                     " observed=" + FormatTriState(observedState) +
                     " accepted=" + shouldSendObservedState +
                     " pendingAck=" + canAcknowledgePendingButton +
-                    " elapsedMs=" + commandStopwatch.ElapsedMilliseconds);
+                    " observedLatencyMs=" + observedLatencyMs +
+                    " pendingObservedLatencyMs=" +
+                    (pendingObservedLatencyMs.HasValue ? pendingObservedLatencyMs.Value.ToString() : "n/a"));
 
                 if (!shouldSendObservedState)
                 {
                     continue;
                 }
 
+                var dispatchQueuedAt = Stopwatch.GetTimestamp();
                 await Dispatcher.InvokeAsync(new System.Action(() =>
                 {
                     if (isExiting)
@@ -974,16 +992,20 @@ namespace X3LaptopCompanion
                         return;
                     }
 
-                    var observedLatencyMs = commandStopwatch.ElapsedMilliseconds;
-                    if (observedExpectedState && pendingButton.HasValue && PendingButtonMatchesCommand(command))
+                    var dispatchLagMs = ElapsedMillisecondsSince(dispatchQueuedAt);
+                    if (dispatchLagMs > 50)
                     {
-                        var pendingLatencyMs = pendingButtonReceivedTimestamp > 0
-                            ? ElapsedMillisecondsSince(pendingButtonReceivedTimestamp)
-                            : observedLatencyMs;
-                        pendingButtonObservedLatencyMs = pendingLatencyMs;
-                        ButtonProtocolText = ButtonName(pendingButton.Value) + " #" + pendingButtonCounter +
-                            " observed in " + pendingLatencyMs + "ms";
-                        DetailText = commandName + " observed in " + pendingLatencyMs + "ms.";
+                        HostLog.Write("Post-command UI dispatch lag. command=" + commandName +
+                            " lagMs=" + dispatchLagMs +
+                            " observedLatencyMs=" + observedLatencyMs);
+                    }
+
+                    if (observedExpectedState && observedPendingButton.HasValue && pendingObservedLatencyMs.HasValue)
+                    {
+                        pendingButtonObservedLatencyMs = pendingObservedLatencyMs.Value;
+                        ButtonProtocolText = ButtonName(observedPendingButton.Value) + " #" + observedPendingCounter +
+                            " observed in " + pendingObservedLatencyMs.Value + "ms";
+                        DetailText = commandName + " observed in " + pendingObservedLatencyMs.Value + "ms.";
                     }
                     else if (observedExpectedState)
                     {
@@ -1279,7 +1301,17 @@ namespace X3LaptopCompanion
                 return 0;
             }
 
-            return (long)((Stopwatch.GetTimestamp() - timestamp) * 1000.0 / Stopwatch.Frequency);
+            return ElapsedMillisecondsBetween(timestamp, Stopwatch.GetTimestamp());
+        }
+
+        private static long ElapsedMillisecondsBetween(long startedAt, long endedAt)
+        {
+            if (startedAt <= 0 || endedAt <= startedAt)
+            {
+                return 0;
+            }
+
+            return (long)((endedAt - startedAt) * 1000.0 / Stopwatch.Frequency);
         }
 
         private void StopServicesForExit()
