@@ -39,25 +39,6 @@ namespace X3LaptopCompanion
         public string Detail { get; }
     }
 
-    public sealed class TeamsCommandStateObservation
-    {
-        public TeamsCommandStateObservation(bool teamsDetected, bool meetingDetected, string meetingName,
-            CompanionTriState state, string detail)
-        {
-            TeamsDetected = teamsDetected;
-            MeetingDetected = meetingDetected;
-            MeetingName = meetingName ?? string.Empty;
-            State = state;
-            Detail = detail ?? string.Empty;
-        }
-
-        public bool TeamsDetected { get; }
-        public bool MeetingDetected { get; }
-        public string MeetingName { get; }
-        public CompanionTriState State { get; }
-        public string Detail { get; }
-    }
-
     public sealed class TeamsController
     {
         private const int MaxMeetingSearchDepth = 42;
@@ -66,6 +47,15 @@ namespace X3LaptopCompanion
         private static readonly string[] MicrophoneButtonNames = { "Mute mic", "Unmute mic" };
         private static readonly string[] CameraButtonNames = { "Turn camera on", "Turn camera off" };
         private static readonly string[] HandButtonNames = { "Raise your hand", "Lower your hand" };
+        private static readonly string[] MeetingButtonNames =
+        {
+            "Unmute mic",
+            "Mute mic",
+            "Turn camera off",
+            "Turn camera on",
+            "Raise your hand",
+            "Lower your hand"
+        };
         private IntPtr cachedMeetingWindowHandle = IntPtr.Zero;
         private int cachedMeetingTargetProcessId;
         private string cachedMeetingTargetProcessName = string.Empty;
@@ -174,6 +164,12 @@ namespace X3LaptopCompanion
         public TeamsMeetingSnapshot GetMeetingSnapshot(IReadOnlyCollection<int> audioProcessIds,
             int? explicitTargetProcessId)
         {
+            return GetMeetingSnapshot(audioProcessIds, explicitTargetProcessId, null, null);
+        }
+
+        public TeamsMeetingSnapshot GetMeetingSnapshot(IReadOnlyCollection<int> audioProcessIds,
+            int? explicitTargetProcessId, TeamsCommand? anchorCommand, CompanionTriState? expectedState)
+        {
             var audioMeetingProcessIds = audioProcessIds ?? Array.Empty<int>();
             var teamsDetected = IsTeamsRunning;
             if (!teamsDetected)
@@ -189,7 +185,8 @@ namespace X3LaptopCompanion
                     "Teams running; active meeting audio session not found");
             }
 
-            if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, out var context))
+            if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, anchorCommand, expectedState,
+                    out var context))
             {
                 return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
                     CompanionTriState.Unknown, CompanionTriState.Unknown, "Teams running; meeting controls not found");
@@ -218,51 +215,6 @@ namespace X3LaptopCompanion
 
             HostLog.Write("Teams UIA snapshot. " + detail);
             return new TeamsMeetingSnapshot(true, meetingDetected, meetingName, microphone, camera, hand, detail);
-        }
-
-        public TeamsCommandStateObservation GetCommandStateObservation(TeamsCommand command,
-            IReadOnlyCollection<int> audioProcessIds, int? explicitTargetProcessId,
-            CompanionTriState? expectedState = null)
-        {
-            var audioMeetingProcessIds = audioProcessIds ?? Array.Empty<int>();
-            var teamsDetected = IsTeamsRunning;
-            if (!teamsDetected)
-            {
-                return new TeamsCommandStateObservation(false, false, string.Empty, CompanionTriState.Unknown,
-                    "Teams not running");
-            }
-
-            if (audioMeetingProcessIds.Count == 0)
-            {
-                return new TeamsCommandStateObservation(true, false, string.Empty, CompanionTriState.Unknown,
-                    "Teams running; active meeting audio session not found");
-            }
-
-            if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, command, expectedState,
-                    out var context))
-            {
-                return new TeamsCommandStateObservation(true, false, string.Empty, CompanionTriState.Unknown,
-                    "Teams running; command controls not found");
-            }
-
-            var controls = context.Controls;
-            var commandState = GetCommandState(controls, command);
-            var meetingName = ExtractMeetingName(controls.FirstWindowName);
-            var meetingDetected = controls.HasMeetingControl;
-            if (!meetingDetected)
-            {
-                meetingName = string.Empty;
-                commandState = CompanionTriState.Unknown;
-            }
-
-            var detail = "target=" + DescribeTarget(context.Target) +
-                " hwnd=0x" + context.Hwnd.ToInt64().ToString("X") +
-                " command=" + CommandName(command) +
-                " activeAudio=True" +
-                " meeting=\"" + meetingName + "\" " + controls.DescribeState();
-
-            HostLog.Write("Teams UIA command state snapshot. " + detail);
-            return new TeamsCommandStateObservation(true, meetingDetected, meetingName, commandState, detail);
         }
 
         public static string CommandName(TeamsCommand command)
@@ -310,21 +262,6 @@ namespace X3LaptopCompanion
             }
 
             return controls.RaiseHandButton != null ? CompanionTriState.Off : CompanionTriState.Unknown;
-        }
-
-        private static CompanionTriState GetCommandState(MeetingControls controls, TeamsCommand command)
-        {
-            switch (command)
-            {
-                case TeamsCommand.ToggleMute:
-                    return GetMicrophoneState(controls);
-                case TeamsCommand.ToggleVideo:
-                    return GetCameraState(controls);
-                case TeamsCommand.ToggleHand:
-                    return GetHandState(controls);
-                default:
-                    return CompanionTriState.Unknown;
-            }
         }
 
         private static string ExtractMeetingName(string windowName)
@@ -737,77 +674,72 @@ namespace X3LaptopCompanion
 
         private static MeetingControls ReadMeetingControls(AutomationElement root)
         {
-            var controls = new MeetingControls();
-            controls.FirstWindowName = Safe(() => root.Current.Name);
-            controls.MuteMicButton = FindButtonByName(root, "Mute mic", controls);
-            controls.UnmuteMicButton = FindButtonByName(root, "Unmute mic", controls);
-            controls.TurnCameraOnButton = FindButtonByName(root, "Turn camera on", controls);
-            controls.TurnCameraOffButton = FindButtonByName(root, "Turn camera off", controls);
-            controls.RaiseHandButton = FindButtonByName(root, "Raise your hand", controls);
-            controls.LowerHandButton = FindButtonByName(root, "Lower your hand", controls);
-            return controls;
+            return ReadMeetingControls(root, null, null);
         }
 
         private static MeetingControls ReadMeetingControls(AutomationElement root, TeamsCommand command,
             CompanionTriState? expectedState)
         {
+            return ReadMeetingControls(root, (TeamsCommand?)command, expectedState);
+        }
+
+        private static MeetingControls ReadMeetingControls(AutomationElement root, TeamsCommand? anchorCommand,
+            CompanionTriState? expectedState)
+        {
             var controls = new MeetingControls();
             controls.FirstWindowName = Safe(() => root.Current.Name);
-            foreach (var name in GetCommandButtonNames(command, expectedState))
+            var anchorButton = FindFirstMeetingButton(root, anchorCommand, expectedState, controls);
+            if (anchorButton == null)
             {
-                var button = FindButtonByName(root, name, controls);
-                if (button == null)
-                {
-                    continue;
-                }
-
-                if (command == TeamsCommand.ToggleMute)
-                {
-                    if (NameEquals(name, "Mute mic"))
-                    {
-                        controls.MuteMicButton = button;
-                    }
-                    else
-                    {
-                        controls.UnmuteMicButton = button;
-                    }
-                }
-                else if (command == TeamsCommand.ToggleVideo)
-                {
-                    if (NameEquals(name, "Turn camera on"))
-                    {
-                        controls.TurnCameraOnButton = button;
-                    }
-                    else
-                    {
-                        controls.TurnCameraOffButton = button;
-                    }
-                }
-                else if (command == TeamsCommand.ToggleHand)
-                {
-                    if (NameEquals(name, "Raise your hand"))
-                    {
-                        controls.RaiseHandButton = button;
-                    }
-                    else
-                    {
-                        controls.LowerHandButton = button;
-                    }
-                }
+                return controls;
             }
 
+            var toolbarRoot = GetParentElement(anchorButton.Element) ?? root;
+            controls.AnchorButtonName = anchorButton.Name;
+            controls.ParentName = Safe(() => toolbarRoot.Current.Name);
+            controls.MuteMicButton = FindButtonByName(toolbarRoot, "Mute mic", controls);
+            controls.UnmuteMicButton = FindButtonByName(toolbarRoot, "Unmute mic", controls);
+            controls.TurnCameraOnButton = FindButtonByName(toolbarRoot, "Turn camera on", controls);
+            controls.TurnCameraOffButton = FindButtonByName(toolbarRoot, "Turn camera off", controls);
+            controls.RaiseHandButton = FindButtonByName(toolbarRoot, "Raise your hand", controls);
+            controls.LowerHandButton = FindButtonByName(toolbarRoot, "Lower your hand", controls);
             return controls;
         }
 
-        private static IReadOnlyCollection<string> GetCommandButtonNames(TeamsCommand command,
-            CompanionTriState? expectedState)
+        private static ButtonInfo FindFirstMeetingButton(AutomationElement root, TeamsCommand? anchorCommand,
+            CompanionTriState? expectedState, MeetingControls controls)
         {
-            if (!expectedState.HasValue)
+            if (root == null)
             {
-                return GetCommandButtonNames(command);
+                return null;
             }
 
-            switch (command)
+            foreach (var name in GetAnchorButtonNames(anchorCommand, expectedState))
+            {
+                var button = FindButtonByName(root, name, controls);
+                if (button != null)
+                {
+                    return button;
+                }
+            }
+
+            return null;
+        }
+
+        private static IReadOnlyCollection<string> GetAnchorButtonNames(TeamsCommand? anchorCommand,
+            CompanionTriState? expectedState)
+        {
+            if (!anchorCommand.HasValue)
+            {
+                return MeetingButtonNames;
+            }
+
+            if (!expectedState.HasValue)
+            {
+                return GetCommandButtonNames(anchorCommand.Value);
+            }
+
+            switch (anchorCommand.Value)
             {
                 case TeamsCommand.ToggleMute:
                     return expectedState.Value == CompanionTriState.Off
@@ -822,7 +754,24 @@ namespace X3LaptopCompanion
                         ? new[] { "Raise your hand", "Lower your hand" }
                         : new[] { "Lower your hand", "Raise your hand" };
                 default:
-                    return GetCommandButtonNames(command);
+                    return MeetingButtonNames;
+            }
+        }
+
+        private static AutomationElement GetParentElement(AutomationElement element)
+        {
+            if (element == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return TreeWalker.RawViewWalker.GetParent(element);
+            }
+            catch
+            {
+                return null;
             }
         }
 
@@ -1223,6 +1172,8 @@ namespace X3LaptopCompanion
             public ButtonInfo RaiseHandButton { get; set; }
             public ButtonInfo LowerHandButton { get; set; }
             public int NodesVisited { get; set; }
+            public string AnchorButtonName { get; set; }
+            public string ParentName { get; set; }
 
             public bool HasMeetingControl
             {
@@ -1270,6 +1221,8 @@ namespace X3LaptopCompanion
             {
                 return "nodes=" + NodesVisited +
                     " firstWindow=\"" + (FirstWindowName ?? string.Empty) + "\"" +
+                    " anchor=\"" + (AnchorButtonName ?? string.Empty) + "\"" +
+                    " parent=\"" + (ParentName ?? string.Empty) + "\"" +
                     " muteButton=\"" + ButtonName(MuteMicButton) + "\"" +
                     " unmuteButton=\"" + ButtonName(UnmuteMicButton) + "\"" +
                     " cameraOnButton=\"" + ButtonName(TurnCameraOnButton) + "\"" +
