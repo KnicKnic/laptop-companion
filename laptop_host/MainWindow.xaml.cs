@@ -730,13 +730,13 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            Dispatcher.BeginInvoke(new System.Action(() =>
+            Dispatcher.InvokeAsync(new System.Action(() =>
             {
                 if (!isExiting)
                 {
                     ParticipationText = "#" + participationEvent.Counter;
                 }
-            }));
+            }), DispatcherPriority.Send);
         }
 
         private void ApplyTestMode()

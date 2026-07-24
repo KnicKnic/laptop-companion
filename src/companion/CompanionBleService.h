@@ -55,8 +55,11 @@ class CompanionBleService {
     uint32_t hostStateChanges = 0;
     uint32_t buttonSubscribes = 0;
     uint32_t buttonNotifications = 0;
+    uint32_t participationTimerChecks = 0;
     uint32_t participationSubscribes = 0;
+    uint32_t participationNotificationAttempts = 0;
     uint32_t participationNotifications = 0;
+    uint32_t participationNotificationFailures = 0;
     uint32_t advertisingRestarts = 0;
   };
 

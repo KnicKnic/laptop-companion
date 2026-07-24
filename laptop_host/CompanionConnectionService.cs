@@ -34,6 +34,8 @@ namespace X3LaptopCompanion
         private int connecting;
         private bool intentionallyPausedAdvertisementWatcher;
         private bool disposed;
+        private uint lastParticipationCounter;
+        private DateTimeOffset? lastParticipationReceivedAt;
 
         public event EventHandler<CompanionConnectionStatus> StatusChanged;
         public event EventHandler<CompanionButtonEvent> ButtonEventReceived;
@@ -689,6 +691,8 @@ namespace X3LaptopCompanion
 
             deviceInfoCharacteristic = null;
             participationCharacteristic = null;
+            lastParticipationCounter = 0;
+            lastParticipationReceivedAt = null;
             hostTeamsStateCharacteristic = null;
             hostMicrophoneStateCharacteristic = null;
             hostCameraStateCharacteristic = null;
@@ -835,13 +839,22 @@ namespace X3LaptopCompanion
 
             var version = reader.ReadByte();
             var counter = reader.ReadUInt32();
+            var receivedAt = DateTimeOffset.Now;
             if (version != CompanionProtocol.ProtocolVersion)
             {
                 HostLog.Write("Participation notification ignored. version=" + version + " counter=" + counter);
                 return;
             }
 
-            HostLog.Write("Participation notification received. counter=" + counter);
+            var deltaCounter = lastParticipationCounter == 0 ? 0 : counter - lastParticipationCounter;
+            var elapsedMs = lastParticipationReceivedAt.HasValue
+                ? (receivedAt - lastParticipationReceivedAt.Value).TotalMilliseconds
+                : 0;
+            lastParticipationCounter = counter;
+            lastParticipationReceivedAt = receivedAt;
+            HostLog.Write("Participation notification received. counter=" + counter +
+                " deltaCounter=" + deltaCounter + " elapsedMs=" + elapsedMs.ToString("F0") +
+                " hostReceivedAt=" + receivedAt);
             ParticipationEventReceived?.Invoke(this, new CompanionParticipationEvent(counter));
         }
 

@@ -1025,30 +1025,56 @@ void CompanionBleService::publishParticipationEventIfDue() {
   if (!participationCharacteristic_) return;
 
   uint32_t counter = 0;
+  unsigned long now = 0;
+  unsigned long untilMs = 0;
+  unsigned long sinceLastMs = 0;
+  unsigned long notifyPeriodMs = 0;
+  uint16_t interval = 0;
+  uint16_t negotiatedInterval = 0;
+  uint16_t requestedMax = 0;
+  uint16_t connHandle = 0xFFFF;
   lockState();
-  const unsigned long now = millis();
+  now = millis();
+  activityStats_.participationTimerChecks++;
   if (!hostConnected_ || !participationSubscribed_ || participationUntilMs_ == 0) {
     unlockState();
+    logPrintf("Companion BLE: participation timer inactive connected=%d subscribed=%d untilMs=%lu nowMs=%lu\n",
+              hostConnected_ ? 1 : 0, participationSubscribed_ ? 1 : 0,
+              static_cast<unsigned long>(participationUntilMs_), static_cast<unsigned long>(now));
     return;
   }
 
+  untilMs = participationUntilMs_;
   if (static_cast<long>(now - participationUntilMs_) >= 0) {
     participationUntilMs_ = 0;
     unlockState();
+    logPrintf("Companion BLE: participation timer expired nowMs=%lu untilMs=%lu sent=%lu\n",
+              static_cast<unsigned long>(now), static_cast<unsigned long>(untilMs),
+              static_cast<unsigned long>(participationCounter_));
     return;
   }
 
-  uint16_t interval = negotiatedConnInterval_ != 0 ? negotiatedConnInterval_ : requestedConnIntervalMax_;
+  negotiatedInterval = negotiatedConnInterval_;
+  requestedMax = requestedConnIntervalMax_;
+  interval = negotiatedInterval != 0 ? negotiatedInterval : requestedMax;
   if (interval == 0) interval = kConnIntervalIdleMax;
-  const unsigned long notifyPeriodMs = std::max(20UL, static_cast<unsigned long>(interval));
+  notifyPeriodMs = std::max(20UL, static_cast<unsigned long>(interval));
+  sinceLastMs = lastParticipationNotifyAtMs_ == 0 ? 0 : now - lastParticipationNotifyAtMs_;
   if (lastParticipationNotifyAtMs_ != 0 && now - lastParticipationNotifyAtMs_ < notifyPeriodMs) {
     unlockState();
+    logPrintf("Companion BLE: participation timer tick waiting nowMs=%lu untilMs=%lu sinceLastMs=%lu periodMs=%lu "
+              "interval=%u negotiated=%u requestedMax=%u\n",
+              static_cast<unsigned long>(now), static_cast<unsigned long>(untilMs),
+              static_cast<unsigned long>(sinceLastMs), static_cast<unsigned long>(notifyPeriodMs),
+              static_cast<unsigned>(interval), static_cast<unsigned>(negotiatedInterval),
+              static_cast<unsigned>(requestedMax));
     return;
   }
 
   lastParticipationNotifyAtMs_ = now;
-  counter = ++participationCounter_;
-  activityStats_.participationNotifications++;
+  counter = participationCounter_ + 1;
+  connHandle = hostConnHandle_;
+  activityStats_.participationNotificationAttempts++;
   unlockState();
 
   const uint8_t payload[] = {
@@ -1059,7 +1085,22 @@ void CompanionBleService::publishParticipationEventIfDue() {
       static_cast<uint8_t>((counter >> 24) & 0xFF),
   };
   participationCharacteristic_->setValue(payload, sizeof(payload));
-  participationCharacteristic_->notify();
+  const bool sent = participationCharacteristic_->notify(payload, sizeof(payload), connHandle);
+  lockState();
+  if (sent) {
+    participationCounter_ = counter;
+    activityStats_.participationNotifications++;
+  } else {
+    activityStats_.participationNotificationFailures++;
+  }
+  unlockState();
+  logPrintf("Companion BLE: participation notify %s counter=%lu handle=%u nowMs=%lu untilMs=%lu sinceLastMs=%lu "
+            "periodMs=%lu interval=%u negotiated=%u requestedMax=%u\n",
+            sent ? "sent" : "failed", static_cast<unsigned long>(counter), static_cast<unsigned>(connHandle),
+            static_cast<unsigned long>(now), static_cast<unsigned long>(untilMs),
+            static_cast<unsigned long>(sinceLastMs), static_cast<unsigned long>(notifyPeriodMs),
+            static_cast<unsigned>(interval), static_cast<unsigned>(negotiatedInterval),
+            static_cast<unsigned>(requestedMax));
 }
 
 std::string CompanionBleService::formatTimingDiagnostics() const {
@@ -1126,15 +1167,21 @@ std::string CompanionBleService::formatActivityDeltaDiagnostics() {
   previousActivityStats_ = current;
   unlockState();
   char line[176];
-  snprintf(line, sizeof(line), "upd+%lu m+%lu wr+%lu chg+%lu sub+%lu ntf+%lu part+%lu req+%lu got+%lu adv+%lu",
+  snprintf(line, sizeof(line), "upd+%lu m+%lu wr+%lu chg+%lu sub+%lu ntf+%lu tick+%lu part+%lu/%lu/%lu req+%lu got+%lu adv+%lu",
            static_cast<unsigned long>(deltaCounter(current.updateCalls, previous.updateCalls)),
            static_cast<unsigned long>(deltaCounter(current.maintenanceRuns, previous.maintenanceRuns)),
            static_cast<unsigned long>(deltaCounter(current.hostWrites, previous.hostWrites)),
            static_cast<unsigned long>(deltaCounter(current.hostStateChanges, previous.hostStateChanges)),
            static_cast<unsigned long>(deltaCounter(current.buttonSubscribes, previous.buttonSubscribes)),
            static_cast<unsigned long>(deltaCounter(current.buttonNotifications, previous.buttonNotifications)),
+           static_cast<unsigned long>(deltaCounter(current.participationTimerChecks,
+                                                   previous.participationTimerChecks)),
+           static_cast<unsigned long>(deltaCounter(current.participationNotificationAttempts,
+                                                   previous.participationNotificationAttempts)),
            static_cast<unsigned long>(
                deltaCounter(current.participationNotifications, previous.participationNotifications)),
+           static_cast<unsigned long>(deltaCounter(current.participationNotificationFailures,
+                                                   previous.participationNotificationFailures)),
            static_cast<unsigned long>(deltaCounter(current.connParamRequests, previous.connParamRequests)),
            static_cast<unsigned long>(deltaCounter(current.connParamUpdates, previous.connParamUpdates)),
            static_cast<unsigned long>(deltaCounter(current.advertisingRestarts, previous.advertisingRestarts)));
