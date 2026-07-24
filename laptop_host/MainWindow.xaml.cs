@@ -45,6 +45,7 @@ namespace X3LaptopCompanion
         private ushort simulatedButtonSequence = 0x7E00;
         private CompanionButton? pendingButton;
         private ushort pendingButtonCounter;
+        private CompanionTriState? pendingButtonExpectedState;
         private ushort microphoneStateCounter;
         private ushort cameraStateCounter;
         private ushort handStateCounter;
@@ -52,6 +53,7 @@ namespace X3LaptopCompanion
         private bool hostStateWriteInFlight;
         private bool isExiting;
         private bool statusRefreshInFlight;
+        private bool teamsCommandRefreshInFlight;
         private HostStatePayload lastSentHostState;
         private HostStatePayload pendingHostState;
         private string pendingHostStateReason;
@@ -549,8 +551,10 @@ namespace X3LaptopCompanion
             if (IsTeamsDryRun)
             {
                 TeamsText = "Dry run";
+                MeetingText = "No";
                 CameraText = "Unknown";
                 MicrophoneText = "Unknown";
+                HandText = "Unknown";
                 return;
             }
 
@@ -590,6 +594,12 @@ namespace X3LaptopCompanion
                 return;
             }
 
+            if (teamsCommandRefreshInFlight)
+            {
+                HostLog.Write("Live Teams status refresh skipped; Teams command refresh is in flight.");
+                return;
+            }
+
             if (statusRefreshInFlight)
             {
                 HostLog.Write("Live Teams status refresh skipped; previous refresh is still running.");
@@ -614,6 +624,12 @@ namespace X3LaptopCompanion
                 {
                     if (isExiting)
                     {
+                        return;
+                    }
+
+                    if (teamsCommandRefreshInFlight)
+                    {
+                        HostLog.Write("Live Teams status refresh result discarded; Teams command refresh is in flight.");
                         return;
                     }
 
@@ -687,6 +703,7 @@ namespace X3LaptopCompanion
             lastButtonSequences[buttonEvent.Button] = buttonEvent.Sequence;
             pendingButton = buttonEvent.Button;
             pendingButtonCounter = buttonEvent.Sequence;
+            pendingButtonExpectedState = null;
             if (isExiting || Dispatcher.HasShutdownStarted)
             {
                 return;
@@ -793,9 +810,10 @@ namespace X3LaptopCompanion
                 snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot), "current", force);
         }
 
-        private void SendTeamsCommandFromUi(TeamsCommand command)
+        private async void SendTeamsCommandFromUi(TeamsCommand command)
         {
             var name = TeamsController.CommandName(command);
+            var stopwatch = Stopwatch.StartNew();
             HostLog.Write(name + " requested.");
             if (IsTeamsDryRun)
             {
@@ -808,21 +826,57 @@ namespace X3LaptopCompanion
             }
 
             var explicitPid = ParseCommandTargetProcessId();
-            EnsureAudioProcessCacheForCommand(explicitPid);
-            if (!teamsController.TrySendCommand(command, mediaStatusSensor.TeamsAudioProcessIds, explicitPid))
+            teamsCommandRefreshInFlight = true;
+            try
             {
-                HostLog.Write(name + " failed; Teams UIA control not found or not invokable.");
-                DetailText = "Teams control was not found. Start or join a meeting, then try again.";
-                var failedSnapshot = ReadTeamsMeetingSnapshot();
-                QueueHostStatusIfChanged(failedSnapshot.TeamsDetected, failedSnapshot.MeetingDetected,
-                    failedSnapshot.MeetingName, failedSnapshot.Microphone, failedSnapshot.Camera, failedSnapshot.Hand,
-                    StatusMessageForSnapshot(failedSnapshot), "teams command missing");
-                return;
-            }
+                var invoked = await Task.Run(() =>
+                {
+                    EnsureAudioProcessCacheForCommand(explicitPid);
+                    return teamsController.TrySendCommand(command, mediaStatusSensor.TeamsAudioProcessIds, explicitPid);
+                });
+                if (isExiting || Dispatcher.HasShutdownStarted)
+                {
+                    return;
+                }
 
-            HostLog.Write(name + " invoked in Teams.");
-            DetailText = name + " invoked in Teams.";
-            _ = RefreshAndSendCurrentStatusAfterInvokeAsync(name);
+                if (!invoked)
+                {
+                    HostLog.Write(name + " failed; Teams UIA control not found or not invokable.");
+                    DetailText = "Teams control was not found. Start or join a meeting, then try again.";
+                    var failedSnapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(true, explicitPid));
+                    if (isExiting || Dispatcher.HasShutdownStarted)
+                    {
+                        return;
+                    }
+
+                    QueueHostStatusIfChanged(failedSnapshot.TeamsDetected, failedSnapshot.MeetingDetected,
+                        failedSnapshot.MeetingName, failedSnapshot.Microphone, failedSnapshot.Camera,
+                        failedSnapshot.Hand, StatusMessageForSnapshot(failedSnapshot), "teams command missing");
+                    return;
+                }
+
+                HostLog.Write(name + " invoked in Teams. elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                DetailText = name + " invoked in Teams.";
+                var expectedState = GetExpectedStateForCommand(command);
+                if (pendingButton.HasValue && PendingButtonMatchesCommand(command))
+                {
+                    pendingButtonExpectedState = expectedState;
+                }
+
+                HostLog.Write("Post-command waiting for observed state. command=" + name +
+                    " expected=" + FormatTriState(expectedState) +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                await RefreshAndSendCurrentStatusAfterInvokeAsync(command, name, expectedState, explicitPid,
+                    stopwatch);
+            }
+            catch (System.Exception ex)
+            {
+                HostLog.Write("Teams command refresh failed.", ex);
+            }
+            finally
+            {
+                teamsCommandRefreshInFlight = false;
+            }
         }
 
         private void EnsureAudioProcessCacheForCommand(int? explicitPid)
@@ -842,20 +896,145 @@ namespace X3LaptopCompanion
             mediaStatusSensor.GetMicrophoneState(teamsProcessIds);
         }
 
-        private async Task RefreshAndSendCurrentStatusAfterInvokeAsync(string commandName)
+        private CompanionTriState? GetExpectedStateForCommand(TeamsCommand command)
         {
-            await Task.Delay(50);
-            Dispatcher.Invoke(() =>
+            if (lastSentHostState == null)
             {
-                HostLog.Write("Post-command Teams state refresh starting. command=" + commandName +
-                    " delayMs=50");
-                var snapshot = ReadTeamsMeetingSnapshot(refreshAudioProcessCache: false);
-                ApplyTeamsSnapshotToUi(snapshot);
-                QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
-                    snapshot.Microphone,
-                    snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
-                    "post-command refresh 50ms");
-            });
+                return null;
+            }
+
+            switch (command)
+            {
+                case TeamsCommand.ToggleMute:
+                    return TryToggleTriState(lastSentHostState.Microphone, out var microphone) ? microphone : null;
+                case TeamsCommand.ToggleVideo:
+                    return TryToggleTriState(lastSentHostState.Camera, out var camera) ? camera : null;
+                case TeamsCommand.ToggleHand:
+                    return TryToggleTriState(lastSentHostState.Hand, out var hand) ? hand : null;
+                default:
+                    return null;
+            }
+        }
+
+        private async Task RefreshAndSendCurrentStatusAfterInvokeAsync(TeamsCommand command, string commandName,
+            CompanionTriState? expectedState, int? explicitTargetProcessId, Stopwatch commandStopwatch)
+        {
+            var delaysMs = new[] { 50, 100, 150, 250, 400, 650, 1000 };
+            for (var attempt = 0; attempt < delaysMs.Length; attempt++)
+            {
+                await Task.Delay(delaysMs[attempt]);
+                var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(false, explicitTargetProcessId));
+                if (isExiting || Dispatcher.HasShutdownStarted)
+                {
+                    return;
+                }
+
+                var observedState = GetCommandField(snapshot, command);
+                var observedExpectedState = expectedState.HasValue &&
+                    observedState.HasValue &&
+                    observedState.Value == expectedState.Value;
+                var finalAttempt = attempt == delaysMs.Length - 1;
+                var canAcknowledgePendingButton = observedExpectedState && pendingButton.HasValue &&
+                    PendingButtonMatchesCommand(command);
+                var shouldSendObservedState = observedExpectedState || !pendingButton.HasValue || finalAttempt;
+                HostLog.Write("Post-command Teams state refresh. command=" + commandName +
+                    " attempt=" + (attempt + 1) + " delayMs=" + delaysMs[attempt] +
+                    " expected=" + FormatTriState(expectedState) +
+                    " observed=" + FormatTriState(observedState) +
+                    " accepted=" + shouldSendObservedState +
+                    " pendingAck=" + canAcknowledgePendingButton +
+                    " elapsedMs=" + commandStopwatch.ElapsedMilliseconds);
+
+                if (!shouldSendObservedState)
+                {
+                    continue;
+                }
+
+                await Dispatcher.InvokeAsync(new System.Action(() =>
+                {
+                    if (isExiting)
+                    {
+                        return;
+                    }
+
+                    ApplyTeamsSnapshotToUi(snapshot);
+                    QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
+                        snapshot.Microphone, snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
+                        "post-command refresh " + delaysMs[attempt] + "ms");
+                }), DispatcherPriority.Send);
+                return;
+            }
+        }
+
+        private static bool TryToggleTriState(CompanionTriState current, out CompanionTriState next)
+        {
+            if (current == CompanionTriState.On)
+            {
+                next = CompanionTriState.Off;
+                return true;
+            }
+
+            if (current == CompanionTriState.Off)
+            {
+                next = CompanionTriState.On;
+                return true;
+            }
+
+            next = CompanionTriState.Unknown;
+            return false;
+        }
+
+        private static CompanionTriState? GetCommandField(TeamsMeetingSnapshot snapshot, TeamsCommand command)
+        {
+            if (snapshot == null)
+            {
+                return null;
+            }
+
+            switch (command)
+            {
+                case TeamsCommand.ToggleMute:
+                    return snapshot.Microphone;
+                case TeamsCommand.ToggleVideo:
+                    return snapshot.Camera;
+                case TeamsCommand.ToggleHand:
+                    return snapshot.Hand;
+                default:
+                    return null;
+            }
+        }
+
+        private bool PendingButtonMatchesCommand(TeamsCommand command)
+        {
+            if (!pendingButton.HasValue)
+            {
+                return false;
+            }
+
+            return (pendingButton.Value == CompanionButton.ToggleMute && command == TeamsCommand.ToggleMute) ||
+                (pendingButton.Value == CompanionButton.ToggleCamera && command == TeamsCommand.ToggleVideo) ||
+                (pendingButton.Value == CompanionButton.ToggleHand && command == TeamsCommand.ToggleHand);
+        }
+
+        private static CompanionTriState StateForButton(CompanionButton button, CompanionTriState microphone,
+            CompanionTriState camera, CompanionTriState hand)
+        {
+            if (button == CompanionButton.ToggleMute)
+            {
+                return microphone;
+            }
+
+            if (button == CompanionButton.ToggleCamera)
+            {
+                return camera;
+            }
+
+            return hand;
+        }
+
+        private static string FormatTriState(CompanionTriState? value)
+        {
+            return value.HasValue ? value.Value.ToString() : "n/a";
         }
 
         private TeamsMeetingSnapshot ReadTeamsMeetingSnapshot()
@@ -965,7 +1144,8 @@ namespace X3LaptopCompanion
         private HostStatePayload BuildHostStatePayload(bool teamsDetected, bool meetingDetected, string meetingName,
             CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message)
         {
-            if (pendingButton.HasValue)
+            if (pendingButton.HasValue && pendingButtonExpectedState.HasValue &&
+                StateForButton(pendingButton.Value, microphone, camera, hand) == pendingButtonExpectedState.Value)
             {
                 var counter = (ushort)(pendingButtonCounter & CompanionProtocol.StateCounterMask);
                 if (pendingButton.Value == CompanionButton.ToggleMute)
@@ -1027,6 +1207,7 @@ namespace X3LaptopCompanion
             var clearedText = ButtonName(pendingButton.Value) + " #" + pendingButtonCounter + " acknowledged";
             pendingButton = null;
             pendingButtonCounter = 0;
+            pendingButtonExpectedState = null;
             Dispatcher.BeginInvoke(new System.Action(() =>
             {
                 if (!isExiting)
@@ -1056,6 +1237,8 @@ namespace X3LaptopCompanion
             hostStateWriteInFlight = false;
             pendingButton = null;
             pendingButtonCounter = 0;
+            pendingButtonExpectedState = null;
+            teamsCommandRefreshInFlight = false;
             ButtonProtocolText = "No pending button";
         }
 

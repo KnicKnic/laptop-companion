@@ -134,9 +134,7 @@ namespace X3LaptopCompanion
 
             if (audioMeetingProcessIds.Count == 0)
             {
-                return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
-                    CompanionTriState.Unknown, CompanionTriState.Unknown,
-                    "Teams running; meeting audio session not found");
+                HostLog.Write("Teams meeting snapshot continuing without WASAPI audio process ids.");
             }
 
             if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, out var context))
