@@ -11,8 +11,8 @@
 
 namespace {
 const char* triStateText(uint8_t value, const char* falseText, const char* trueText) {
-  if (value == 1) return trueText;
-  if (value == 0) return falseText;
+  if (value == 2) return trueText;
+  if (value == 1) return falseText;
   return "unknown";
 }
 
@@ -75,10 +75,12 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
            static_cast<unsigned long>(stats.gapConnects), static_cast<unsigned long>(stats.gapDisconnects),
            static_cast<unsigned long>(stats.connParamRequests), static_cast<unsigned long>(stats.connParamUpdates));
   char hostLine[112];
-  snprintf(hostLine, sizeof(hostLine), "Host writes:%lu state changes:%lu subscribes:%lu notifications:%lu",
+  snprintf(hostLine, sizeof(hostLine), "Host wr:%lu chg:%lu btn sub/ntf:%lu/%lu part sub/ntf:%lu/%lu",
            static_cast<unsigned long>(stats.hostWrites), static_cast<unsigned long>(stats.hostStateChanges),
            static_cast<unsigned long>(stats.buttonSubscribes),
-           static_cast<unsigned long>(stats.buttonNotifications));
+           static_cast<unsigned long>(stats.buttonNotifications),
+           static_cast<unsigned long>(stats.participationSubscribes),
+           static_cast<unsigned long>(stats.participationNotifications));
   char workerLine[112];
   snprintf(workerLine, sizeof(workerLine), "Worker updates:%lu maintenance:%lu adv restarts:%lu",
            static_cast<unsigned long>(stats.updateCalls), static_cast<unsigned long>(stats.maintenanceRuns),
@@ -87,9 +89,10 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   snprintf(meetingLine, sizeof(meetingLine), "Meeting:%s  Name:%s", host.meetingDetected ? "active" : "none",
            host.meetingName.empty() ? "--" : host.meetingName.c_str());
   char mediaLine[112];
-  snprintf(mediaLine, sizeof(mediaLine), "Mic:%s  Camera:%s  Hand:%s",
-           triStateText(host.microphone, "muted", "live"), triStateText(host.camera, "off", "on"),
-           triStateText(host.hand, "lowered", "raised"));
+  snprintf(mediaLine, sizeof(mediaLine), "Mic:%s #%u  Camera:%s #%u  Hand:%s #%u",
+           triStateText(host.microphone, "muted", "live"), static_cast<unsigned>(host.microphoneCounter),
+           triStateText(host.camera, "off", "on"), static_cast<unsigned>(host.cameraCounter),
+           triStateText(host.hand, "lowered", "raised"), static_cast<unsigned>(host.handCounter));
   char hostMessageLine[128];
   snprintf(hostMessageLine, sizeof(hostMessageLine), "Host text: %s", host.message.empty() ? "--" : host.message.c_str());
 

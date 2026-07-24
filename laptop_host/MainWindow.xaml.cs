@@ -20,6 +20,8 @@ namespace X3LaptopCompanion
         private string microphoneText = "Unknown";
         private string cameraText = "Unknown";
         private string handText = "Unknown";
+        private string buttonProtocolText = "No pending button";
+        private string participationText = "No participation pulses";
         private bool isTestMode;
         private string testModeText = "Off";
         private bool testTeamsDetected = true;
@@ -40,7 +42,12 @@ namespace X3LaptopCompanion
         private string windowDumpTargetText = string.Empty;
         private readonly System.Collections.Generic.Dictionary<CompanionButton, ushort> lastButtonSequences =
             new System.Collections.Generic.Dictionary<CompanionButton, ushort>();
-        private ushort simulatedButtonSequence = 0xFF00;
+        private ushort simulatedButtonSequence = 0x7E00;
+        private CompanionButton? pendingButton;
+        private ushort pendingButtonCounter;
+        private ushort microphoneStateCounter;
+        private ushort cameraStateCounter;
+        private ushort handStateCounter;
         private bool wasBleConnected;
         private bool hostStateWriteInFlight;
         private bool isExiting;
@@ -54,7 +61,9 @@ namespace X3LaptopCompanion
         private sealed class HostStatePayload
         {
             public HostStatePayload(bool teamsDetected, bool meetingDetected, string meetingName,
-                CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message)
+                CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message,
+                ushort teamsCounter, ushort meetingCounter, ushort microphoneCounter, ushort cameraCounter,
+                ushort handCounter)
             {
                 TeamsDetected = teamsDetected;
                 MeetingDetected = meetingDetected;
@@ -63,6 +72,11 @@ namespace X3LaptopCompanion
                 Camera = camera;
                 Hand = hand;
                 Message = string.IsNullOrWhiteSpace(message) ? string.Empty : message;
+                TeamsCounter = teamsCounter;
+                MeetingCounter = meetingCounter;
+                MicrophoneCounter = microphoneCounter;
+                CameraCounter = cameraCounter;
+                HandCounter = handCounter;
             }
 
             public bool TeamsDetected { get; }
@@ -72,6 +86,26 @@ namespace X3LaptopCompanion
             public CompanionTriState Camera { get; }
             public CompanionTriState Hand { get; }
             public string Message { get; }
+            public ushort TeamsCounter { get; }
+            public ushort MeetingCounter { get; }
+            public ushort MicrophoneCounter { get; }
+            public ushort CameraCounter { get; }
+            public ushort HandCounter { get; }
+
+            public ushort CounterFor(CompanionButton button)
+            {
+                if (button == CompanionButton.ToggleMute)
+                {
+                    return MicrophoneCounter;
+                }
+
+                if (button == CompanionButton.ToggleHand)
+                {
+                    return HandCounter;
+                }
+
+                return CameraCounter;
+            }
 
             public bool SameAs(HostStatePayload other)
             {
@@ -82,7 +116,12 @@ namespace X3LaptopCompanion
                     Microphone == other.Microphone &&
                     Camera == other.Camera &&
                     Hand == other.Hand &&
-                    string.Equals(Message, other.Message, System.StringComparison.Ordinal);
+                    string.Equals(Message, other.Message, System.StringComparison.Ordinal) &&
+                    TeamsCounter == other.TeamsCounter &&
+                    MeetingCounter == other.MeetingCounter &&
+                    MicrophoneCounter == other.MicrophoneCounter &&
+                    CameraCounter == other.CameraCounter &&
+                    HandCounter == other.HandCounter;
             }
         }
 
@@ -93,6 +132,7 @@ namespace X3LaptopCompanion
             HostLog.Write("Main window created.");
             connectionService.StatusChanged += OnConnectionStatusChanged;
             connectionService.ButtonEventReceived += OnButtonEventReceived;
+            connectionService.ParticipationEventReceived += OnParticipationEventReceived;
             statusTimer.Interval = System.TimeSpan.FromSeconds(2);
             statusTimer.Tick += OnStatusTimerTick;
             Loaded += OnLoaded;
@@ -135,6 +175,18 @@ namespace X3LaptopCompanion
         {
             get { return handText; }
             private set { SetField(ref handText, value, nameof(HandText)); }
+        }
+
+        public string ButtonProtocolText
+        {
+            get { return buttonProtocolText; }
+            private set { SetField(ref buttonProtocolText, value, nameof(ButtonProtocolText)); }
+        }
+
+        public string ParticipationText
+        {
+            get { return participationText; }
+            private set { SetField(ref participationText, value, nameof(ParticipationText)); }
         }
 
         public bool IsTestMode
@@ -298,6 +350,7 @@ namespace X3LaptopCompanion
             }
 
             simulatedButtonSequence++;
+            simulatedButtonSequence = NormalizeProtocolCounter(simulatedButtonSequence);
             OnButtonEventReceived(this, new CompanionButtonEvent(CompanionButton.ToggleMute,
                 CompanionButtonAction.Released, simulatedButtonSequence, 0));
         }
@@ -632,6 +685,8 @@ namespace X3LaptopCompanion
             }
 
             lastButtonSequences[buttonEvent.Button] = buttonEvent.Sequence;
+            pendingButton = buttonEvent.Button;
+            pendingButtonCounter = buttonEvent.Sequence;
             if (isExiting || Dispatcher.HasShutdownStarted)
             {
                 return;
@@ -644,6 +699,7 @@ namespace X3LaptopCompanion
                     return;
                 }
 
+                ButtonProtocolText = ButtonName(buttonEvent.Button) + " #" + buttonEvent.Sequence + " pressed";
                 TeamsCommand? command = null;
                 switch (buttonEvent.Button)
                 {
@@ -663,6 +719,22 @@ namespace X3LaptopCompanion
                     HostLog.Write("BLE button dispatching Teams command. button=" + buttonEvent.Button +
                         " command=" + TeamsController.CommandName(command.Value));
                     SendTeamsCommandFromUi(command.Value);
+                }
+            }));
+        }
+
+        private void OnParticipationEventReceived(object sender, CompanionParticipationEvent participationEvent)
+        {
+            if (isExiting || Dispatcher.HasShutdownStarted)
+            {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (!isExiting)
+                {
+                    ParticipationText = "#" + participationEvent.Counter;
                 }
             }));
         }
@@ -871,7 +943,7 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            var payload = new HostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
+            var payload = BuildHostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
                 message);
             if (!force && payload.SameAs(lastSentHostState))
             {
@@ -890,6 +962,31 @@ namespace X3LaptopCompanion
             _ = SendHostStatePayloadAsync(payload, reason);
         }
 
+        private HostStatePayload BuildHostStatePayload(bool teamsDetected, bool meetingDetected, string meetingName,
+            CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message)
+        {
+            if (pendingButton.HasValue)
+            {
+                var counter = (ushort)(pendingButtonCounter & CompanionProtocol.StateCounterMask);
+                if (pendingButton.Value == CompanionButton.ToggleMute)
+                {
+                    microphoneStateCounter = counter;
+                }
+                else if (pendingButton.Value == CompanionButton.ToggleHand)
+                {
+                    handStateCounter = counter;
+                }
+                else if (pendingButton.Value == CompanionButton.ToggleCamera)
+                {
+                    cameraStateCounter = counter;
+                }
+            }
+
+            return new HostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
+                message, 0, 0, microphoneStateCounter, cameraStateCounter,
+                handStateCounter);
+        }
+
         private async Task SendHostStatePayloadAsync(HostStatePayload payload, string reason)
         {
             hostStateWriteInFlight = true;
@@ -897,10 +994,13 @@ namespace X3LaptopCompanion
             {
                 HostLog.Write("Host state write queued. reason=" + reason);
                 var sent = await connectionService.SendHostStatusAsync(payload.TeamsDetected, payload.MeetingDetected,
-                    payload.MeetingName, payload.Microphone, payload.Camera, payload.Hand, payload.Message);
+                    payload.MeetingName, payload.Microphone, payload.Camera, payload.Hand, payload.Message,
+                    payload.TeamsCounter, payload.MeetingCounter, payload.MicrophoneCounter, payload.CameraCounter,
+                    payload.HandCounter);
                 if (sent)
                 {
                     lastSentHostState = payload;
+                    ClearPendingButtonIfAcknowledged(payload);
                 }
             }
             finally
@@ -917,11 +1017,32 @@ namespace X3LaptopCompanion
             }
         }
 
+        private void ClearPendingButtonIfAcknowledged(HostStatePayload payload)
+        {
+            if (!pendingButton.HasValue || payload.CounterFor(pendingButton.Value) != pendingButtonCounter)
+            {
+                return;
+            }
+
+            var clearedText = ButtonName(pendingButton.Value) + " #" + pendingButtonCounter + " acknowledged";
+            pendingButton = null;
+            pendingButtonCounter = 0;
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (!isExiting)
+                {
+                    ButtonProtocolText = "No pending button";
+                    DetailText = clearedText;
+                }
+            }));
+        }
+
         private void StopServicesForExit()
         {
             statusTimer.Stop();
             connectionService.StatusChanged -= OnConnectionStatusChanged;
             connectionService.ButtonEventReceived -= OnButtonEventReceived;
+            connectionService.ParticipationEventReceived -= OnParticipationEventReceived;
             ResetHostStateWriteCache();
             wasBleConnected = false;
             connectionService.Dispose();
@@ -933,6 +1054,9 @@ namespace X3LaptopCompanion
             pendingHostState = null;
             pendingHostStateReason = null;
             hostStateWriteInFlight = false;
+            pendingButton = null;
+            pendingButtonCounter = 0;
+            ButtonProtocolText = "No pending button";
         }
 
         private void OnTestStatusChanged(string reason)
@@ -983,6 +1107,27 @@ namespace X3LaptopCompanion
             }
 
             return value == CompanionTriState.On ? onText : "Unknown";
+        }
+
+        private static ushort NormalizeProtocolCounter(ushort value)
+        {
+            value = (ushort)(value & CompanionProtocol.StateCounterMask);
+            return value == 0 ? (ushort)1 : value;
+        }
+
+        private static string ButtonName(CompanionButton button)
+        {
+            if (button == CompanionButton.ToggleMute)
+            {
+                return "Mute";
+            }
+
+            if (button == CompanionButton.ToggleHand)
+            {
+                return "Hand";
+            }
+
+            return "Camera";
         }
 
         private bool SetField(ref string field, string value, string propertyName)

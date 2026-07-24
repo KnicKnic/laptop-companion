@@ -17,8 +17,11 @@ constexpr unsigned long kHandshakeTimeoutMs = 15000;
 constexpr unsigned long kAdvertisingRestartIntervalMs = 5000;
 constexpr unsigned long kConnParamRequestMinIntervalMs = 2500;
 constexpr unsigned long kButtonResponsiveWindowMs = 5000;
+constexpr unsigned long kParticipationWindowMs = 5000;
 constexpr unsigned long kWorkerPollMs = 500;
+constexpr unsigned long kWorkerPollActiveMs = 25;
 constexpr size_t kStatusMessageMaxLen = 48;
+constexpr size_t kEncodedStateLen = 2;
 
 constexpr uint16_t kConnIntervalResponsiveMin = 24;  // 30 ms
 constexpr uint16_t kConnIntervalResponsiveMax = 40;  // 50 ms
@@ -27,7 +30,7 @@ constexpr uint16_t kConnTimeoutResponsive = 400;     // 4 s
 
 constexpr uint16_t kConnIntervalIdleMin = 80;        // 100 ms
 constexpr uint16_t kConnIntervalIdleMax = 96;        // 120 ms
-constexpr uint16_t kConnLatencyIdle = 1;
+constexpr uint16_t kConnLatencyIdle = 39;
 constexpr uint16_t kConnTimeoutIdle = 1500;          // 15 s
 constexpr uint16_t kAdvIntervalLowPowerMin = 800;    // 500 ms
 constexpr uint16_t kAdvIntervalLowPowerMax = 1600;   // 1000 ms
@@ -74,6 +77,65 @@ void formatTenthsMs(uint32_t tenthsMs, char* buffer, size_t bufferSize) {
 
 uint32_t deltaCounter(uint32_t current, uint32_t previous) {
   return current >= previous ? current - previous : 0;
+}
+
+uint16_t nextButtonCounter(uint16_t current) {
+  uint16_t next = static_cast<uint16_t>((current + 1U) & CompanionProtocol::STATE_COUNTER_MASK);
+  return next == 0 ? 1 : next;
+}
+
+uint16_t decodeLe16(const std::string& value) {
+  return static_cast<uint16_t>(static_cast<uint8_t>(value[0])) |
+         static_cast<uint16_t>(static_cast<uint8_t>(value[1]) << 8);
+}
+
+uint8_t decodeTriStateByte(uint8_t value) {
+  if (value == static_cast<uint8_t>(CompanionProtocol::TriState::On) ||
+      value == static_cast<uint8_t>(CompanionProtocol::TriState::Off) ||
+      value == static_cast<uint8_t>(CompanionProtocol::TriState::Unknown)) {
+    return value;
+  }
+  return value != 0 ? static_cast<uint8_t>(CompanionProtocol::TriState::On)
+                    : static_cast<uint8_t>(CompanionProtocol::TriState::Off);
+}
+
+bool decodeBoolState(const std::string& value, bool* on, uint16_t* counter) {
+  if (value.empty() || !on || !counter) return false;
+  if (value.size() >= kEncodedStateLen) {
+    const uint16_t encoded = decodeLe16(value);
+    *on = (encoded & 0x0001U) != 0;
+    *counter = static_cast<uint16_t>(encoded >> 1);
+    return true;
+  }
+
+  *on = value[0] != 0;
+  *counter = 0;
+  return true;
+}
+
+bool decodeTriState(const std::string& value, uint8_t* state, uint16_t* counter) {
+  if (value.empty() || !state || !counter) return false;
+  if (value.size() >= kEncodedStateLen) {
+    const uint16_t encoded = decodeLe16(value);
+    *state = (encoded & 0x0001U) != 0 ? static_cast<uint8_t>(CompanionProtocol::TriState::On)
+                                      : static_cast<uint8_t>(CompanionProtocol::TriState::Off);
+    *counter = static_cast<uint16_t>(encoded >> 1);
+    return true;
+  }
+
+  *state = decodeTriStateByte(static_cast<uint8_t>(value[0]));
+  *counter = 0;
+  return true;
+}
+
+void setEncodedStateValue(NimBLECharacteristic* characteristic, bool on, uint16_t counter) {
+  if (!characteristic) return;
+  const uint16_t encoded = CompanionProtocol::encodeState(on, counter);
+  const uint8_t payload[] = {
+      static_cast<uint8_t>(encoded & 0xFF),
+      static_cast<uint8_t>((encoded >> 8) & 0xFF),
+  };
+  characteristic->setValue(payload, sizeof(payload));
 }
 
 class CompanionServerCallbacks : public NimBLEServerCallbacks {
@@ -143,6 +205,14 @@ class ButtonEventCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+class ParticipationCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic*, NimBLEConnInfo&, uint16_t subValue) override {
+    if (g_service) {
+      g_service->onParticipationSubscribed(subValue != 0);
+    }
+  }
+};
+
 CompanionServerCallbacks serverCallbacks;
 HostStateCallbacks teamsStateCallbacks(HostStateField::Teams);
 HostStateCallbacks meetingStateCallbacks(HostStateField::Meeting);
@@ -152,6 +222,7 @@ HostStateCallbacks cameraStateCallbacks(HostStateField::Camera);
 HostStateCallbacks handStateCallbacks(HostStateField::Hand);
 HostStateCallbacks statusMessageCallbacks(HostStateField::Message);
 ButtonEventCallbacks buttonEventCallbacks;
+ParticipationCallbacks participationCallbacks;
 }  // namespace
 
 CompanionBleService& CompanionBleService::getInstance() {
@@ -202,28 +273,32 @@ bool CompanionBleService::begin() {
 
   constexpr uint32_t stateProperties = NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR;
   hostTeamsStateCharacteristic_ =
-      service->createCharacteristic(CompanionProtocol::HOST_TEAMS_STATE_UUID, stateProperties, 1);
+      service->createCharacteristic(CompanionProtocol::HOST_TEAMS_STATE_UUID, stateProperties, kEncodedStateLen);
   hostMeetingStateCharacteristic_ =
-      service->createCharacteristic(CompanionProtocol::HOST_MEETING_STATE_UUID, stateProperties, 1);
+      service->createCharacteristic(CompanionProtocol::HOST_MEETING_STATE_UUID, stateProperties, kEncodedStateLen);
   hostMeetingNameCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::HOST_MEETING_NAME_UUID, stateProperties, kStatusMessageMaxLen);
   hostMicrophoneStateCharacteristic_ =
-      service->createCharacteristic(CompanionProtocol::HOST_MICROPHONE_STATE_UUID, stateProperties, 1);
+      service->createCharacteristic(CompanionProtocol::HOST_MICROPHONE_STATE_UUID, stateProperties, kEncodedStateLen);
   hostCameraStateCharacteristic_ =
-      service->createCharacteristic(CompanionProtocol::HOST_CAMERA_STATE_UUID, stateProperties, 1);
+      service->createCharacteristic(CompanionProtocol::HOST_CAMERA_STATE_UUID, stateProperties, kEncodedStateLen);
   hostHandStateCharacteristic_ =
-      service->createCharacteristic(CompanionProtocol::HOST_HAND_STATE_UUID, stateProperties, 1);
+      service->createCharacteristic(CompanionProtocol::HOST_HAND_STATE_UUID, stateProperties, kEncodedStateLen);
   hostStatusMessageCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::HOST_STATUS_MESSAGE_UUID, stateProperties, kStatusMessageMaxLen);
   buttonEventCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::BUTTON_EVENT_UUID,
                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY, 9);
+  participationCharacteristic_ =
+      service->createCharacteristic(CompanionProtocol::CONNECTION_PARTICIPATION_UUID,
+                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY, 5);
   deviceInfoCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::DEVICE_INFO_UUID, NIMBLE_PROPERTY::READ, 2);
 
   if (!hostTeamsStateCharacteristic_ || !hostMeetingStateCharacteristic_ || !hostMeetingNameCharacteristic_ ||
       !hostMicrophoneStateCharacteristic_ || !hostCameraStateCharacteristic_ || !hostHandStateCharacteristic_ ||
-      !hostStatusMessageCharacteristic_ || !buttonEventCharacteristic_ || !deviceInfoCharacteristic_) {
+      !hostStatusMessageCharacteristic_ || !buttonEventCharacteristic_ || !participationCharacteristic_ ||
+      !deviceInfoCharacteristic_) {
     logPrintf("Companion BLE: failed to create characteristics\n");
     end();
     return false;
@@ -237,6 +312,7 @@ bool CompanionBleService::begin() {
   hostHandStateCharacteristic_->setCallbacks(&handStateCallbacks);
   hostStatusMessageCharacteristic_->setCallbacks(&statusMessageCallbacks);
   buttonEventCharacteristic_->setCallbacks(&buttonEventCallbacks);
+  participationCharacteristic_->setCallbacks(&participationCallbacks);
 
   if (!server_->start()) {
     logPrintf("Companion BLE: failed to start GATT server\n");
@@ -302,6 +378,7 @@ void CompanionBleService::end() {
   hostHandStateCharacteristic_ = nullptr;
   hostStatusMessageCharacteristic_ = nullptr;
   buttonEventCharacteristic_ = nullptr;
+  participationCharacteristic_ = nullptr;
   deviceInfoCharacteristic_ = nullptr;
   ownsBluetoothStack_ = false;
 }
@@ -349,6 +426,13 @@ CompanionBleService::HostStatus CompanionBleService::getHostStatus() const {
   return status;
 }
 
+CompanionBleService::PendingButtonStatus CompanionBleService::getPendingButtonStatus() const {
+  lockState();
+  const PendingButtonStatus status = pendingButtons_;
+  unlockState();
+  return status;
+}
+
 CompanionBleService::ActivityStats CompanionBleService::getActivityStats() const {
   lockState();
   const ActivityStats stats = activityStats_;
@@ -356,7 +440,7 @@ CompanionBleService::ActivityStats CompanionBleService::getActivityStats() const
   return stats;
 }
 
-bool CompanionBleService::notifyToggleMuteReleased() {
+bool CompanionBleService::notifyToggleMuteReleased(uint16_t* counter) {
   lockState();
   const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
   unlockState();
@@ -365,12 +449,11 @@ bool CompanionBleService::notifyToggleMuteReleased() {
     return false;
   }
 
-  publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleMute),
-                     static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released));
-  return true;
+  return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleMute),
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), counter);
 }
 
-bool CompanionBleService::notifyToggleHandReleased() {
+bool CompanionBleService::notifyToggleHandReleased(uint16_t* counter) {
   lockState();
   const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
   unlockState();
@@ -379,12 +462,11 @@ bool CompanionBleService::notifyToggleHandReleased() {
     return false;
   }
 
-  publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleHand),
-                     static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released));
-  return true;
+  return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleHand),
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), counter);
 }
 
-bool CompanionBleService::notifyToggleCameraReleased() {
+bool CompanionBleService::notifyToggleCameraReleased(uint16_t* counter) {
   lockState();
   const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
   unlockState();
@@ -393,9 +475,8 @@ bool CompanionBleService::notifyToggleCameraReleased() {
     return false;
   }
 
-  publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleCamera),
-                     static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released));
-  return true;
+  return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleCamera),
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), counter);
 }
 
 void CompanionBleService::onHostConnected(uint16_t connHandle) {
@@ -455,10 +536,17 @@ void CompanionBleService::onHostTeamsStateWritten(NimBLECharacteristic* characte
     return;
   }
 
-  const bool next = value[0] != 0;
-  const bool changed = hostStatus_.teamsDetected != next;
+  bool next = false;
+  uint16_t counter = 0;
+  if (!decodeBoolState(value, &next, &counter)) {
+    unlockState();
+    return;
+  }
+
+  const bool changed = hostStatus_.teamsDetected != next || hostStatus_.teamsCounter != counter;
   const bool firstStateWrite = !hostStateReceived_;
   hostStatus_.teamsDetected = next;
+  hostStatus_.teamsCounter = counter;
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
     activityStats_.hostStateChanges++;
@@ -484,10 +572,17 @@ void CompanionBleService::onHostMeetingStateWritten(NimBLECharacteristic* charac
     return;
   }
 
-  const bool next = value[0] != 0;
-  const bool changed = hostStatus_.meetingDetected != next;
+  bool next = false;
+  uint16_t counter = 0;
+  if (!decodeBoolState(value, &next, &counter)) {
+    unlockState();
+    return;
+  }
+
+  const bool changed = hostStatus_.meetingDetected != next || hostStatus_.meetingCounter != counter;
   const bool firstStateWrite = !hostStateReceived_;
   hostStatus_.meetingDetected = next;
+  hostStatus_.meetingCounter = counter;
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
     activityStats_.hostStateChanges++;
@@ -538,10 +633,21 @@ void CompanionBleService::onHostMicrophoneStateWritten(NimBLECharacteristic* cha
     return;
   }
 
-  const uint8_t next = static_cast<uint8_t>(value[0]);
-  const bool changed = hostStatus_.microphone != next;
+  uint8_t next = 0;
+  uint16_t counter = 0;
+  if (!decodeTriState(value, &next, &counter)) {
+    unlockState();
+    return;
+  }
+
+  const bool acknowledged = pendingButtons_.mutePending && pendingButtons_.muteCounter == counter;
+  const bool changed = hostStatus_.microphone != next || hostStatus_.microphoneCounter != counter || acknowledged;
   const bool firstStateWrite = !hostStateReceived_;
   hostStatus_.microphone = next;
+  hostStatus_.microphoneCounter = counter;
+  if (acknowledged) {
+    pendingButtons_.mutePending = false;
+  }
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
     activityStats_.hostStateChanges++;
@@ -567,10 +673,21 @@ void CompanionBleService::onHostCameraStateWritten(NimBLECharacteristic* charact
     return;
   }
 
-  const uint8_t next = static_cast<uint8_t>(value[0]);
-  const bool changed = hostStatus_.camera != next;
+  uint8_t next = 0;
+  uint16_t counter = 0;
+  if (!decodeTriState(value, &next, &counter)) {
+    unlockState();
+    return;
+  }
+
+  const bool acknowledged = pendingButtons_.cameraPending && pendingButtons_.cameraCounter == counter;
+  const bool changed = hostStatus_.camera != next || hostStatus_.cameraCounter != counter || acknowledged;
   const bool firstStateWrite = !hostStateReceived_;
   hostStatus_.camera = next;
+  hostStatus_.cameraCounter = counter;
+  if (acknowledged) {
+    pendingButtons_.cameraPending = false;
+  }
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
     activityStats_.hostStateChanges++;
@@ -596,10 +713,21 @@ void CompanionBleService::onHostHandStateWritten(NimBLECharacteristic* character
     return;
   }
 
-  const uint8_t next = static_cast<uint8_t>(value[0]);
-  const bool changed = hostStatus_.hand != next;
+  uint8_t next = 0;
+  uint16_t counter = 0;
+  if (!decodeTriState(value, &next, &counter)) {
+    unlockState();
+    return;
+  }
+
+  const bool acknowledged = pendingButtons_.handPending && pendingButtons_.handCounter == counter;
+  const bool changed = hostStatus_.hand != next || hostStatus_.handCounter != counter || acknowledged;
   const bool firstStateWrite = !hostStateReceived_;
   hostStatus_.hand = next;
+  hostStatus_.handCounter = counter;
+  if (acknowledged) {
+    pendingButtons_.handPending = false;
+  }
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
     activityStats_.hostStateChanges++;
@@ -645,6 +773,15 @@ void CompanionBleService::onButtonEventSubscribed(bool subscribed) {
   requestIdleConnectionParamsIfReady("subscribe");
 }
 
+void CompanionBleService::onParticipationSubscribed(bool subscribed) {
+  lockState();
+  participationSubscribed_ = subscribed;
+  activityStats_.participationSubscribes++;
+  const StatusChangedCallback callback = markStatusChangedLocked();
+  unlockState();
+  notifyStatusChanged(callback);
+}
+
 void CompanionBleService::update() {
   lockState();
   if (!running_) {
@@ -653,6 +790,19 @@ void CompanionBleService::update() {
   }
 
   activityStats_.updateCalls++;
+  const bool shouldCheckParticipation = hostConnected_ && participationSubscribed_ && participationUntilMs_ != 0;
+  unlockState();
+
+  if (shouldCheckParticipation) {
+    publishParticipationEventIfDue();
+  }
+
+  lockState();
+  if (!running_) {
+    unlockState();
+    return;
+  }
+
   const unsigned long now = millis();
   if (lastMaintenanceAtMs_ != 0 && now - lastMaintenanceAtMs_ < kMaintenanceIntervalMs) {
     unlockState();
@@ -694,6 +844,7 @@ void CompanionBleService::resetSessionState() {
   hostConnected_ = false;
   hostStateReceived_ = false;
   buttonEventSubscribed_ = false;
+  participationSubscribed_ = false;
   connectionProfile_ = ConnectionPowerProfile::Unknown;
   requestedConnectionProfile_ = ConnectionPowerProfile::Unknown;
   hostConnHandle_ = 0xFFFF;
@@ -707,8 +858,11 @@ void CompanionBleService::resetSessionState() {
   hostConnectedAtMs_ = 0;
   lastConnParamRequestAtMs_ = 0;
   responsiveUntilMs_ = 0;
+  participationUntilMs_ = 0;
+  lastParticipationNotifyAtMs_ = 0;
   hasNegotiatedConnParams_ = false;
   hostStatus_ = HostStatus{};
+  pendingButtons_ = PendingButtonStatus{};
   unlockState();
 }
 
@@ -787,20 +941,18 @@ bool CompanionBleService::restartAdvertising(const char* reason) {
 
 void CompanionBleService::publishHostStateValues() {
   lockState();
-  const uint8_t teams = hostStatus_.teamsDetected ? 1 : 0;
-  const uint8_t meeting = hostStatus_.meetingDetected ? 1 : 0;
-  if (hostTeamsStateCharacteristic_) hostTeamsStateCharacteristic_->setValue(&teams, sizeof(teams));
-  if (hostMeetingStateCharacteristic_) hostMeetingStateCharacteristic_->setValue(&meeting, sizeof(meeting));
+  setEncodedStateValue(hostTeamsStateCharacteristic_, hostStatus_.teamsDetected, hostStatus_.teamsCounter);
+  setEncodedStateValue(hostMeetingStateCharacteristic_, hostStatus_.meetingDetected, hostStatus_.meetingCounter);
   if (hostMeetingNameCharacteristic_) hostMeetingNameCharacteristic_->setValue(hostStatus_.meetingName);
-  if (hostMicrophoneStateCharacteristic_) {
-    hostMicrophoneStateCharacteristic_->setValue(&hostStatus_.microphone, sizeof(hostStatus_.microphone));
-  }
-  if (hostCameraStateCharacteristic_) {
-    hostCameraStateCharacteristic_->setValue(&hostStatus_.camera, sizeof(hostStatus_.camera));
-  }
-  if (hostHandStateCharacteristic_) {
-    hostHandStateCharacteristic_->setValue(&hostStatus_.hand, sizeof(hostStatus_.hand));
-  }
+  setEncodedStateValue(hostMicrophoneStateCharacteristic_,
+                       hostStatus_.microphone == static_cast<uint8_t>(CompanionProtocol::TriState::On),
+                       hostStatus_.microphoneCounter);
+  setEncodedStateValue(hostCameraStateCharacteristic_,
+                       hostStatus_.camera == static_cast<uint8_t>(CompanionProtocol::TriState::On),
+                       hostStatus_.cameraCounter);
+  setEncodedStateValue(hostHandStateCharacteristic_,
+                       hostStatus_.hand == static_cast<uint8_t>(CompanionProtocol::TriState::On),
+                       hostStatus_.handCounter);
   if (hostStatusMessageCharacteristic_) hostStatusMessageCharacteristic_->setValue(hostStatus_.message);
   unlockState();
 }
@@ -810,42 +962,104 @@ void CompanionBleService::publishDeviceInfo() {
 
   const uint8_t payload[] = {
       CompanionProtocol::PROTOCOL_VERSION,
-      0x02,
+      0x03,
   };
   deviceInfoCharacteristic_->setValue(payload, sizeof(payload));
 }
 
-void CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action) {
-  if (!buttonEventCharacteristic_) return;
+bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, uint16_t* counter) {
+  if (!buttonEventCharacteristic_) return false;
 
   lockState();
-  responsiveUntilMs_ = millis() + kButtonResponsiveWindowMs;
+  buttonEventSequence_ = nextButtonCounter(buttonEventSequence_);
+  const uint16_t sequence = buttonEventSequence_;
+  const unsigned long now = millis();
+  responsiveUntilMs_ = now + kButtonResponsiveWindowMs;
+  participationUntilMs_ = now + kParticipationWindowMs;
+  lastParticipationNotifyAtMs_ = 0;
+  if (buttonId == static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleMute)) {
+    pendingButtons_.mutePending = true;
+    pendingButtons_.muteCounter = sequence;
+  } else if (buttonId == static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleHand)) {
+    pendingButtons_.handPending = true;
+    pendingButtons_.handCounter = sequence;
+  } else if (buttonId == static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleCamera)) {
+    pendingButtons_.cameraPending = true;
+    pendingButtons_.cameraCounter = sequence;
+  }
+  const StatusChangedCallback pendingCallback = markStatusChangedLocked();
   unlockState();
+  notifyStatusChanged(pendingCallback);
   requestConnectionParams(ConnectionPowerProfile::Responsive, "button_event");
 
-  buttonEventSequence_++;
   const uint32_t uptimeMs = millis();
   const uint8_t payload[] = {
       CompanionProtocol::PROTOCOL_VERSION,
       buttonId,
       action,
-      static_cast<uint8_t>(buttonEventSequence_ & 0xFF),
-      static_cast<uint8_t>((buttonEventSequence_ >> 8) & 0xFF),
+      static_cast<uint8_t>(sequence & 0xFF),
+      static_cast<uint8_t>((sequence >> 8) & 0xFF),
       static_cast<uint8_t>(uptimeMs & 0xFF),
       static_cast<uint8_t>((uptimeMs >> 8) & 0xFF),
       static_cast<uint8_t>((uptimeMs >> 16) & 0xFF),
       static_cast<uint8_t>((uptimeMs >> 24) & 0xFF),
   };
   logPrintf("Companion BLE: publishing button event id=%u action=%u seq=%u uptimeMs=%lu\n",
-            static_cast<unsigned>(buttonId), static_cast<unsigned>(action), static_cast<unsigned>(buttonEventSequence_),
+            static_cast<unsigned>(buttonId), static_cast<unsigned>(action), static_cast<unsigned>(sequence),
             static_cast<unsigned long>(uptimeMs));
   buttonEventCharacteristic_->setValue(payload, sizeof(payload));
   buttonEventCharacteristic_->notify();
+  if (counter) {
+    *counter = sequence;
+  }
   lockState();
   activityStats_.buttonNotifications++;
   const StatusChangedCallback callback = markStatusChangedLocked();
   unlockState();
   notifyStatusChanged(callback);
+  publishParticipationEventIfDue();
+  return true;
+}
+
+void CompanionBleService::publishParticipationEventIfDue() {
+  if (!participationCharacteristic_) return;
+
+  uint32_t counter = 0;
+  lockState();
+  const unsigned long now = millis();
+  if (!hostConnected_ || !participationSubscribed_ || participationUntilMs_ == 0) {
+    unlockState();
+    return;
+  }
+
+  if (static_cast<long>(now - participationUntilMs_) >= 0) {
+    participationUntilMs_ = 0;
+    unlockState();
+    return;
+  }
+
+  uint16_t interval = negotiatedConnInterval_ != 0 ? negotiatedConnInterval_ : requestedConnIntervalMax_;
+  if (interval == 0) interval = kConnIntervalIdleMax;
+  const unsigned long notifyPeriodMs = std::max(20UL, static_cast<unsigned long>(interval));
+  if (lastParticipationNotifyAtMs_ != 0 && now - lastParticipationNotifyAtMs_ < notifyPeriodMs) {
+    unlockState();
+    return;
+  }
+
+  lastParticipationNotifyAtMs_ = now;
+  counter = ++participationCounter_;
+  activityStats_.participationNotifications++;
+  unlockState();
+
+  const uint8_t payload[] = {
+      CompanionProtocol::PROTOCOL_VERSION,
+      static_cast<uint8_t>(counter & 0xFF),
+      static_cast<uint8_t>((counter >> 8) & 0xFF),
+      static_cast<uint8_t>((counter >> 16) & 0xFF),
+      static_cast<uint8_t>((counter >> 24) & 0xFF),
+  };
+  participationCharacteristic_->setValue(payload, sizeof(payload));
+  participationCharacteristic_->notify();
 }
 
 std::string CompanionBleService::formatTimingDiagnostics() const {
@@ -912,13 +1126,15 @@ std::string CompanionBleService::formatActivityDeltaDiagnostics() {
   previousActivityStats_ = current;
   unlockState();
   char line[176];
-  snprintf(line, sizeof(line), "upd+%lu m+%lu wr+%lu chg+%lu sub+%lu ntf+%lu req+%lu got+%lu adv+%lu",
+  snprintf(line, sizeof(line), "upd+%lu m+%lu wr+%lu chg+%lu sub+%lu ntf+%lu part+%lu req+%lu got+%lu adv+%lu",
            static_cast<unsigned long>(deltaCounter(current.updateCalls, previous.updateCalls)),
            static_cast<unsigned long>(deltaCounter(current.maintenanceRuns, previous.maintenanceRuns)),
            static_cast<unsigned long>(deltaCounter(current.hostWrites, previous.hostWrites)),
            static_cast<unsigned long>(deltaCounter(current.hostStateChanges, previous.hostStateChanges)),
            static_cast<unsigned long>(deltaCounter(current.buttonSubscribes, previous.buttonSubscribes)),
            static_cast<unsigned long>(deltaCounter(current.buttonNotifications, previous.buttonNotifications)),
+           static_cast<unsigned long>(
+               deltaCounter(current.participationNotifications, previous.participationNotifications)),
            static_cast<unsigned long>(deltaCounter(current.connParamRequests, previous.connParamRequests)),
            static_cast<unsigned long>(deltaCounter(current.connParamUpdates, previous.connParamUpdates)),
            static_cast<unsigned long>(deltaCounter(current.advertisingRestarts, previous.advertisingRestarts)));
@@ -982,7 +1198,10 @@ void CompanionBleService::workerTrampoline(void* self) {
 void CompanionBleService::workerLoop() {
   while (!workerStopRequested_) {
     update();
-    vTaskDelay(pdMS_TO_TICKS(kWorkerPollMs));
+    lockState();
+    const bool participationActive = hostConnected_ && participationSubscribed_ && participationUntilMs_ != 0;
+    unlockState();
+    vTaskDelay(pdMS_TO_TICKS(participationActive ? kWorkerPollActiveMs : kWorkerPollMs));
   }
   vTaskDelete(nullptr);
 }

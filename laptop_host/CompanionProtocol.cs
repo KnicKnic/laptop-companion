@@ -14,8 +14,20 @@ namespace X3LaptopCompanion
         public static readonly Guid HostMeetingStateUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a000008");
         public static readonly Guid HostHandStateUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a000009");
         public static readonly Guid HostMeetingNameUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000a");
+        public static readonly Guid ConnectionParticipationUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000b");
 
-        public const byte ProtocolVersion = 1;
+        public const byte ProtocolVersion = 2;
+        public const ushort StateCounterMask = 0x7FFF;
+
+        public static ushort EncodeState(bool on, ushort counter)
+        {
+            return (ushort)(((counter & StateCounterMask) << 1) | (on ? 1 : 0));
+        }
+
+        public static bool TriStateIsOn(CompanionTriState state)
+        {
+            return state == CompanionTriState.On;
+        }
     }
 
     public enum CompanionButton : byte
@@ -51,5 +63,15 @@ namespace X3LaptopCompanion
         public CompanionButtonAction Action { get; }
         public ushort Sequence { get; }
         public uint DeviceUptimeMs { get; }
+    }
+
+    public sealed class CompanionParticipationEvent
+    {
+        public CompanionParticipationEvent(uint counter)
+        {
+            Counter = counter;
+        }
+
+        public uint Counter { get; }
     }
 }

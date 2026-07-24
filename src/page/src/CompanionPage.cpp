@@ -37,6 +37,12 @@ const freeink::Icon& cameraStatusIcon(uint8_t state) {
   return triStateIs(state, CompanionProtocol::TriState::Off) ? icon_video_off_36 : icon_video_36;
 }
 
+std::string pressedText(const char* label, uint16_t counter) {
+  char text[32];
+  snprintf(text, sizeof(text), "%s #%u pressed", label, static_cast<unsigned>(counter));
+  return text;
+}
+
 void drawStatusTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile, const freeink::Icon& icon,
                     const char* label, const char* value, bool active) {
   const freeink::ui::Color ink = active ? freeink::ui::Color::White : freeink::ui::Color::Black;
@@ -131,15 +137,16 @@ void CompanionPage::onEnter() {
 bool CompanionPage::handleButton(ButtonPressKind kind) {
   CompanionBleService& service = CompanionBleService::getInstance();
   ensureStarted();
+  uint16_t counter = 0;
   switch (kind) {
     case ButtonPressKind::Left:
-      actionMessage_ = service.notifyToggleMuteReleased() ? "Mute sent" : "Host not ready";
+      actionMessage_ = service.notifyToggleMuteReleased(&counter) ? pressedText("Mute", counter) : "Host not ready";
       return true;
     case ButtonPressKind::Right:
-      actionMessage_ = service.notifyToggleHandReleased() ? "Hand sent" : "Host not ready";
+      actionMessage_ = service.notifyToggleHandReleased(&counter) ? pressedText("Hand", counter) : "Host not ready";
       return true;
     case ButtonPressKind::Confirm:
-      actionMessage_ = service.notifyToggleCameraReleased() ? "Camera sent" : "Host not ready";
+      actionMessage_ = service.notifyToggleCameraReleased(&counter) ? pressedText("Camera", counter) : "Host not ready";
       return true;
     default:
       return false;
@@ -157,6 +164,7 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
   auto tx = beginRender(mode);
   CompanionBleService& service = CompanionBleService::getInstance();
   const CompanionBleService::HostStatus host = service.getHostStatus();
+  const CompanionBleService::PendingButtonStatus pending = service.getPendingButtonStatus();
 
   const freeink::ui::Rect content = getPagePanel(target);
 
@@ -199,10 +207,22 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
   drawStatusTile(target, freeink::ui::Rect{content.x, static_cast<int16_t>(mediaTileY + 124), content.width, 88},
                  icon_activity_36, "Hand", triStateText(host.hand, "Lowered", "Raised"), handRaised);
 
-  if (!actionMessage_.empty()) {
+  std::string pendingText;
+  if (pending.mutePending) {
+    pendingText = pressedText("Mute", pending.muteCounter);
+  } else if (pending.handPending) {
+    pendingText = pressedText("Hand", pending.handCounter);
+  } else if (pending.cameraPending) {
+    pendingText = pressedText("Camera", pending.cameraCounter);
+  } else if (!actionMessage_.empty() && actionMessage_.find("pressed") != std::string::npos) {
+    actionMessage_.clear();
+  }
+
+  const std::string& message = pendingText.empty() ? actionMessage_ : pendingText;
+  if (!message.empty()) {
     freeink::ui::drawText(target,
                           freeink::ui::Rect{content.x, static_cast<int16_t>(content.bottom() - 72), content.width, 30},
-                          actionMessage_.c_str(), center);
+                          message.c_str(), center);
   }
 
   drawPageChrome(target);
