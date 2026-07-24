@@ -241,13 +241,10 @@ namespace X3LaptopCompanion
                             continue;
                         }
 
-                        if (TryGetEndpointMuted(device, out var endpointMuted) && endpointMuted)
-                        {
-                            return CompanionTriState.Off;
-                        }
-
+                        var endpointMuted = TryGetEndpointMuted(device, out var muted) && muted;
                         var deviceSessionState = GetDeviceTeamsSessionState(device, processSet, matchedAudioProcessIds);
-                        if (deviceSessionState == CompanionTriState.Off)
+                        if (deviceSessionState == CompanionTriState.Off ||
+                            (endpointMuted && deviceSessionState.HasValue))
                         {
                             return CompanionTriState.Off;
                         }

@@ -124,6 +124,7 @@ namespace X3LaptopCompanion
         public TeamsMeetingSnapshot GetMeetingSnapshot(IReadOnlyCollection<int> audioProcessIds,
             int? explicitTargetProcessId)
         {
+            var audioMeetingProcessIds = audioProcessIds ?? Array.Empty<int>();
             var teamsDetected = IsTeamsRunning;
             if (!teamsDetected)
             {
@@ -131,7 +132,14 @@ namespace X3LaptopCompanion
                     CompanionTriState.Unknown, CompanionTriState.Unknown, "Teams not running");
             }
 
-            if (!TryFindMeetingWindow(audioProcessIds, explicitTargetProcessId, out var context))
+            if (audioMeetingProcessIds.Count == 0)
+            {
+                return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
+                    CompanionTriState.Unknown, CompanionTriState.Unknown,
+                    "Teams running; meeting audio session not found");
+            }
+
+            if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, out var context))
             {
                 return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
                     CompanionTriState.Unknown, CompanionTriState.Unknown, "Teams running; meeting controls not found");
