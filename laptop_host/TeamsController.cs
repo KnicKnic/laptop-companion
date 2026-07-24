@@ -134,7 +134,9 @@ namespace X3LaptopCompanion
 
             if (audioMeetingProcessIds.Count == 0)
             {
-                HostLog.Write("Teams meeting snapshot continuing without WASAPI audio process ids.");
+                return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
+                    CompanionTriState.Unknown, CompanionTriState.Unknown,
+                    "Teams running; active meeting audio session not found");
             }
 
             if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, out var context))
@@ -150,8 +152,7 @@ namespace X3LaptopCompanion
             var camera = GetCameraState(controls);
             var hand = GetHandState(controls);
             var meetingName = ExtractMeetingName(controls.FirstWindowName);
-            var hasActiveMeetingAudio = audioMeetingProcessIds.Count > 0;
-            var meetingDetected = hasActiveMeetingAudio && controls.HasMeetingControl;
+            var meetingDetected = controls.HasMeetingControl;
             if (!meetingDetected)
             {
                 meetingName = string.Empty;
@@ -162,7 +163,7 @@ namespace X3LaptopCompanion
 
             var detail = "target=" + DescribeTarget(context.Target) +
                 " hwnd=0x" + context.Hwnd.ToInt64().ToString("X") +
-                " activeAudio=" + hasActiveMeetingAudio +
+                " activeAudio=True" +
                 " meeting=\"" + meetingName + "\" " + controls.DescribeState();
 
             HostLog.Write("Teams UIA snapshot. " + detail);
