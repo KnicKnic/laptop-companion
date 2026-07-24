@@ -646,7 +646,14 @@ void CompanionBleService::onHostMicrophoneStateWritten(NimBLECharacteristic* cha
   hostStatus_.microphone = next;
   hostStatus_.microphoneCounter = counter;
   if (acknowledged) {
+    const uint32_t latencyMs = millis() - pendingButtons_.mutePressedAtMs;
     pendingButtons_.mutePending = false;
+    pendingButtons_.lastAcknowledgedValid = true;
+    pendingButtons_.lastAcknowledgedButtonId = static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleMute);
+    pendingButtons_.lastAcknowledgedCounter = counter;
+    pendingButtons_.lastAcknowledgedLatencyMs = latencyMs;
+    logPrintf("Companion BLE: mute button seq=%u acknowledged roundtripMs=%lu\n", static_cast<unsigned>(counter),
+              static_cast<unsigned long>(latencyMs));
   }
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
@@ -686,7 +693,14 @@ void CompanionBleService::onHostCameraStateWritten(NimBLECharacteristic* charact
   hostStatus_.camera = next;
   hostStatus_.cameraCounter = counter;
   if (acknowledged) {
+    const uint32_t latencyMs = millis() - pendingButtons_.cameraPressedAtMs;
     pendingButtons_.cameraPending = false;
+    pendingButtons_.lastAcknowledgedValid = true;
+    pendingButtons_.lastAcknowledgedButtonId = static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleCamera);
+    pendingButtons_.lastAcknowledgedCounter = counter;
+    pendingButtons_.lastAcknowledgedLatencyMs = latencyMs;
+    logPrintf("Companion BLE: camera button seq=%u acknowledged roundtripMs=%lu\n", static_cast<unsigned>(counter),
+              static_cast<unsigned long>(latencyMs));
   }
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
@@ -726,7 +740,14 @@ void CompanionBleService::onHostHandStateWritten(NimBLECharacteristic* character
   hostStatus_.hand = next;
   hostStatus_.handCounter = counter;
   if (acknowledged) {
+    const uint32_t latencyMs = millis() - pendingButtons_.handPressedAtMs;
     pendingButtons_.handPending = false;
+    pendingButtons_.lastAcknowledgedValid = true;
+    pendingButtons_.lastAcknowledgedButtonId = static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleHand);
+    pendingButtons_.lastAcknowledgedCounter = counter;
+    pendingButtons_.lastAcknowledgedLatencyMs = latencyMs;
+    logPrintf("Companion BLE: hand button seq=%u acknowledged roundtripMs=%lu\n", static_cast<unsigned>(counter),
+              static_cast<unsigned long>(latencyMs));
   }
   hostStateReceived_ = true;
   if (changed || firstStateWrite) {
@@ -980,12 +1001,15 @@ bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, u
   if (buttonId == static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleMute)) {
     pendingButtons_.mutePending = true;
     pendingButtons_.muteCounter = sequence;
+    pendingButtons_.mutePressedAtMs = now;
   } else if (buttonId == static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleHand)) {
     pendingButtons_.handPending = true;
     pendingButtons_.handCounter = sequence;
+    pendingButtons_.handPressedAtMs = now;
   } else if (buttonId == static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleCamera)) {
     pendingButtons_.cameraPending = true;
     pendingButtons_.cameraCounter = sequence;
+    pendingButtons_.cameraPressedAtMs = now;
   }
   const StatusChangedCallback pendingCallback = markStatusChangedLocked();
   unlockState();

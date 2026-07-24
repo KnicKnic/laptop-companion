@@ -38,10 +38,17 @@ class CompanionBleService {
   struct PendingButtonStatus {
     bool mutePending = false;
     uint16_t muteCounter = 0;
+    uint32_t mutePressedAtMs = 0;
     bool handPending = false;
     uint16_t handCounter = 0;
+    uint32_t handPressedAtMs = 0;
     bool cameraPending = false;
     uint16_t cameraCounter = 0;
+    uint32_t cameraPressedAtMs = 0;
+    bool lastAcknowledgedValid = false;
+    uint8_t lastAcknowledgedButtonId = 0;
+    uint16_t lastAcknowledgedCounter = 0;
+    uint32_t lastAcknowledgedLatencyMs = 0;
   };
 
   struct ActivityStats {

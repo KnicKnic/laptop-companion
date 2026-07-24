@@ -43,6 +43,26 @@ std::string pressedText(const char* label, uint16_t counter) {
   return text;
 }
 
+const char* buttonLabel(uint8_t buttonId) {
+  switch (static_cast<CompanionProtocol::ButtonId>(buttonId)) {
+    case CompanionProtocol::ButtonId::ToggleMute:
+      return "Mute";
+    case CompanionProtocol::ButtonId::ToggleHand:
+      return "Hand";
+    case CompanionProtocol::ButtonId::ToggleCamera:
+      return "Camera";
+    default:
+      return "Button";
+  }
+}
+
+std::string acknowledgedText(const char* label, uint16_t counter, uint32_t latencyMs) {
+  char text[48];
+  snprintf(text, sizeof(text), "%s #%u roundtrip %lums", label, static_cast<unsigned>(counter),
+           static_cast<unsigned long>(latencyMs));
+  return text;
+}
+
 void drawStatusTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile, const freeink::Icon& icon,
                     const char* label, const char* value, bool active) {
   const freeink::ui::Color ink = active ? freeink::ui::Color::White : freeink::ui::Color::Black;
@@ -216,6 +236,11 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
     pendingText = pressedText("Camera", pending.cameraCounter);
   } else if (!actionMessage_.empty() && actionMessage_.find("pressed") != std::string::npos) {
     actionMessage_.clear();
+  }
+
+  if (pendingText.empty() && actionMessage_.empty() && pending.lastAcknowledgedValid) {
+    pendingText = acknowledgedText(buttonLabel(pending.lastAcknowledgedButtonId), pending.lastAcknowledgedCounter,
+                                   pending.lastAcknowledgedLatencyMs);
   }
 
   const std::string& message = pendingText.empty() ? actionMessage_ : pendingText;
