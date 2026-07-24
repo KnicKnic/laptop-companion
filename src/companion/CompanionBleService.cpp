@@ -834,7 +834,8 @@ void CompanionBleService::update() {
   activityStats_.maintenanceRuns++;
   const bool connected = hostConnected_;
   const bool responsiveDue = responsiveUntilMs_ != 0 && static_cast<long>(now - responsiveUntilMs_) >= 0;
-  const bool staleHandshake = hostConnectedAtMs_ != 0 && !hostStateReceived_ &&
+  const bool hostSubscribed = buttonEventSubscribed_ || participationSubscribed_;
+  const bool staleHandshake = hostConnectedAtMs_ != 0 && !hostStateReceived_ && !hostSubscribed &&
                               now - hostConnectedAtMs_ > kHandshakeTimeoutMs && server_;
   const uint16_t staleHandle = hostConnHandle_;
   unlockState();

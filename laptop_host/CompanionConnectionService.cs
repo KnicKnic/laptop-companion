@@ -355,7 +355,7 @@ namespace X3LaptopCompanion
 
         private void OnAdvertisementWatcherStopped(BluetoothLEAdvertisementWatcher sender, BluetoothLEAdvertisementWatcherStoppedEventArgs args)
         {
-            HostLog.Write("BLE advertisement watcher stopped. Status=" + sender.Status + " Error=" + args.Error);
+            HostLog.Write("BLE advertisement watcher stopped. Status=" + sender.Status + " BluetoothStatus=" + args.Error);
             if (intentionallyPausedAdvertisementWatcher)
             {
                 return;
@@ -369,7 +369,7 @@ namespace X3LaptopCompanion
 
         private void OnGattSessionStatusChanged(GattSession sender, GattSessionStatusChangedEventArgs args)
         {
-            HostLog.Write("GattSession status changed. Status=" + args.Status + " Error=" + args.Error);
+            HostLog.Write("GattSession status changed. Status=" + args.Status + " BluetoothStatus=" + args.Error);
             if (disposed || connecting != 0 || args.Status != GattSessionStatus.Closed)
             {
                 return;

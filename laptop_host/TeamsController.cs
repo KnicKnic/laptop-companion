@@ -150,9 +150,19 @@ namespace X3LaptopCompanion
             var camera = GetCameraState(controls);
             var hand = GetHandState(controls);
             var meetingName = ExtractMeetingName(controls.FirstWindowName);
-            var meetingDetected = controls.HasMeetingControl || !string.IsNullOrWhiteSpace(meetingName);
+            var hasActiveMeetingAudio = audioMeetingProcessIds.Count > 0;
+            var meetingDetected = hasActiveMeetingAudio && controls.HasMeetingControl;
+            if (!meetingDetected)
+            {
+                meetingName = string.Empty;
+                microphone = CompanionTriState.Unknown;
+                camera = CompanionTriState.Unknown;
+                hand = CompanionTriState.Unknown;
+            }
+
             var detail = "target=" + DescribeTarget(context.Target) +
                 " hwnd=0x" + context.Hwnd.ToInt64().ToString("X") +
+                " activeAudio=" + hasActiveMeetingAudio +
                 " meeting=\"" + meetingName + "\" " + controls.DescribeState();
 
             HostLog.Write("Teams UIA snapshot. " + detail);

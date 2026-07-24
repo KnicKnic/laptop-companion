@@ -611,7 +611,7 @@ namespace X3LaptopCompanion
             _ = RefreshLiveTeamsStatusAsync(ParseCommandTargetProcessId());
         }
 
-        private async Task RefreshLiveTeamsStatusAsync(int? explicitTargetProcessId)
+        private async Task RefreshLiveTeamsStatusAsync(int? explicitTargetProcessId, bool force = false)
         {
             try
             {
@@ -637,7 +637,7 @@ namespace X3LaptopCompanion
                     ApplyTeamsSnapshotToUi(snapshot);
                     QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
                         snapshot.Microphone, snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
-                        "current");
+                        "current", force);
                 });
             }
             catch (System.Exception ex)
@@ -678,7 +678,20 @@ namespace X3LaptopCompanion
 
                 if (reconnected)
                 {
-                    SendCurrentHostStatus(force: true);
+                    if (IsTestMode || IsTeamsDryRun)
+                    {
+                        SendCurrentHostStatus(force: true);
+                        return;
+                    }
+
+                    if (statusRefreshInFlight)
+                    {
+                        HostLog.Write("Initial live Teams status refresh skipped; refresh is already running.");
+                        return;
+                    }
+
+                    statusRefreshInFlight = true;
+                    _ = RefreshLiveTeamsStatusAsync(ParseCommandTargetProcessId(), force: true);
                 }
             }));
         }
