@@ -952,10 +952,14 @@ namespace X3LaptopCompanion
                 var observedExpectedState = expectedState.HasValue &&
                     observedState.HasValue &&
                     observedState.Value == expectedState.Value;
+                var observedKnownState = observedState.HasValue && observedState.Value != CompanionTriState.Unknown;
+                var observedInclusiveState = !expectedState.HasValue && observedKnownState;
+                var acceptedButtonState = observedExpectedState || observedInclusiveState;
+                var acceptedCounterState = acceptedButtonState ? observedState : null;
                 var finalAttempt = attempt == delaysMs.Length - 1;
-                var canAcknowledgePendingButton = observedExpectedState && pendingButton.HasValue &&
+                var canAcknowledgePendingButton = acceptedButtonState && pendingButton.HasValue &&
                     PendingButtonMatchesCommand(command);
-                var shouldSendObservedState = observedExpectedState || !pendingButton.HasValue || finalAttempt;
+                var shouldSendObservedState = acceptedButtonState || !pendingButton.HasValue || finalAttempt;
                 var observedLatencyMs = commandStopwatch.ElapsedMilliseconds;
                 long? pendingObservedLatencyMs = null;
                 CompanionButton? observedPendingButton = null;
@@ -973,6 +977,7 @@ namespace X3LaptopCompanion
                     " attempt=" + (attempt + 1) + " delayMs=" + delaysMs[attempt] +
                     " expected=" + FormatTriState(expectedState) +
                     " observed=" + FormatTriState(observedState) +
+                    " inclusive=" + observedInclusiveState +
                     " accepted=" + shouldSendObservedState +
                     " pendingAck=" + canAcknowledgePendingButton +
                     " observedLatencyMs=" + observedLatencyMs +
@@ -1000,14 +1005,15 @@ namespace X3LaptopCompanion
                             " observedLatencyMs=" + observedLatencyMs);
                     }
 
-                    if (observedExpectedState && observedPendingButton.HasValue && pendingObservedLatencyMs.HasValue)
+                    if (acceptedButtonState && observedPendingButton.HasValue && pendingObservedLatencyMs.HasValue)
                     {
                         pendingButtonObservedLatencyMs = pendingObservedLatencyMs.Value;
+                        pendingButtonExpectedState = acceptedCounterState;
                         ButtonProtocolText = ButtonName(observedPendingButton.Value) + " #" + observedPendingCounter +
                             " observed in " + pendingObservedLatencyMs.Value + "ms";
                         DetailText = commandName + " observed in " + pendingObservedLatencyMs.Value + "ms.";
                     }
-                    else if (observedExpectedState)
+                    else if (acceptedButtonState)
                     {
                         DetailText = commandName + " observed in " + observedLatencyMs + "ms.";
                     }
