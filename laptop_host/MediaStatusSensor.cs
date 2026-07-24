@@ -381,6 +381,13 @@ namespace X3LaptopCompanion
                         }
 
                         sawTeamsSession = true;
+                        Marshal.ThrowExceptionForHR(sessionControl.GetState(out var state));
+                        if (state != AudioSessionState.Active)
+                        {
+                            continue;
+                        }
+
+                        sawActiveTeamsSession = true;
                         if (TryGetSessionProcessId(sessionControl, out var matchedProcessId) && matchedProcessId > 0)
                         {
                             matchedAudioProcessIds.Add((int)matchedProcessId);
@@ -389,12 +396,6 @@ namespace X3LaptopCompanion
                         if (TryGetSessionMuted(sessionControl, out var sessionMuted) && sessionMuted)
                         {
                             return CompanionTriState.Off;
-                        }
-
-                        Marshal.ThrowExceptionForHR(sessionControl.GetState(out var state));
-                        if (state == AudioSessionState.Active)
-                        {
-                            sawActiveTeamsSession = true;
                         }
                     }
                     finally
