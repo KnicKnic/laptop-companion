@@ -61,6 +61,20 @@ namespace X3LaptopCompanion
             get { return FindTeamsProcesses().Select(p => p.Id).ToList(); }
         }
 
+        public void InvalidateMeetingWindowCache(string reason)
+        {
+            if (cachedMeetingWindowHandle == IntPtr.Zero)
+            {
+                return;
+            }
+
+            HostLog.Write("Teams UIA meeting window cache invalidated. reason=" + reason +
+                " hwnd=0x" + cachedMeetingWindowHandle.ToInt64().ToString("X"));
+            cachedMeetingWindowHandle = IntPtr.Zero;
+            cachedMeetingTargetProcessId = 0;
+            cachedMeetingTargetProcessName = string.Empty;
+        }
+
         public bool TryToggleMute()
         {
             return TrySendCommand(TeamsCommand.ToggleMute);

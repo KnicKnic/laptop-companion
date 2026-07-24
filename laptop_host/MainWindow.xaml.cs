@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
@@ -831,7 +832,9 @@ namespace X3LaptopCompanion
         {
             var name = TeamsController.CommandName(command);
             var stopwatch = Stopwatch.StartNew();
-            HostLog.Write(name + " requested.");
+            HostLog.Write("Teams command requested. command=" + name +
+                " uiThread=" + Dispatcher.CheckAccess() +
+                " threadId=" + Thread.CurrentThread.ManagedThreadId);
             if (IsTeamsDryRun)
             {
                 TeamsText = "Dry run";
@@ -846,11 +849,21 @@ namespace X3LaptopCompanion
             teamsCommandRefreshInFlight = true;
             try
             {
+                HostLog.Write("Teams command invoke scheduling. command=" + name +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds +
+                    " uiThread=" + Dispatcher.CheckAccess());
                 var invoked = await Task.Run(() =>
                 {
+                    HostLog.Write("Teams command invoke worker running. command=" + name +
+                        " threadId=" + Thread.CurrentThread.ManagedThreadId);
                     EnsureAudioProcessCacheForCommand(explicitPid);
                     return teamsController.TrySendCommand(command, mediaStatusSensor.TeamsAudioProcessIds, explicitPid);
-                });
+                }).ConfigureAwait(false);
+                HostLog.Write("Teams command invoke completed. command=" + name +
+                    " invoked=" + invoked +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds +
+                    " uiThread=" + Dispatcher.CheckAccess() +
+                    " threadId=" + Thread.CurrentThread.ManagedThreadId);
                 if (isExiting || Dispatcher.HasShutdownStarted)
                 {
                     return;
@@ -859,21 +872,41 @@ namespace X3LaptopCompanion
                 if (!invoked)
                 {
                     HostLog.Write(name + " failed; Teams UIA control not found or not invokable.");
-                    DetailText = "Teams control was not found. Start or join a meeting, then try again.";
-                    var failedSnapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(true, explicitPid));
+                    await Dispatcher.InvokeAsync(new System.Action(() =>
+                    {
+                        if (!isExiting)
+                        {
+                            DetailText = "Teams control was not found. Start or join a meeting, then try again.";
+                        }
+                    }));
+                    var failedSnapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(true, explicitPid))
+                        .ConfigureAwait(false);
                     if (isExiting || Dispatcher.HasShutdownStarted)
                     {
                         return;
                     }
 
-                    QueueHostStatusIfChanged(failedSnapshot.TeamsDetected, failedSnapshot.MeetingDetected,
-                        failedSnapshot.MeetingName, failedSnapshot.Microphone, failedSnapshot.Camera,
-                        failedSnapshot.Hand, StatusMessageForSnapshot(failedSnapshot), "teams command missing");
+                    await Dispatcher.InvokeAsync(new System.Action(() =>
+                    {
+                        if (!isExiting)
+                        {
+                            QueueHostStatusIfChanged(failedSnapshot.TeamsDetected, failedSnapshot.MeetingDetected,
+                                failedSnapshot.MeetingName, failedSnapshot.Microphone, failedSnapshot.Camera,
+                                failedSnapshot.Hand, StatusMessageForSnapshot(failedSnapshot), "teams command missing");
+                        }
+                    }));
                     return;
                 }
 
                 HostLog.Write(name + " invoked in Teams. elapsedMs=" + stopwatch.ElapsedMilliseconds);
-                DetailText = name + " invoked in Teams.";
+                teamsController.InvalidateMeetingWindowCache("post-command " + name);
+                _ = Dispatcher.BeginInvoke(new System.Action(() =>
+                {
+                    if (!isExiting)
+                    {
+                        DetailText = name + " invoked in Teams.";
+                    }
+                }));
                 var expectedState = GetExpectedStateForCommand(command);
                 if (pendingButton.HasValue && PendingButtonMatchesCommand(command))
                 {
@@ -882,9 +915,11 @@ namespace X3LaptopCompanion
 
                 HostLog.Write("Post-command waiting for observed state. command=" + name +
                     " expected=" + FormatTriState(expectedState) +
-                    " elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                    " firstDelayMs=50" +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds +
+                    " uiThread=" + Dispatcher.CheckAccess());
                 await RefreshAndSendCurrentStatusAfterInvokeAsync(command, name, expectedState, explicitPid,
-                    stopwatch);
+                    stopwatch).ConfigureAwait(false);
             }
             catch (System.Exception ex)
             {
@@ -940,9 +975,11 @@ namespace X3LaptopCompanion
             for (var attempt = 0; attempt < delaysMs.Length; attempt++)
             {
                 await Task.Delay(delaysMs[attempt]).ConfigureAwait(false);
+                var snapshotReadStartedAt = Stopwatch.GetTimestamp();
                 var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(false, explicitTargetProcessId))
                     .ConfigureAwait(false);
                 var snapshotObservedAt = Stopwatch.GetTimestamp();
+                var snapshotReadMs = ElapsedMillisecondsBetween(snapshotReadStartedAt, snapshotObservedAt);
                 if (isExiting || Dispatcher.HasShutdownStarted)
                 {
                     return;
@@ -980,9 +1017,11 @@ namespace X3LaptopCompanion
                     " inclusive=" + observedInclusiveState +
                     " accepted=" + shouldSendObservedState +
                     " pendingAck=" + canAcknowledgePendingButton +
+                    " snapshotReadMs=" + snapshotReadMs +
                     " observedLatencyMs=" + observedLatencyMs +
                     " pendingObservedLatencyMs=" +
-                    (pendingObservedLatencyMs.HasValue ? pendingObservedLatencyMs.Value.ToString() : "n/a"));
+                    (pendingObservedLatencyMs.HasValue ? pendingObservedLatencyMs.Value.ToString() : "n/a") +
+                    " uiThread=" + Dispatcher.CheckAccess());
 
                 if (!shouldSendObservedState)
                 {
@@ -998,6 +1037,10 @@ namespace X3LaptopCompanion
                     }
 
                     var dispatchLagMs = ElapsedMillisecondsSince(dispatchQueuedAt);
+                    HostLog.Write("Post-command UI update applying. command=" + commandName +
+                        " dispatchLagMs=" + dispatchLagMs +
+                        " observedLatencyMs=" + observedLatencyMs +
+                        " uiThread=" + Dispatcher.CheckAccess());
                     if (dispatchLagMs > 50)
                     {
                         HostLog.Write("Post-command UI dispatch lag. command=" + commandName +
