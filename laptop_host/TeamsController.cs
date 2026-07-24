@@ -180,6 +180,7 @@ namespace X3LaptopCompanion
 
             if (audioMeetingProcessIds.Count == 0)
             {
+                InvalidateMeetingWindowCache("active meeting audio missing");
                 return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
                     CompanionTriState.Unknown, CompanionTriState.Unknown,
                     "Teams running; active meeting audio session not found");
