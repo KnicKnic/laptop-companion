@@ -47,6 +47,7 @@ namespace X3LaptopCompanion
         private ushort pendingButtonCounter;
         private CompanionTriState? pendingButtonExpectedState;
         private long pendingButtonReceivedTimestamp;
+        private long? pendingButtonObservedLatencyMs;
         private ushort microphoneStateCounter;
         private ushort cameraStateCounter;
         private ushort handStateCounter;
@@ -719,6 +720,7 @@ namespace X3LaptopCompanion
             pendingButtonCounter = buttonEvent.Sequence;
             pendingButtonExpectedState = null;
             pendingButtonReceivedTimestamp = Stopwatch.GetTimestamp();
+            pendingButtonObservedLatencyMs = null;
             if (isExiting || Dispatcher.HasShutdownStarted)
             {
                 return;
@@ -973,7 +975,17 @@ namespace X3LaptopCompanion
                     }
 
                     var observedLatencyMs = commandStopwatch.ElapsedMilliseconds;
-                    if (observedExpectedState)
+                    if (observedExpectedState && pendingButton.HasValue && PendingButtonMatchesCommand(command))
+                    {
+                        var pendingLatencyMs = pendingButtonReceivedTimestamp > 0
+                            ? ElapsedMillisecondsSince(pendingButtonReceivedTimestamp)
+                            : observedLatencyMs;
+                        pendingButtonObservedLatencyMs = pendingLatencyMs;
+                        ButtonProtocolText = ButtonName(pendingButton.Value) + " #" + pendingButtonCounter +
+                            " observed in " + pendingLatencyMs + "ms";
+                        DetailText = commandName + " observed in " + pendingLatencyMs + "ms.";
+                    }
+                    else if (observedExpectedState)
                     {
                         DetailText = commandName + " observed in " + observedLatencyMs + "ms.";
                     }
@@ -1198,10 +1210,14 @@ namespace X3LaptopCompanion
             try
             {
                 HostLog.Write("Host state write queued. reason=" + reason);
+                var priorityButton = pendingButton.HasValue &&
+                    payload.CounterFor(pendingButton.Value) == pendingButtonCounter
+                    ? pendingButton
+                    : null;
                 var sent = await connectionService.SendHostStatusAsync(payload.TeamsDetected, payload.MeetingDetected,
                     payload.MeetingName, payload.Microphone, payload.Camera, payload.Hand, payload.Message,
                     payload.TeamsCounter, payload.MeetingCounter, payload.MicrophoneCounter, payload.CameraCounter,
-                    payload.HandCounter);
+                    payload.HandCounter, priorityButton);
                 if (sent)
                 {
                     lastSentHostState = payload;
@@ -1229,17 +1245,23 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            var latencyText = pendingButtonReceivedTimestamp > 0
-                ? " in " + ElapsedMillisecondsSince(pendingButtonReceivedTimestamp) + "ms"
-                : string.Empty;
-            var clearedText = ButtonName(pendingButton.Value) + " #" + pendingButtonCounter +
-                " acknowledged" + latencyText;
+            var protocolLatencyMs = pendingButtonReceivedTimestamp > 0
+                ? ElapsedMillisecondsSince(pendingButtonReceivedTimestamp)
+                : 0;
+            var observedLatencyText = pendingButtonObservedLatencyMs.HasValue
+                ? " observed in " + pendingButtonObservedLatencyMs.Value + "ms"
+                : " acknowledged in " + protocolLatencyMs + "ms";
+            var clearedText = ButtonName(pendingButton.Value) + " #" + pendingButtonCounter + observedLatencyText;
             HostLog.Write("Button protocol acknowledged. button=" + pendingButton.Value +
-                " seq=" + pendingButtonCounter + latencyText);
+                " seq=" + pendingButtonCounter +
+                " observedLatencyMs=" +
+                (pendingButtonObservedLatencyMs.HasValue ? pendingButtonObservedLatencyMs.Value.ToString() : "n/a") +
+                " protocolLatencyMs=" + protocolLatencyMs);
             pendingButton = null;
             pendingButtonCounter = 0;
             pendingButtonExpectedState = null;
             pendingButtonReceivedTimestamp = 0;
+            pendingButtonObservedLatencyMs = null;
             Dispatcher.BeginInvoke(new System.Action(() =>
             {
                 if (!isExiting)
@@ -1281,6 +1303,7 @@ namespace X3LaptopCompanion
             pendingButtonCounter = 0;
             pendingButtonExpectedState = null;
             pendingButtonReceivedTimestamp = 0;
+            pendingButtonObservedLatencyMs = null;
             teamsCommandRefreshInFlight = false;
             ButtonProtocolText = "No pending button";
         }

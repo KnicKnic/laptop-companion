@@ -118,7 +118,7 @@ namespace X3LaptopCompanion
         public async Task<bool> SendHostStatusAsync(bool teamsDetected, bool meetingDetected,
             string meetingName, CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand,
             string message, ushort teamsCounter = 0, ushort meetingCounter = 0, ushort microphoneCounter = 0,
-            ushort cameraCounter = 0, ushort handCounter = 0)
+            ushort cameraCounter = 0, ushort handCounter = 0, CompanionButton? priorityButton = null)
         {
             if (!await hostStateWriteLock.WaitAsync(0))
             {
@@ -140,19 +140,56 @@ namespace X3LaptopCompanion
                     " meeting=" + meetingDetected + " meetingName=" + meetingName +
                     " mic=" + microphone + " camera=" + camera +
                     " hand=" + hand + " counters=" + teamsCounter + "/" + meetingCounter + "/" +
-                    microphoneCounter + "/" + cameraCounter + "/" + handCounter + " message=" + message);
-                var teamsStatus = await WriteEncodedStateAsync(hostTeamsStateCharacteristic, teamsDetected,
+                    microphoneCounter + "/" + cameraCounter + "/" + handCounter +
+                    " priorityButton=" + (priorityButton.HasValue ? priorityButton.Value.ToString() : "(none)") +
+                    " message=" + message);
+                var teamsStatus = GattCommunicationStatus.Success;
+                var meetingStatus = GattCommunicationStatus.Success;
+                var meetingNameStatus = GattCommunicationStatus.Success;
+                var microphoneStatus = GattCommunicationStatus.Success;
+                var cameraStatus = GattCommunicationStatus.Success;
+                var handStatus = GattCommunicationStatus.Success;
+
+                if (priorityButton == CompanionButton.ToggleMute)
+                {
+                    microphoneStatus = await WriteEncodedStateAsync(hostMicrophoneStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(microphone), microphoneCounter, "microphone");
+                }
+                else if (priorityButton == CompanionButton.ToggleCamera)
+                {
+                    cameraStatus = await WriteEncodedStateAsync(hostCameraStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(camera), cameraCounter, "camera");
+                }
+                else if (priorityButton == CompanionButton.ToggleHand)
+                {
+                    handStatus = await WriteOptionalByteStateAsync(hostHandStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(hand), handCounter, "hand");
+                }
+
+                teamsStatus = await WriteEncodedStateAsync(hostTeamsStateCharacteristic, teamsDetected,
                     teamsCounter, "teams");
-                var meetingStatus = await WriteOptionalByteStateAsync(hostMeetingStateCharacteristic,
+                meetingStatus = await WriteOptionalByteStateAsync(hostMeetingStateCharacteristic,
                     meetingDetected, meetingCounter, "meeting");
-                var meetingNameStatus = await WriteOptionalStringStateAsync(hostMeetingNameCharacteristic,
+                meetingNameStatus = await WriteOptionalStringStateAsync(hostMeetingNameCharacteristic,
                     meetingName, "meeting name");
-                var microphoneStatus = await WriteEncodedStateAsync(hostMicrophoneStateCharacteristic,
-                    CompanionProtocol.TriStateIsOn(microphone), microphoneCounter, "microphone");
-                var cameraStatus = await WriteEncodedStateAsync(hostCameraStateCharacteristic,
-                    CompanionProtocol.TriStateIsOn(camera), cameraCounter, "camera");
-                var handStatus = await WriteOptionalByteStateAsync(hostHandStateCharacteristic,
-                    CompanionProtocol.TriStateIsOn(hand), handCounter, "hand");
+                if (priorityButton != CompanionButton.ToggleMute)
+                {
+                    microphoneStatus = await WriteEncodedStateAsync(hostMicrophoneStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(microphone), microphoneCounter, "microphone");
+                }
+
+                if (priorityButton != CompanionButton.ToggleCamera)
+                {
+                    cameraStatus = await WriteEncodedStateAsync(hostCameraStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(camera), cameraCounter, "camera");
+                }
+
+                if (priorityButton != CompanionButton.ToggleHand)
+                {
+                    handStatus = await WriteOptionalByteStateAsync(hostHandStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(hand), handCounter, "hand");
+                }
+
                 var messageStatus = await WriteStringStateAsync(hostStatusMessageCharacteristic, message, "message");
                 var elapsedMs = (DateTimeOffset.Now - startedAt).TotalMilliseconds;
                 HostLog.Write("Host state write complete teamsStatus=" + teamsStatus + " micStatus=" + microphoneStatus +
