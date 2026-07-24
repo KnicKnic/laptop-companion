@@ -39,6 +39,25 @@ namespace X3LaptopCompanion
         public string Detail { get; }
     }
 
+    public sealed class TeamsCommandStateObservation
+    {
+        public TeamsCommandStateObservation(bool teamsDetected, bool meetingDetected, string meetingName,
+            CompanionTriState state, string detail)
+        {
+            TeamsDetected = teamsDetected;
+            MeetingDetected = meetingDetected;
+            MeetingName = meetingName ?? string.Empty;
+            State = state;
+            Detail = detail ?? string.Empty;
+        }
+
+        public bool TeamsDetected { get; }
+        public bool MeetingDetected { get; }
+        public string MeetingName { get; }
+        public CompanionTriState State { get; }
+        public string Detail { get; }
+    }
+
     public sealed class TeamsController
     {
         private const int MaxMeetingSearchDepth = 42;
@@ -201,6 +220,51 @@ namespace X3LaptopCompanion
             return new TeamsMeetingSnapshot(true, meetingDetected, meetingName, microphone, camera, hand, detail);
         }
 
+        public TeamsCommandStateObservation GetCommandStateObservation(TeamsCommand command,
+            IReadOnlyCollection<int> audioProcessIds, int? explicitTargetProcessId,
+            CompanionTriState? expectedState = null)
+        {
+            var audioMeetingProcessIds = audioProcessIds ?? Array.Empty<int>();
+            var teamsDetected = IsTeamsRunning;
+            if (!teamsDetected)
+            {
+                return new TeamsCommandStateObservation(false, false, string.Empty, CompanionTriState.Unknown,
+                    "Teams not running");
+            }
+
+            if (audioMeetingProcessIds.Count == 0)
+            {
+                return new TeamsCommandStateObservation(true, false, string.Empty, CompanionTriState.Unknown,
+                    "Teams running; active meeting audio session not found");
+            }
+
+            if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, command, expectedState,
+                    out var context))
+            {
+                return new TeamsCommandStateObservation(true, false, string.Empty, CompanionTriState.Unknown,
+                    "Teams running; command controls not found");
+            }
+
+            var controls = context.Controls;
+            var commandState = GetCommandState(controls, command);
+            var meetingName = ExtractMeetingName(controls.FirstWindowName);
+            var meetingDetected = controls.HasMeetingControl;
+            if (!meetingDetected)
+            {
+                meetingName = string.Empty;
+                commandState = CompanionTriState.Unknown;
+            }
+
+            var detail = "target=" + DescribeTarget(context.Target) +
+                " hwnd=0x" + context.Hwnd.ToInt64().ToString("X") +
+                " command=" + CommandName(command) +
+                " activeAudio=True" +
+                " meeting=\"" + meetingName + "\" " + controls.DescribeState();
+
+            HostLog.Write("Teams UIA command state snapshot. " + detail);
+            return new TeamsCommandStateObservation(true, meetingDetected, meetingName, commandState, detail);
+        }
+
         public static string CommandName(TeamsCommand command)
         {
             switch (command)
@@ -248,6 +312,21 @@ namespace X3LaptopCompanion
             return controls.RaiseHandButton != null ? CompanionTriState.Off : CompanionTriState.Unknown;
         }
 
+        private static CompanionTriState GetCommandState(MeetingControls controls, TeamsCommand command)
+        {
+            switch (command)
+            {
+                case TeamsCommand.ToggleMute:
+                    return GetMicrophoneState(controls);
+                case TeamsCommand.ToggleVideo:
+                    return GetCameraState(controls);
+                case TeamsCommand.ToggleHand:
+                    return GetHandState(controls);
+                default:
+                    return CompanionTriState.Unknown;
+            }
+        }
+
         private static string ExtractMeetingName(string windowName)
         {
             if (string.IsNullOrWhiteSpace(windowName))
@@ -282,8 +361,14 @@ namespace X3LaptopCompanion
         private bool TryFindMeetingWindow(IReadOnlyCollection<int> audioProcessIds, int? explicitTargetProcessId,
             out MeetingWindowContext context)
         {
+            return TryFindMeetingWindow(audioProcessIds, explicitTargetProcessId, null, null, out context);
+        }
+
+        private bool TryFindMeetingWindow(IReadOnlyCollection<int> audioProcessIds, int? explicitTargetProcessId,
+            TeamsCommand? command, CompanionTriState? expectedState, out MeetingWindowContext context)
+        {
             context = null;
-            if (!explicitTargetProcessId.HasValue && TryUseCachedMeetingWindow(out context))
+            if (!explicitTargetProcessId.HasValue && TryUseCachedMeetingWindow(command, expectedState, out context))
             {
                 return true;
             }
@@ -316,7 +401,9 @@ namespace X3LaptopCompanion
                             continue;
                         }
 
-                        var controls = ReadMeetingControls(root);
+                        var controls = command.HasValue
+                            ? ReadMeetingControls(root, command.Value, expectedState)
+                            : ReadMeetingControls(root);
                         var score = controls.Score;
                         HostLog.Write("Teams UIA target score. " + DescribeTarget(target) +
                             " hwnd=0x" + window.Hwnd.ToInt64().ToString("X") +
@@ -578,7 +665,8 @@ namespace X3LaptopCompanion
             }
         }
 
-        private bool TryUseCachedMeetingWindow(out MeetingWindowContext context)
+        private bool TryUseCachedMeetingWindow(TeamsCommand? command, CompanionTriState? expectedState,
+            out MeetingWindowContext context)
         {
             context = null;
             IntPtr handle;
@@ -608,7 +696,9 @@ namespace X3LaptopCompanion
 
                 // Cache only the stable top-level window handle. The Teams buttons themselves are deliberately
                 // rediscovered below because WebView rerenders can invalidate saved AutomationElement instances.
-                var controls = ReadMeetingControls(root);
+                var controls = command.HasValue
+                    ? ReadMeetingControls(root, command.Value, expectedState)
+                    : ReadMeetingControls(root);
                 HostLog.Write("Teams UIA cached target score. hwnd=0x" +
                     handle.ToInt64().ToString("X") +
                     " score=" + controls.Score + " " + controls.DescribeState());
@@ -656,6 +746,84 @@ namespace X3LaptopCompanion
             controls.RaiseHandButton = FindButtonByName(root, "Raise your hand", controls);
             controls.LowerHandButton = FindButtonByName(root, "Lower your hand", controls);
             return controls;
+        }
+
+        private static MeetingControls ReadMeetingControls(AutomationElement root, TeamsCommand command,
+            CompanionTriState? expectedState)
+        {
+            var controls = new MeetingControls();
+            controls.FirstWindowName = Safe(() => root.Current.Name);
+            foreach (var name in GetCommandButtonNames(command, expectedState))
+            {
+                var button = FindButtonByName(root, name, controls);
+                if (button == null)
+                {
+                    continue;
+                }
+
+                if (command == TeamsCommand.ToggleMute)
+                {
+                    if (NameEquals(name, "Mute mic"))
+                    {
+                        controls.MuteMicButton = button;
+                    }
+                    else
+                    {
+                        controls.UnmuteMicButton = button;
+                    }
+                }
+                else if (command == TeamsCommand.ToggleVideo)
+                {
+                    if (NameEquals(name, "Turn camera on"))
+                    {
+                        controls.TurnCameraOnButton = button;
+                    }
+                    else
+                    {
+                        controls.TurnCameraOffButton = button;
+                    }
+                }
+                else if (command == TeamsCommand.ToggleHand)
+                {
+                    if (NameEquals(name, "Raise your hand"))
+                    {
+                        controls.RaiseHandButton = button;
+                    }
+                    else
+                    {
+                        controls.LowerHandButton = button;
+                    }
+                }
+            }
+
+            return controls;
+        }
+
+        private static IReadOnlyCollection<string> GetCommandButtonNames(TeamsCommand command,
+            CompanionTriState? expectedState)
+        {
+            if (!expectedState.HasValue)
+            {
+                return GetCommandButtonNames(command);
+            }
+
+            switch (command)
+            {
+                case TeamsCommand.ToggleMute:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Unmute mic", "Mute mic" }
+                        : new[] { "Mute mic", "Unmute mic" };
+                case TeamsCommand.ToggleVideo:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Turn camera on", "Turn camera off" }
+                        : new[] { "Turn camera off", "Turn camera on" };
+                case TeamsCommand.ToggleHand:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Raise your hand", "Lower your hand" }
+                        : new[] { "Lower your hand", "Raise your hand" };
+                default:
+                    return GetCommandButtonNames(command);
+            }
         }
 
         private static ButtonInfo FindButtonByName(AutomationElement root, string name, MeetingControls controls)

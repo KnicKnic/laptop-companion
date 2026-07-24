@@ -976,7 +976,9 @@ namespace X3LaptopCompanion
             {
                 await Task.Delay(delaysMs[attempt]).ConfigureAwait(false);
                 var snapshotReadStartedAt = Stopwatch.GetTimestamp();
-                var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(false, explicitTargetProcessId))
+                var mergeBaseState = lastSentHostState;
+                var snapshot = await Task.Run(() => ReadTeamsCommandObservation(command, explicitTargetProcessId,
+                        mergeBaseState, expectedState))
                     .ConfigureAwait(false);
                 var snapshotObservedAt = Stopwatch.GetTimestamp();
                 var snapshotReadMs = ElapsedMillisecondsBetween(snapshotReadStartedAt, snapshotObservedAt);
@@ -1167,6 +1169,38 @@ namespace X3LaptopCompanion
 
             return teamsController.GetMeetingSnapshot(mediaStatusSensor.TeamsAudioProcessIds,
                 explicitTargetProcessId);
+        }
+
+        private TeamsMeetingSnapshot ReadTeamsCommandObservation(TeamsCommand command, int? explicitTargetProcessId,
+            HostStatePayload mergeBaseState, CompanionTriState? expectedState)
+        {
+            var observation = teamsController.GetCommandStateObservation(command, mediaStatusSensor.TeamsAudioProcessIds,
+                explicitTargetProcessId, expectedState);
+            var microphone = mergeBaseState == null ? CompanionTriState.Unknown : mergeBaseState.Microphone;
+            var camera = mergeBaseState == null ? CompanionTriState.Unknown : mergeBaseState.Camera;
+            var hand = mergeBaseState == null ? CompanionTriState.Unknown : mergeBaseState.Hand;
+
+            if (!observation.MeetingDetected)
+            {
+                microphone = CompanionTriState.Unknown;
+                camera = CompanionTriState.Unknown;
+                hand = CompanionTriState.Unknown;
+            }
+            else if (command == TeamsCommand.ToggleMute)
+            {
+                microphone = observation.State;
+            }
+            else if (command == TeamsCommand.ToggleVideo)
+            {
+                camera = observation.State;
+            }
+            else if (command == TeamsCommand.ToggleHand)
+            {
+                hand = observation.State;
+            }
+
+            return new TeamsMeetingSnapshot(observation.TeamsDetected, observation.MeetingDetected,
+                observation.MeetingName, microphone, camera, hand, observation.Detail);
         }
 
         private static string TeamsTextForSnapshot(TeamsMeetingSnapshot snapshot)
