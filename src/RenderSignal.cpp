@@ -70,3 +70,14 @@ bool SequencedRenderSignal::waitForAtLeast(uint32_t sequence, TickType_t timeout
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
+
+uint32_t SequencedRenderSignal::latestSequence() const {
+  if (mutex_ == nullptr) {
+    return latestRequest_.sequence;
+  }
+
+  xSemaphoreTake(mutex_, portMAX_DELAY);
+  const uint32_t sequence = latestRequest_.sequence;
+  xSemaphoreGive(mutex_);
+  return sequence;
+}

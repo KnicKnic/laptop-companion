@@ -2,6 +2,7 @@
 
 #include "AppLog.h"
 #include "CompanionProtocol.h"
+#include "DisplayWorker.h"
 
 #include <NimBLEDevice.h>
 #include <NimBLEUtils.h>
@@ -440,6 +441,17 @@ CompanionBleService::ActivityStats CompanionBleService::getActivityStats() const
   return stats;
 }
 
+uint32_t CompanionBleService::getBluetoothSessionRenderRequests() const {
+  lockState();
+  const bool connected = hostConnected_;
+  const uint32_t baseline = bluetoothSessionRenderBaseline_;
+  unlockState();
+  if (!connected) return 0;
+
+  const uint32_t total = renderRequestCount();
+  return total >= baseline ? total - baseline : 0;
+}
+
 bool CompanionBleService::notifyToggleMuteReleased(uint16_t* counter) {
   lockState();
   const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
@@ -485,6 +497,7 @@ void CompanionBleService::onHostConnected(uint16_t connHandle) {
   hostConnected_ = true;
   hostConnHandle_ = connHandle;
   hostConnectedAtMs_ = millis();
+  bluetoothSessionRenderBaseline_ = renderRequestCount();
   activityStats_.gapConnects++;
   const StatusChangedCallback callback = markStatusChangedLocked();
   unlockState();
@@ -883,6 +896,7 @@ void CompanionBleService::resetSessionState() {
   participationUntilMs_ = 0;
   lastParticipationNotifyAtMs_ = 0;
   hasNegotiatedConnParams_ = false;
+  bluetoothSessionRenderBaseline_ = 0;
   hostStatus_ = HostStatus{};
   pendingButtons_ = PendingButtonStatus{};
   unlockState();

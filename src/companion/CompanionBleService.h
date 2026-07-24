@@ -88,6 +88,7 @@ class CompanionBleService {
   HostStatus getHostStatus() const;
   PendingButtonStatus getPendingButtonStatus() const;
   ActivityStats getActivityStats() const;
+  uint32_t getBluetoothSessionRenderRequests() const;
   std::string formatTimingDiagnostics() const;
   std::string formatActivityDeltaDiagnostics();
 
@@ -169,6 +170,7 @@ class CompanionBleService {
   bool hasNegotiatedConnParams_ = false;
   uint16_t buttonEventSequence_ = 0;
   uint32_t participationCounter_ = 0;
+  uint32_t bluetoothSessionRenderBaseline_ = 0;
   HostStatus hostStatus_;
   PendingButtonStatus pendingButtons_;
   ActivityStats activityStats_;
