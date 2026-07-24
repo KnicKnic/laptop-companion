@@ -1,0 +1,15 @@
+#pragma once
+
+#include "Page.h"
+
+class CompanionStatsPage final : public Page {
+ public:
+  explicit CompanionStatsPage(EInkDisplay& display);
+
+  PageId id() const override;
+  const char* name() const override;
+  void onEnter() override;
+  void onLeave() override;
+  std::unique_ptr<RenderTransaction> render(freeink::ui::DisplayTarget& target,
+                                            EInkDisplay::RefreshMode mode, bool forceDraw) override;
+};

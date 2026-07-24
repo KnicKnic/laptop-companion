@@ -1,0 +1,14 @@
+.pio/
+.vscode/
+*.bin
+*.elf
+*.map
+*.uf2
+managed_components/
+.dummy/
+managed_components.stale-*/
+dependencies.lock.stale-*
+tools/
+freeink-sd-shared-spi-fix/
+laptop_host/bin/
+laptop_host/obj/

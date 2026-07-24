@@ -1,0 +1,11 @@
+# alias = lucide-name
+bluetooth = bluetooth
+bluetooth_off = bluetooth-off
+laptop = laptop
+monitor = monitor
+mic = mic
+mic_off = mic-off
+video = video
+video_off = video-off
+radio_tower = radio-tower
+activity = activity
