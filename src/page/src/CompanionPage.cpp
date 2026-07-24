@@ -200,8 +200,6 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
   const bool micLive = triStateIs(host.microphone, CompanionProtocol::TriState::On);
   const bool cameraLive = triStateIs(host.camera, CompanionProtocol::TriState::On);
   const bool handRaised = triStateIs(host.hand, CompanionProtocol::TriState::On);
-  const uint32_t totalRenderRequests = renderRequestCount();
-  const uint32_t sessionRenderRequests = service.getBluetoothSessionRenderRequests();
 
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 20), content.width, 34},
                         "Laptop Companion", title);
@@ -219,21 +217,6 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
                   freeink::ui::Rect{static_cast<int16_t>(content.x + linkW + gap), tileY,
                                     static_cast<int16_t>(content.width - linkW - gap), 96},
                   host.meetingDetected, host.meetingName);
-
-  char renderLine[64];
-  snprintf(renderLine, sizeof(renderLine), "renders: %lu", static_cast<unsigned long>(totalRenderRequests));
-  char sessionRenderLine[64];
-  snprintf(sessionRenderLine, sizeof(sessionRenderLine), "bluetooth_session: %lu",
-           static_cast<unsigned long>(sessionRenderRequests));
-  freeink::ui::TextStyle statLeft = center;
-  statLeft.align = freeink::ui::TextAlign::Left;
-  freeink::ui::TextStyle statRight = center;
-  statRight.align = freeink::ui::TextAlign::Right;
-  const int16_t renderStatsY = static_cast<int16_t>(content.y + 166);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, renderStatsY, tileW, 20}, renderLine, statLeft);
-  freeink::ui::drawText(target,
-                        freeink::ui::Rect{static_cast<int16_t>(content.x + tileW + gap), renderStatsY, tileW, 20},
-                        sessionRenderLine, statRight);
 
   const int16_t mediaTileY = static_cast<int16_t>(content.y + 188);
   drawStatusTile(target, freeink::ui::Rect{content.x, mediaTileY, tileW, 100}, micStatusIcon(host.microphone),

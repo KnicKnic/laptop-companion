@@ -84,10 +84,12 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
            static_cast<unsigned long>(stats.participationSubscribes),
            static_cast<unsigned long>(stats.participationNotifications));
   char workerLine[112];
-  snprintf(workerLine, sizeof(workerLine), "Worker upd:%lu m:%lu adv:%lu renders:%lu bluetooth_session:%lu",
+  snprintf(workerLine, sizeof(workerLine), "Worker updates:%lu maintenance:%lu adv restarts:%lu",
            static_cast<unsigned long>(stats.updateCalls), static_cast<unsigned long>(stats.maintenanceRuns),
-            static_cast<unsigned long>(stats.advertisingRestarts), static_cast<unsigned long>(totalRenderRequests),
-            static_cast<unsigned long>(sessionRenderRequests));
+           static_cast<unsigned long>(stats.advertisingRestarts));
+  char renderLine[112];
+  snprintf(renderLine, sizeof(renderLine), "renders: %lu session: %lu",
+           static_cast<unsigned long>(totalRenderRequests), static_cast<unsigned long>(sessionRenderRequests));
   char meetingLine[128];
   snprintf(meetingLine, sizeof(meetingLine), "Meeting:%s  Name:%s", host.meetingDetected ? "active" : "none",
            host.meetingName.empty() ? "--" : host.meetingName.c_str());
@@ -116,6 +118,8 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, hostLine, body);
   y += 34;
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, workerLine, body);
+  y += 34;
+  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, renderLine, body);
   y += 44;
 
   const size_t timingBreak = timing.find('\n');
