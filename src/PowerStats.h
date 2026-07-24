@@ -20,6 +20,7 @@ struct PowerStatsSnapshot {
   uint64_t freq80MhzUs = 0;
   uint64_t freq160MhzUs = 0;
   uint64_t freqOtherUs = 0;
+  uint32_t renderRequests = 0;
 };
 
 bool beginPowerStats();

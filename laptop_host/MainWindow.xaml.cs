@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
@@ -10,7 +11,6 @@ namespace X3LaptopCompanion
     {
         private readonly TeamsController teamsController = new TeamsController();
         private readonly MediaStatusSensor mediaStatusSensor = new MediaStatusSensor();
-        private readonly UiaWindowDumper uiaWindowDumper = new UiaWindowDumper();
         private readonly CompanionConnectionService connectionService = new CompanionConnectionService();
         private readonly DispatcherTimer statusTimer = new DispatcherTimer();
 
@@ -20,6 +20,8 @@ namespace X3LaptopCompanion
         private string microphoneText = "Unknown";
         private string cameraText = "Unknown";
         private string handText = "Unknown";
+        private string buttonProtocolText = "No pending button";
+        private string participationText = "No participation pulses";
         private bool isTestMode;
         private string testModeText = "Off";
         private bool testTeamsDetected = true;
@@ -37,12 +39,22 @@ namespace X3LaptopCompanion
         private bool isTeamsDryRun;
         private string teamsModeText = "Live Teams";
         private string commandTargetProcessIdText = string.Empty;
-        private string windowDumpTargetText = string.Empty;
         private readonly System.Collections.Generic.Dictionary<CompanionButton, ushort> lastButtonSequences =
             new System.Collections.Generic.Dictionary<CompanionButton, ushort>();
-        private ushort simulatedButtonSequence = 0xFF00;
+        private ushort simulatedButtonSequence = 0x7E00;
+        private CompanionButton? pendingButton;
+        private ushort pendingButtonCounter;
+        private CompanionTriState? pendingButtonExpectedState;
+        private long pendingButtonReceivedTimestamp;
+        private long? pendingButtonObservedLatencyMs;
+        private ushort microphoneStateCounter;
+        private ushort cameraStateCounter;
+        private ushort handStateCounter;
         private bool wasBleConnected;
         private bool hostStateWriteInFlight;
+        private bool isExiting;
+        private bool statusRefreshInFlight;
+        private bool teamsCommandRefreshInFlight;
         private HostStatePayload lastSentHostState;
         private HostStatePayload pendingHostState;
         private string pendingHostStateReason;
@@ -52,7 +64,9 @@ namespace X3LaptopCompanion
         private sealed class HostStatePayload
         {
             public HostStatePayload(bool teamsDetected, bool meetingDetected, string meetingName,
-                CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message)
+                CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message,
+                ushort teamsCounter, ushort meetingCounter, ushort microphoneCounter, ushort cameraCounter,
+                ushort handCounter)
             {
                 TeamsDetected = teamsDetected;
                 MeetingDetected = meetingDetected;
@@ -61,6 +75,11 @@ namespace X3LaptopCompanion
                 Camera = camera;
                 Hand = hand;
                 Message = string.IsNullOrWhiteSpace(message) ? string.Empty : message;
+                TeamsCounter = teamsCounter;
+                MeetingCounter = meetingCounter;
+                MicrophoneCounter = microphoneCounter;
+                CameraCounter = cameraCounter;
+                HandCounter = handCounter;
             }
 
             public bool TeamsDetected { get; }
@@ -70,6 +89,26 @@ namespace X3LaptopCompanion
             public CompanionTriState Camera { get; }
             public CompanionTriState Hand { get; }
             public string Message { get; }
+            public ushort TeamsCounter { get; }
+            public ushort MeetingCounter { get; }
+            public ushort MicrophoneCounter { get; }
+            public ushort CameraCounter { get; }
+            public ushort HandCounter { get; }
+
+            public ushort CounterFor(CompanionButton button)
+            {
+                if (button == CompanionButton.ToggleMute)
+                {
+                    return MicrophoneCounter;
+                }
+
+                if (button == CompanionButton.ToggleHand)
+                {
+                    return HandCounter;
+                }
+
+                return CameraCounter;
+            }
 
             public bool SameAs(HostStatePayload other)
             {
@@ -80,7 +119,12 @@ namespace X3LaptopCompanion
                     Microphone == other.Microphone &&
                     Camera == other.Camera &&
                     Hand == other.Hand &&
-                    string.Equals(Message, other.Message, System.StringComparison.Ordinal);
+                    string.Equals(Message, other.Message, System.StringComparison.Ordinal) &&
+                    TeamsCounter == other.TeamsCounter &&
+                    MeetingCounter == other.MeetingCounter &&
+                    MicrophoneCounter == other.MicrophoneCounter &&
+                    CameraCounter == other.CameraCounter &&
+                    HandCounter == other.HandCounter;
             }
         }
 
@@ -91,6 +135,7 @@ namespace X3LaptopCompanion
             HostLog.Write("Main window created.");
             connectionService.StatusChanged += OnConnectionStatusChanged;
             connectionService.ButtonEventReceived += OnButtonEventReceived;
+            connectionService.ParticipationEventReceived += OnParticipationEventReceived;
             statusTimer.Interval = System.TimeSpan.FromSeconds(2);
             statusTimer.Tick += OnStatusTimerTick;
             Loaded += OnLoaded;
@@ -133,6 +178,18 @@ namespace X3LaptopCompanion
         {
             get { return handText; }
             private set { SetField(ref handText, value, nameof(HandText)); }
+        }
+
+        public string ButtonProtocolText
+        {
+            get { return buttonProtocolText; }
+            private set { SetField(ref buttonProtocolText, value, nameof(ButtonProtocolText)); }
+        }
+
+        public string ParticipationText
+        {
+            get { return participationText; }
+            private set { SetField(ref participationText, value, nameof(ParticipationText)); }
         }
 
         public bool IsTestMode
@@ -263,18 +320,6 @@ namespace X3LaptopCompanion
             }
         }
 
-        public string WindowDumpTargetText
-        {
-            get { return windowDumpTargetText; }
-            set
-            {
-                if (SetField(ref windowDumpTargetText, value, nameof(WindowDumpTargetText)))
-                {
-                    HostLog.Write("UIA dump target text changed. value=\"" + value + "\"");
-                }
-            }
-        }
-
         public string DetailText
         {
             get { return detailText; }
@@ -296,6 +341,7 @@ namespace X3LaptopCompanion
             }
 
             simulatedButtonSequence++;
+            simulatedButtonSequence = NormalizeProtocolCounter(simulatedButtonSequence);
             OnButtonEventReceived(this, new CompanionButtonEvent(CompanionButton.ToggleMute,
                 CompanionButtonAction.Released, simulatedButtonSequence, 0));
         }
@@ -342,9 +388,29 @@ namespace X3LaptopCompanion
 
         private void OnClosing(object sender, CancelEventArgs e)
         {
+            if (isExiting || Application.Current.Dispatcher.HasShutdownStarted)
+            {
+                HostLog.Write("Main window close requested for app exit.");
+                StopServicesForExit();
+                return;
+            }
+
             HostLog.Write("Main window close requested; hiding to tray.");
             e.Cancel = true;
             Hide();
+        }
+
+        public void ExitApplication()
+        {
+            if (isExiting)
+            {
+                return;
+            }
+
+            HostLog.Write("Application exit requested.");
+            isExiting = true;
+            StopServicesForExit();
+            Application.Current.Shutdown();
         }
 
         private void ToggleMute_Click(object sender, RoutedEventArgs e)
@@ -380,16 +446,6 @@ namespace X3LaptopCompanion
         private void ToggleVideo_Click(object sender, RoutedEventArgs e)
         {
             SendTeamsCommandFromUi(TeamsCommand.ToggleVideo);
-        }
-
-        private void DumpWindow_Click(object sender, RoutedEventArgs e)
-        {
-            DumpWindow();
-        }
-
-        private void ListWindows_Click(object sender, RoutedEventArgs e)
-        {
-            ListWindows();
         }
 
         private void CycleTestMicrophone_Click(object sender, RoutedEventArgs e)
@@ -430,52 +486,15 @@ namespace X3LaptopCompanion
             });
         }
 
-        private void DumpWindow()
-        {
-            var target = WindowDumpTargetText;
-            if (string.IsNullOrWhiteSpace(target))
-            {
-                DetailText = "Enter a window target before dumping.";
-                HostLog.Write("UIA dump skipped; target is blank.");
-                return;
-            }
-
-            DetailText = "UIA dump queued. Use Open Log to inspect it.";
-            HostLog.Write("UIA dump requested. target=\"" + target + "\"");
-            _ = Task.Run(() =>
-            {
-                var dumped = uiaWindowDumper.DumpWindow(target);
-                Dispatcher.Invoke(() =>
-                {
-                    DetailText = dumped
-                        ? "UIA dump written to the log."
-                        : "UIA dump target was not found. Use List Windows to discover a target.";
-                });
-            });
-        }
-
-        private void ListWindows()
-        {
-            var filter = WindowDumpTargetText;
-            DetailText = "Window list queued. Use Open Log to inspect it.";
-            HostLog.Write("UIA window list requested. filter=\"" + filter + "\"");
-            _ = Task.Run(() =>
-            {
-                uiaWindowDumper.ListWindows(filter);
-                Dispatcher.Invoke(() =>
-                {
-                    DetailText = "Window list written to the log.";
-                });
-            });
-        }
-
         private void RefreshTeamsPresence()
         {
             if (IsTeamsDryRun)
             {
                 TeamsText = "Dry run";
+                MeetingText = "No";
                 CameraText = "Unknown";
                 MicrophoneText = "Unknown";
+                HandText = "Unknown";
                 return;
             }
 
@@ -496,6 +515,11 @@ namespace X3LaptopCompanion
 
         private void OnStatusTimerTick(object sender, System.EventArgs e)
         {
+            if (isExiting)
+            {
+                return;
+            }
+
             if (IsTestMode)
             {
                 ApplyTestStatusToUi();
@@ -510,17 +534,75 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            var snapshot = ReadTeamsMeetingSnapshot();
-            ApplyTeamsSnapshotToUi(snapshot);
-            QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
-                snapshot.Microphone,
-                snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot), "current");
+            if (teamsCommandRefreshInFlight)
+            {
+                HostLog.Write("Live Teams status refresh skipped; Teams command refresh is in flight.");
+                return;
+            }
+
+            if (statusRefreshInFlight)
+            {
+                HostLog.Write("Live Teams status refresh skipped; previous refresh is still running.");
+                return;
+            }
+
+            statusRefreshInFlight = true;
+            _ = RefreshLiveTeamsStatusAsync(ParseCommandTargetProcessId());
+        }
+
+        private async Task RefreshLiveTeamsStatusAsync(int? explicitTargetProcessId, bool force = false)
+        {
+            try
+            {
+                var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(true, explicitTargetProcessId));
+                if (isExiting || Dispatcher.HasShutdownStarted)
+                {
+                    return;
+                }
+
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (isExiting)
+                    {
+                        return;
+                    }
+
+                    if (teamsCommandRefreshInFlight)
+                    {
+                        HostLog.Write("Live Teams status refresh result discarded; Teams command refresh is in flight.");
+                        return;
+                    }
+
+                    ApplyTeamsSnapshotToUi(snapshot);
+                    QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
+                        snapshot.Microphone, snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
+                        "current", force);
+                });
+            }
+            catch (System.Exception ex)
+            {
+                HostLog.Write("Live Teams status refresh failed.", ex);
+            }
+            finally
+            {
+                statusRefreshInFlight = false;
+            }
         }
 
         private void OnConnectionStatusChanged(object sender, CompanionConnectionStatus status)
         {
-            Dispatcher.Invoke(() =>
+            if (isExiting || Dispatcher.HasShutdownStarted)
             {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (isExiting)
+                {
+                    return;
+                }
+
                 HostLog.Write("UI status received. connected=" + status.IsConnected + " message=" + status.Message);
                 ConnectionText = status.IsConnected ? "Connected" : "Disconnected";
                 DetailText = status.Message;
@@ -535,9 +617,22 @@ namespace X3LaptopCompanion
 
                 if (reconnected)
                 {
-                    SendCurrentHostStatus(force: true);
+                    if (IsTestMode || IsTeamsDryRun)
+                    {
+                        SendCurrentHostStatus(force: true);
+                        return;
+                    }
+
+                    if (statusRefreshInFlight)
+                    {
+                        HostLog.Write("Initial live Teams status refresh skipped; refresh is already running.");
+                        return;
+                    }
+
+                    statusRefreshInFlight = true;
+                    _ = RefreshLiveTeamsStatusAsync(ParseCommandTargetProcessId(), force: true);
                 }
-            });
+            }));
         }
 
         private void OnButtonEventReceived(object sender, CompanionButtonEvent buttonEvent)
@@ -559,8 +654,24 @@ namespace X3LaptopCompanion
             }
 
             lastButtonSequences[buttonEvent.Button] = buttonEvent.Sequence;
-            Dispatcher.Invoke(() =>
+            pendingButton = buttonEvent.Button;
+            pendingButtonCounter = buttonEvent.Sequence;
+            pendingButtonExpectedState = null;
+            pendingButtonReceivedTimestamp = Stopwatch.GetTimestamp();
+            pendingButtonObservedLatencyMs = null;
+            if (isExiting || Dispatcher.HasShutdownStarted)
             {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (isExiting)
+                {
+                    return;
+                }
+
+                ButtonProtocolText = ButtonName(buttonEvent.Button) + " #" + buttonEvent.Sequence + " pressed";
                 TeamsCommand? command = null;
                 switch (buttonEvent.Button)
                 {
@@ -581,7 +692,23 @@ namespace X3LaptopCompanion
                         " command=" + TeamsController.CommandName(command.Value));
                     SendTeamsCommandFromUi(command.Value);
                 }
-            });
+            }));
+        }
+
+        private void OnParticipationEventReceived(object sender, CompanionParticipationEvent participationEvent)
+        {
+            if (isExiting || Dispatcher.HasShutdownStarted)
+            {
+                return;
+            }
+
+            Dispatcher.InvokeAsync(new System.Action(() =>
+            {
+                if (!isExiting)
+                {
+                    ParticipationText = "#" + participationEvent.Counter;
+                }
+            }), DispatcherPriority.Send);
         }
 
         private void ApplyTestMode()
@@ -638,10 +765,13 @@ namespace X3LaptopCompanion
                 snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot), "current", force);
         }
 
-        private void SendTeamsCommandFromUi(TeamsCommand command)
+        private async void SendTeamsCommandFromUi(TeamsCommand command)
         {
             var name = TeamsController.CommandName(command);
-            HostLog.Write(name + " requested.");
+            var stopwatch = Stopwatch.StartNew();
+            HostLog.Write("Teams command requested. command=" + name +
+                " uiThread=" + Dispatcher.CheckAccess() +
+                " threadId=" + Thread.CurrentThread.ManagedThreadId);
             if (IsTeamsDryRun)
             {
                 TeamsText = "Dry run";
@@ -653,21 +783,89 @@ namespace X3LaptopCompanion
             }
 
             var explicitPid = ParseCommandTargetProcessId();
-            EnsureAudioProcessCacheForCommand(explicitPid);
-            if (!teamsController.TrySendCommand(command, mediaStatusSensor.TeamsAudioProcessIds, explicitPid))
+            teamsCommandRefreshInFlight = true;
+            try
             {
-                HostLog.Write(name + " failed; Teams UIA control not found or not invokable.");
-                DetailText = "Teams control was not found. Start or join a meeting, then try again.";
-                var failedSnapshot = ReadTeamsMeetingSnapshot();
-                QueueHostStatusIfChanged(failedSnapshot.TeamsDetected, failedSnapshot.MeetingDetected,
-                    failedSnapshot.MeetingName, failedSnapshot.Microphone, failedSnapshot.Camera, failedSnapshot.Hand,
-                    StatusMessageForSnapshot(failedSnapshot), "teams command missing");
-                return;
-            }
+                HostLog.Write("Teams command invoke scheduling. command=" + name +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds +
+                    " uiThread=" + Dispatcher.CheckAccess());
+                var invoked = await Task.Run(() =>
+                {
+                    HostLog.Write("Teams command invoke worker running. command=" + name +
+                        " threadId=" + Thread.CurrentThread.ManagedThreadId);
+                    EnsureAudioProcessCacheForCommand(explicitPid);
+                    return teamsController.TrySendCommand(command, mediaStatusSensor.TeamsAudioProcessIds, explicitPid);
+                }).ConfigureAwait(false);
+                HostLog.Write("Teams command invoke completed. command=" + name +
+                    " invoked=" + invoked +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds +
+                    " uiThread=" + Dispatcher.CheckAccess() +
+                    " threadId=" + Thread.CurrentThread.ManagedThreadId);
+                if (isExiting || Dispatcher.HasShutdownStarted)
+                {
+                    return;
+                }
 
-            HostLog.Write(name + " invoked in Teams.");
-            DetailText = name + " invoked in Teams.";
-            _ = RefreshAndSendCurrentStatusAfterInvokeAsync(name);
+                if (!invoked)
+                {
+                    HostLog.Write(name + " failed; Teams UIA control not found or not invokable.");
+                    await Dispatcher.InvokeAsync(new System.Action(() =>
+                    {
+                        if (!isExiting)
+                        {
+                            DetailText = "Teams control was not found. Start or join a meeting, then try again.";
+                        }
+                    }));
+                    var failedSnapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(true, explicitPid))
+                        .ConfigureAwait(false);
+                    if (isExiting || Dispatcher.HasShutdownStarted)
+                    {
+                        return;
+                    }
+
+                    await Dispatcher.InvokeAsync(new System.Action(() =>
+                    {
+                        if (!isExiting)
+                        {
+                            QueueHostStatusIfChanged(failedSnapshot.TeamsDetected, failedSnapshot.MeetingDetected,
+                                failedSnapshot.MeetingName, failedSnapshot.Microphone, failedSnapshot.Camera,
+                                failedSnapshot.Hand, StatusMessageForSnapshot(failedSnapshot), "teams command missing");
+                        }
+                    }));
+                    return;
+                }
+
+                HostLog.Write(name + " invoked in Teams. elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                teamsController.InvalidateMeetingWindowCache("post-command " + name);
+                _ = Dispatcher.BeginInvoke(new System.Action(() =>
+                {
+                    if (!isExiting)
+                    {
+                        DetailText = name + " invoked in Teams.";
+                    }
+                }));
+                var expectedState = GetExpectedStateForCommand(command);
+                if (pendingButton.HasValue && PendingButtonMatchesCommand(command))
+                {
+                    pendingButtonExpectedState = expectedState;
+                }
+
+                HostLog.Write("Post-command waiting for observed state. command=" + name +
+                    " expected=" + FormatTriState(expectedState) +
+                    " firstDelayMs=50" +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds +
+                    " uiThread=" + Dispatcher.CheckAccess());
+                await RefreshAndSendCurrentStatusAfterInvokeAsync(command, name, expectedState, explicitPid,
+                    stopwatch).ConfigureAwait(false);
+            }
+            catch (System.Exception ex)
+            {
+                HostLog.Write("Teams command refresh failed.", ex);
+            }
+            finally
+            {
+                teamsCommandRefreshInFlight = false;
+            }
         }
 
         private void EnsureAudioProcessCacheForCommand(int? explicitPid)
@@ -687,20 +885,202 @@ namespace X3LaptopCompanion
             mediaStatusSensor.GetMicrophoneState(teamsProcessIds);
         }
 
-        private async Task RefreshAndSendCurrentStatusAfterInvokeAsync(string commandName)
+        private CompanionTriState? GetExpectedStateForCommand(TeamsCommand command)
         {
-            await Task.Delay(50);
-            Dispatcher.Invoke(() =>
+            if (lastSentHostState == null)
             {
-                HostLog.Write("Post-command Teams state refresh starting. command=" + commandName +
-                    " delayMs=50");
-                var snapshot = ReadTeamsMeetingSnapshot(refreshAudioProcessCache: false);
-                ApplyTeamsSnapshotToUi(snapshot);
-                QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
-                    snapshot.Microphone,
-                    snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
-                    "post-command refresh 50ms");
-            });
+                return null;
+            }
+
+            switch (command)
+            {
+                case TeamsCommand.ToggleMute:
+                    return TryToggleTriState(lastSentHostState.Microphone, out var microphone) ? microphone : null;
+                case TeamsCommand.ToggleVideo:
+                    return TryToggleTriState(lastSentHostState.Camera, out var camera) ? camera : null;
+                case TeamsCommand.ToggleHand:
+                    return TryToggleTriState(lastSentHostState.Hand, out var hand) ? hand : null;
+                default:
+                    return null;
+            }
+        }
+
+        private async Task RefreshAndSendCurrentStatusAfterInvokeAsync(TeamsCommand command, string commandName,
+            CompanionTriState? expectedState, int? explicitTargetProcessId, Stopwatch commandStopwatch)
+        {
+            var delaysMs = new[] { 50, 100, 150, 250, 400, 650, 1000 };
+            for (var attempt = 0; attempt < delaysMs.Length; attempt++)
+            {
+                await Task.Delay(delaysMs[attempt]).ConfigureAwait(false);
+                var snapshotReadStartedAt = Stopwatch.GetTimestamp();
+                var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(false, explicitTargetProcessId, command,
+                        expectedState))
+                    .ConfigureAwait(false);
+                var snapshotObservedAt = Stopwatch.GetTimestamp();
+                var snapshotReadMs = ElapsedMillisecondsBetween(snapshotReadStartedAt, snapshotObservedAt);
+                if (isExiting || Dispatcher.HasShutdownStarted)
+                {
+                    return;
+                }
+
+                var observedState = GetCommandField(snapshot, command);
+                var observedExpectedState = expectedState.HasValue &&
+                    observedState.HasValue &&
+                    observedState.Value == expectedState.Value;
+                var observedKnownState = observedState.HasValue && observedState.Value != CompanionTriState.Unknown;
+                var observedInclusiveState = !expectedState.HasValue && observedKnownState;
+                var acceptedButtonState = observedExpectedState || observedInclusiveState;
+                var acceptedCounterState = acceptedButtonState ? observedState : null;
+                var finalAttempt = attempt == delaysMs.Length - 1;
+                var canAcknowledgePendingButton = acceptedButtonState && pendingButton.HasValue &&
+                    PendingButtonMatchesCommand(command);
+                var shouldSendObservedState = acceptedButtonState || !pendingButton.HasValue || finalAttempt;
+                var observedLatencyMs = commandStopwatch.ElapsedMilliseconds;
+                long? pendingObservedLatencyMs = null;
+                CompanionButton? observedPendingButton = null;
+                ushort observedPendingCounter = 0;
+                if (canAcknowledgePendingButton)
+                {
+                    observedPendingButton = pendingButton;
+                    observedPendingCounter = pendingButtonCounter;
+                    pendingObservedLatencyMs = pendingButtonReceivedTimestamp > 0
+                        ? ElapsedMillisecondsBetween(pendingButtonReceivedTimestamp, snapshotObservedAt)
+                        : observedLatencyMs;
+                }
+
+                HostLog.Write("Post-command Teams state refresh. command=" + commandName +
+                    " attempt=" + (attempt + 1) + " delayMs=" + delaysMs[attempt] +
+                    " expected=" + FormatTriState(expectedState) +
+                    " observed=" + FormatTriState(observedState) +
+                    " inclusive=" + observedInclusiveState +
+                    " accepted=" + shouldSendObservedState +
+                    " pendingAck=" + canAcknowledgePendingButton +
+                    " snapshotReadMs=" + snapshotReadMs +
+                    " observedLatencyMs=" + observedLatencyMs +
+                    " pendingObservedLatencyMs=" +
+                    (pendingObservedLatencyMs.HasValue ? pendingObservedLatencyMs.Value.ToString() : "n/a") +
+                    " uiThread=" + Dispatcher.CheckAccess());
+
+                if (!shouldSendObservedState)
+                {
+                    continue;
+                }
+
+                var dispatchQueuedAt = Stopwatch.GetTimestamp();
+                await Dispatcher.InvokeAsync(new System.Action(() =>
+                {
+                    if (isExiting)
+                    {
+                        return;
+                    }
+
+                    var dispatchLagMs = ElapsedMillisecondsSince(dispatchQueuedAt);
+                    HostLog.Write("Post-command UI update applying. command=" + commandName +
+                        " dispatchLagMs=" + dispatchLagMs +
+                        " observedLatencyMs=" + observedLatencyMs +
+                        " uiThread=" + Dispatcher.CheckAccess());
+                    if (dispatchLagMs > 50)
+                    {
+                        HostLog.Write("Post-command UI dispatch lag. command=" + commandName +
+                            " lagMs=" + dispatchLagMs +
+                            " observedLatencyMs=" + observedLatencyMs);
+                    }
+
+                    if (acceptedButtonState && observedPendingButton.HasValue && pendingObservedLatencyMs.HasValue)
+                    {
+                        pendingButtonObservedLatencyMs = pendingObservedLatencyMs.Value;
+                        pendingButtonExpectedState = acceptedCounterState;
+                        ButtonProtocolText = ButtonName(observedPendingButton.Value) + " #" + observedPendingCounter +
+                            " observed in " + pendingObservedLatencyMs.Value + "ms";
+                        DetailText = commandName + " observed in " + pendingObservedLatencyMs.Value + "ms.";
+                    }
+                    else if (acceptedButtonState)
+                    {
+                        DetailText = commandName + " observed in " + observedLatencyMs + "ms.";
+                    }
+                    else if (finalAttempt)
+                    {
+                        DetailText = commandName + " reconciled after " + observedLatencyMs + "ms.";
+                    }
+
+                    ApplyTeamsSnapshotToUi(snapshot);
+                    QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
+                        snapshot.Microphone, snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
+                        "post-command refresh " + delaysMs[attempt] + "ms");
+                }), DispatcherPriority.Send);
+                return;
+            }
+        }
+
+        private static bool TryToggleTriState(CompanionTriState current, out CompanionTriState next)
+        {
+            if (current == CompanionTriState.On)
+            {
+                next = CompanionTriState.Off;
+                return true;
+            }
+
+            if (current == CompanionTriState.Off)
+            {
+                next = CompanionTriState.On;
+                return true;
+            }
+
+            next = CompanionTriState.Unknown;
+            return false;
+        }
+
+        private static CompanionTriState? GetCommandField(TeamsMeetingSnapshot snapshot, TeamsCommand command)
+        {
+            if (snapshot == null)
+            {
+                return null;
+            }
+
+            switch (command)
+            {
+                case TeamsCommand.ToggleMute:
+                    return snapshot.Microphone;
+                case TeamsCommand.ToggleVideo:
+                    return snapshot.Camera;
+                case TeamsCommand.ToggleHand:
+                    return snapshot.Hand;
+                default:
+                    return null;
+            }
+        }
+
+        private bool PendingButtonMatchesCommand(TeamsCommand command)
+        {
+            if (!pendingButton.HasValue)
+            {
+                return false;
+            }
+
+            return (pendingButton.Value == CompanionButton.ToggleMute && command == TeamsCommand.ToggleMute) ||
+                (pendingButton.Value == CompanionButton.ToggleCamera && command == TeamsCommand.ToggleVideo) ||
+                (pendingButton.Value == CompanionButton.ToggleHand && command == TeamsCommand.ToggleHand);
+        }
+
+        private static CompanionTriState StateForButton(CompanionButton button, CompanionTriState microphone,
+            CompanionTriState camera, CompanionTriState hand)
+        {
+            if (button == CompanionButton.ToggleMute)
+            {
+                return microphone;
+            }
+
+            if (button == CompanionButton.ToggleCamera)
+            {
+                return camera;
+            }
+
+            return hand;
+        }
+
+        private static string FormatTriState(CompanionTriState? value)
+        {
+            return value.HasValue ? value.Value.ToString() : "n/a";
         }
 
         private TeamsMeetingSnapshot ReadTeamsMeetingSnapshot()
@@ -709,6 +1089,17 @@ namespace X3LaptopCompanion
         }
 
         private TeamsMeetingSnapshot ReadTeamsMeetingSnapshot(bool refreshAudioProcessCache)
+        {
+            return ReadTeamsMeetingSnapshot(refreshAudioProcessCache, ParseCommandTargetProcessId());
+        }
+
+        private TeamsMeetingSnapshot ReadTeamsMeetingSnapshot(bool refreshAudioProcessCache, int? explicitTargetProcessId)
+        {
+            return ReadTeamsMeetingSnapshot(refreshAudioProcessCache, explicitTargetProcessId, null, null);
+        }
+
+        private TeamsMeetingSnapshot ReadTeamsMeetingSnapshot(bool refreshAudioProcessCache, int? explicitTargetProcessId,
+            TeamsCommand? anchorCommand, CompanionTriState? expectedState)
         {
             var teamsProcessIds = teamsController.TeamsProcessIds;
             if (refreshAudioProcessCache && teamsProcessIds.Count > 0)
@@ -719,7 +1110,7 @@ namespace X3LaptopCompanion
             }
 
             return teamsController.GetMeetingSnapshot(mediaStatusSensor.TeamsAudioProcessIds,
-                ParseCommandTargetProcessId());
+                explicitTargetProcessId, anchorCommand, expectedState);
         }
 
         private static string TeamsTextForSnapshot(TeamsMeetingSnapshot snapshot)
@@ -771,13 +1162,19 @@ namespace X3LaptopCompanion
             CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message,
             string reason, bool force = false)
         {
+            if (isExiting)
+            {
+                HostLog.Write("Host state write skipped while app is exiting. reason=" + reason);
+                return;
+            }
+
             if (!wasBleConnected)
             {
                 HostLog.Write("Host state write skipped while BLE is disconnected. reason=" + reason);
                 return;
             }
 
-            var payload = new HostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
+            var payload = BuildHostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
                 message);
             if (!force && payload.SameAs(lastSentHostState))
             {
@@ -796,17 +1193,50 @@ namespace X3LaptopCompanion
             _ = SendHostStatePayloadAsync(payload, reason);
         }
 
+        private HostStatePayload BuildHostStatePayload(bool teamsDetected, bool meetingDetected, string meetingName,
+            CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message)
+        {
+            if (pendingButton.HasValue && pendingButtonExpectedState.HasValue &&
+                StateForButton(pendingButton.Value, microphone, camera, hand) == pendingButtonExpectedState.Value)
+            {
+                var counter = (ushort)(pendingButtonCounter & CompanionProtocol.StateCounterMask);
+                if (pendingButton.Value == CompanionButton.ToggleMute)
+                {
+                    microphoneStateCounter = counter;
+                }
+                else if (pendingButton.Value == CompanionButton.ToggleHand)
+                {
+                    handStateCounter = counter;
+                }
+                else if (pendingButton.Value == CompanionButton.ToggleCamera)
+                {
+                    cameraStateCounter = counter;
+                }
+            }
+
+            return new HostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
+                message, 0, 0, microphoneStateCounter, cameraStateCounter,
+                handStateCounter);
+        }
+
         private async Task SendHostStatePayloadAsync(HostStatePayload payload, string reason)
         {
             hostStateWriteInFlight = true;
             try
             {
                 HostLog.Write("Host state write queued. reason=" + reason);
+                var priorityButton = pendingButton.HasValue &&
+                    payload.CounterFor(pendingButton.Value) == pendingButtonCounter
+                    ? pendingButton
+                    : null;
                 var sent = await connectionService.SendHostStatusAsync(payload.TeamsDetected, payload.MeetingDetected,
-                    payload.MeetingName, payload.Microphone, payload.Camera, payload.Hand, payload.Message);
+                    payload.MeetingName, payload.Microphone, payload.Camera, payload.Hand, payload.Message,
+                    payload.TeamsCounter, payload.MeetingCounter, payload.MicrophoneCounter, payload.CameraCounter,
+                    payload.HandCounter, priorityButton);
                 if (sent)
                 {
                     lastSentHostState = payload;
+                    ClearPendingButtonIfAcknowledged(payload);
                 }
             }
             finally
@@ -816,11 +1246,76 @@ namespace X3LaptopCompanion
                 var pendingReason = pendingHostStateReason;
                 pendingHostState = null;
                 pendingHostStateReason = null;
-                if (pending != null && !pending.SameAs(lastSentHostState))
+                if (!isExiting && pending != null && !pending.SameAs(lastSentHostState))
                 {
                     _ = SendHostStatePayloadAsync(pending, pendingReason ?? "pending");
                 }
             }
+        }
+
+        private void ClearPendingButtonIfAcknowledged(HostStatePayload payload)
+        {
+            if (!pendingButton.HasValue || payload.CounterFor(pendingButton.Value) != pendingButtonCounter)
+            {
+                return;
+            }
+
+            var protocolLatencyMs = pendingButtonReceivedTimestamp > 0
+                ? ElapsedMillisecondsSince(pendingButtonReceivedTimestamp)
+                : 0;
+            var observedLatencyText = pendingButtonObservedLatencyMs.HasValue
+                ? " observed in " + pendingButtonObservedLatencyMs.Value + "ms"
+                : " acknowledged in " + protocolLatencyMs + "ms";
+            var clearedText = ButtonName(pendingButton.Value) + " #" + pendingButtonCounter + observedLatencyText;
+            HostLog.Write("Button protocol acknowledged. button=" + pendingButton.Value +
+                " seq=" + pendingButtonCounter +
+                " observedLatencyMs=" +
+                (pendingButtonObservedLatencyMs.HasValue ? pendingButtonObservedLatencyMs.Value.ToString() : "n/a") +
+                " protocolLatencyMs=" + protocolLatencyMs);
+            pendingButton = null;
+            pendingButtonCounter = 0;
+            pendingButtonExpectedState = null;
+            pendingButtonReceivedTimestamp = 0;
+            pendingButtonObservedLatencyMs = null;
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (!isExiting)
+                {
+                    ButtonProtocolText = clearedText;
+                    DetailText = clearedText;
+                }
+            }));
+        }
+
+        private static long ElapsedMillisecondsSince(long timestamp)
+        {
+            if (timestamp <= 0)
+            {
+                return 0;
+            }
+
+            return ElapsedMillisecondsBetween(timestamp, Stopwatch.GetTimestamp());
+        }
+
+        private static long ElapsedMillisecondsBetween(long startedAt, long endedAt)
+        {
+            if (startedAt <= 0 || endedAt <= startedAt)
+            {
+                return 0;
+            }
+
+            return (long)((endedAt - startedAt) * 1000.0 / Stopwatch.Frequency);
+        }
+
+        private void StopServicesForExit()
+        {
+            statusTimer.Stop();
+            connectionService.StatusChanged -= OnConnectionStatusChanged;
+            connectionService.ButtonEventReceived -= OnButtonEventReceived;
+            connectionService.ParticipationEventReceived -= OnParticipationEventReceived;
+            ResetHostStateWriteCache();
+            wasBleConnected = false;
+            connectionService.Dispose();
         }
 
         private void ResetHostStateWriteCache()
@@ -829,6 +1324,13 @@ namespace X3LaptopCompanion
             pendingHostState = null;
             pendingHostStateReason = null;
             hostStateWriteInFlight = false;
+            pendingButton = null;
+            pendingButtonCounter = 0;
+            pendingButtonExpectedState = null;
+            pendingButtonReceivedTimestamp = 0;
+            pendingButtonObservedLatencyMs = null;
+            teamsCommandRefreshInFlight = false;
+            ButtonProtocolText = "No pending button";
         }
 
         private void OnTestStatusChanged(string reason)
@@ -879,6 +1381,27 @@ namespace X3LaptopCompanion
             }
 
             return value == CompanionTriState.On ? onText : "Unknown";
+        }
+
+        private static ushort NormalizeProtocolCounter(ushort value)
+        {
+            value = (ushort)(value & CompanionProtocol.StateCounterMask);
+            return value == 0 ? (ushort)1 : value;
+        }
+
+        private static string ButtonName(CompanionButton button)
+        {
+            if (button == CompanionButton.ToggleMute)
+            {
+                return "Mute";
+            }
+
+            if (button == CompanionButton.ToggleHand)
+            {
+                return "Hand";
+            }
+
+            return "Camera";
         }
 
         private bool SetField(ref string field, string value, string propertyName)

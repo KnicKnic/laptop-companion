@@ -47,9 +47,19 @@ namespace X3LaptopCompanion
         private static readonly string[] MicrophoneButtonNames = { "Mute mic", "Unmute mic" };
         private static readonly string[] CameraButtonNames = { "Turn camera on", "Turn camera off" };
         private static readonly string[] HandButtonNames = { "Raise your hand", "Lower your hand" };
+        private static readonly string[] MeetingButtonNames =
+        {
+            "Unmute mic",
+            "Mute mic",
+            "Turn camera off",
+            "Turn camera on",
+            "Raise your hand",
+            "Lower your hand"
+        };
         private IntPtr cachedMeetingWindowHandle = IntPtr.Zero;
         private int cachedMeetingTargetProcessId;
         private string cachedMeetingTargetProcessName = string.Empty;
+        private readonly object cachedMeetingWindowLock = new object();
 
         public bool IsTeamsRunning
         {
@@ -59,6 +69,36 @@ namespace X3LaptopCompanion
         public IReadOnlyCollection<int> TeamsProcessIds
         {
             get { return FindTeamsProcesses().Select(p => p.Id).ToList(); }
+        }
+
+        public void InvalidateMeetingWindowCache(string reason)
+        {
+            IntPtr handle;
+            lock (cachedMeetingWindowLock)
+            {
+                handle = cachedMeetingWindowHandle;
+                if (handle == IntPtr.Zero)
+                {
+                    return;
+                }
+
+                cachedMeetingWindowHandle = IntPtr.Zero;
+                cachedMeetingTargetProcessId = 0;
+                cachedMeetingTargetProcessName = string.Empty;
+            }
+
+            HostLog.Write("Teams UIA meeting window cache invalidated. reason=" + reason +
+                " hwnd=0x" + handle.ToInt64().ToString("X"));
+        }
+
+        private void ClearMeetingWindowCache()
+        {
+            lock (cachedMeetingWindowLock)
+            {
+                cachedMeetingWindowHandle = IntPtr.Zero;
+                cachedMeetingTargetProcessId = 0;
+                cachedMeetingTargetProcessName = string.Empty;
+            }
         }
 
         public bool TryToggleMute()
@@ -124,6 +164,13 @@ namespace X3LaptopCompanion
         public TeamsMeetingSnapshot GetMeetingSnapshot(IReadOnlyCollection<int> audioProcessIds,
             int? explicitTargetProcessId)
         {
+            return GetMeetingSnapshot(audioProcessIds, explicitTargetProcessId, null, null);
+        }
+
+        public TeamsMeetingSnapshot GetMeetingSnapshot(IReadOnlyCollection<int> audioProcessIds,
+            int? explicitTargetProcessId, TeamsCommand? anchorCommand, CompanionTriState? expectedState)
+        {
+            var audioMeetingProcessIds = audioProcessIds ?? Array.Empty<int>();
             var teamsDetected = IsTeamsRunning;
             if (!teamsDetected)
             {
@@ -131,7 +178,16 @@ namespace X3LaptopCompanion
                     CompanionTriState.Unknown, CompanionTriState.Unknown, "Teams not running");
             }
 
-            if (!TryFindMeetingWindow(audioProcessIds, explicitTargetProcessId, out var context))
+            if (audioMeetingProcessIds.Count == 0)
+            {
+                InvalidateMeetingWindowCache("active meeting audio missing");
+                return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
+                    CompanionTriState.Unknown, CompanionTriState.Unknown,
+                    "Teams running; active meeting audio session not found");
+            }
+
+            if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, anchorCommand, expectedState,
+                    out var context))
             {
                 return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
                     CompanionTriState.Unknown, CompanionTriState.Unknown, "Teams running; meeting controls not found");
@@ -144,9 +200,18 @@ namespace X3LaptopCompanion
             var camera = GetCameraState(controls);
             var hand = GetHandState(controls);
             var meetingName = ExtractMeetingName(controls.FirstWindowName);
-            var meetingDetected = controls.HasMeetingControl || !string.IsNullOrWhiteSpace(meetingName);
+            var meetingDetected = controls.HasMeetingControl;
+            if (!meetingDetected)
+            {
+                meetingName = string.Empty;
+                microphone = CompanionTriState.Unknown;
+                camera = CompanionTriState.Unknown;
+                hand = CompanionTriState.Unknown;
+            }
+
             var detail = "target=" + DescribeTarget(context.Target) +
                 " hwnd=0x" + context.Hwnd.ToInt64().ToString("X") +
+                " activeAudio=True" +
                 " meeting=\"" + meetingName + "\" " + controls.DescribeState();
 
             HostLog.Write("Teams UIA snapshot. " + detail);
@@ -234,8 +299,14 @@ namespace X3LaptopCompanion
         private bool TryFindMeetingWindow(IReadOnlyCollection<int> audioProcessIds, int? explicitTargetProcessId,
             out MeetingWindowContext context)
         {
+            return TryFindMeetingWindow(audioProcessIds, explicitTargetProcessId, null, null, out context);
+        }
+
+        private bool TryFindMeetingWindow(IReadOnlyCollection<int> audioProcessIds, int? explicitTargetProcessId,
+            TeamsCommand? command, CompanionTriState? expectedState, out MeetingWindowContext context)
+        {
             context = null;
-            if (!explicitTargetProcessId.HasValue && TryUseCachedMeetingWindow(out context))
+            if (!explicitTargetProcessId.HasValue && TryUseCachedMeetingWindow(command, expectedState, out context))
             {
                 return true;
             }
@@ -268,7 +339,9 @@ namespace X3LaptopCompanion
                             continue;
                         }
 
-                        var controls = ReadMeetingControls(root);
+                        var controls = command.HasValue
+                            ? ReadMeetingControls(root, command.Value, expectedState)
+                            : ReadMeetingControls(root);
                         var score = controls.Score;
                         HostLog.Write("Teams UIA target score. " + DescribeTarget(target) +
                             " hwnd=0x" + window.Hwnd.ToInt64().ToString("X") +
@@ -374,18 +447,28 @@ namespace X3LaptopCompanion
         {
             context = null;
             button = null;
-            if (cachedMeetingWindowHandle == IntPtr.Zero || !IsWindow(cachedMeetingWindowHandle))
+            IntPtr handle;
+            int targetProcessId;
+            string targetProcessName;
+            lock (cachedMeetingWindowLock)
             {
-                cachedMeetingWindowHandle = IntPtr.Zero;
+                handle = cachedMeetingWindowHandle;
+                targetProcessId = cachedMeetingTargetProcessId;
+                targetProcessName = cachedMeetingTargetProcessName;
+            }
+
+            if (handle == IntPtr.Zero || !IsWindow(handle))
+            {
+                ClearMeetingWindowCache();
                 return false;
             }
 
             try
             {
-                var root = AutomationElement.FromHandle(cachedMeetingWindowHandle);
+                var root = AutomationElement.FromHandle(handle);
                 if (root == null)
                 {
-                    cachedMeetingWindowHandle = IntPtr.Zero;
+                    ClearMeetingWindowCache();
                     return false;
                 }
 
@@ -394,25 +477,25 @@ namespace X3LaptopCompanion
                 if (!TryFindCommandButton(root, command, out button, out var method))
                 {
                     HostLog.Write("Teams command cached target missed. command=" + CommandName(command) +
-                        " hwnd=0x" + cachedMeetingWindowHandle.ToInt64().ToString("X"));
-                    cachedMeetingWindowHandle = IntPtr.Zero;
+                        " hwnd=0x" + handle.ToInt64().ToString("X"));
+                    ClearMeetingWindowCache();
                     return false;
                 }
 
-                var target = new CommandTarget(cachedMeetingTargetProcessId, cachedMeetingTargetProcessName,
+                var target = new CommandTarget(targetProcessId, targetProcessName,
                     "cached meeting window");
-                context = new MeetingWindowContext(target, cachedMeetingWindowHandle, root, null);
+                context = new MeetingWindowContext(target, handle, root, null);
                 HostLog.Write("Teams command cached target hit. command=" + CommandName(command) +
                     " method=" + method +
-                    " hwnd=0x" + cachedMeetingWindowHandle.ToInt64().ToString("X") +
+                    " hwnd=0x" + handle.ToInt64().ToString("X") +
                     " buttonName=\"" + button.Name + "\" automationId=\"" + button.AutomationId + "\"");
                 return true;
             }
             catch (Exception ex)
             {
                 HostLog.Write("Teams command cached target failed. hwnd=0x" +
-                    cachedMeetingWindowHandle.ToInt64().ToString("X") + " error=" + ex.Message);
-                cachedMeetingWindowHandle = IntPtr.Zero;
+                    handle.ToInt64().ToString("X") + " error=" + ex.Message);
+                ClearMeetingWindowCache();
                 return false;
             }
         }
@@ -520,158 +603,198 @@ namespace X3LaptopCompanion
             }
         }
 
-        private bool TryUseCachedMeetingWindow(out MeetingWindowContext context)
+        private bool TryUseCachedMeetingWindow(TeamsCommand? command, CompanionTriState? expectedState,
+            out MeetingWindowContext context)
         {
             context = null;
-            if (cachedMeetingWindowHandle == IntPtr.Zero || !IsWindow(cachedMeetingWindowHandle))
+            IntPtr handle;
+            int targetProcessId;
+            string targetProcessName;
+            lock (cachedMeetingWindowLock)
             {
-                cachedMeetingWindowHandle = IntPtr.Zero;
+                handle = cachedMeetingWindowHandle;
+                targetProcessId = cachedMeetingTargetProcessId;
+                targetProcessName = cachedMeetingTargetProcessName;
+            }
+
+            if (handle == IntPtr.Zero || !IsWindow(handle))
+            {
+                ClearMeetingWindowCache();
                 return false;
             }
 
             try
             {
-                var root = AutomationElement.FromHandle(cachedMeetingWindowHandle);
+                var root = AutomationElement.FromHandle(handle);
                 if (root == null)
                 {
-                    cachedMeetingWindowHandle = IntPtr.Zero;
+                    ClearMeetingWindowCache();
                     return false;
                 }
 
                 // Cache only the stable top-level window handle. The Teams buttons themselves are deliberately
                 // rediscovered below because WebView rerenders can invalidate saved AutomationElement instances.
-                var controls = ReadMeetingControls(root);
+                var controls = command.HasValue
+                    ? ReadMeetingControls(root, command.Value, expectedState)
+                    : ReadMeetingControls(root);
                 HostLog.Write("Teams UIA cached target score. hwnd=0x" +
-                    cachedMeetingWindowHandle.ToInt64().ToString("X") +
+                    handle.ToInt64().ToString("X") +
                     " score=" + controls.Score + " " + controls.DescribeState());
                 if (!controls.HasMeetingControl)
                 {
-                    cachedMeetingWindowHandle = IntPtr.Zero;
+                    ClearMeetingWindowCache();
                     return false;
                 }
 
-                var target = new CommandTarget(cachedMeetingTargetProcessId, cachedMeetingTargetProcessName,
+                var target = new CommandTarget(targetProcessId, targetProcessName,
                     "cached meeting window");
-                context = new MeetingWindowContext(target, cachedMeetingWindowHandle, root, controls);
+                context = new MeetingWindowContext(target, handle, root, controls);
                 return true;
             }
             catch (Exception ex)
             {
                 HostLog.Write("Teams UIA cached target failed. hwnd=0x" +
-                    cachedMeetingWindowHandle.ToInt64().ToString("X") + " error=" + ex.Message);
-                cachedMeetingWindowHandle = IntPtr.Zero;
+                    handle.ToInt64().ToString("X") + " error=" + ex.Message);
+                ClearMeetingWindowCache();
                 return false;
             }
         }
 
         private void RememberMeetingWindow(MeetingWindowContext context)
         {
-            cachedMeetingWindowHandle = context.Hwnd;
-            cachedMeetingTargetProcessId = context.Target.ProcessId;
-            cachedMeetingTargetProcessName = context.Target.ProcessName;
+            lock (cachedMeetingWindowLock)
+            {
+                cachedMeetingWindowHandle = context.Hwnd;
+                cachedMeetingTargetProcessId = context.Target.ProcessId;
+                cachedMeetingTargetProcessName = context.Target.ProcessName;
+            }
+
             HostLog.Write("Teams UIA meeting window cached. hwnd=0x" +
-                cachedMeetingWindowHandle.ToInt64().ToString("X") + " target=" + DescribeTarget(context.Target));
+                context.Hwnd.ToInt64().ToString("X") + " target=" + DescribeTarget(context.Target));
         }
 
         private static MeetingControls ReadMeetingControls(AutomationElement root)
         {
+            return ReadMeetingControls(root, null, null);
+        }
+
+        private static MeetingControls ReadMeetingControls(AutomationElement root, TeamsCommand command,
+            CompanionTriState? expectedState)
+        {
+            return ReadMeetingControls(root, (TeamsCommand?)command, expectedState);
+        }
+
+        private static MeetingControls ReadMeetingControls(AutomationElement root, TeamsCommand? anchorCommand,
+            CompanionTriState? expectedState)
+        {
             var controls = new MeetingControls();
-            var count = 0;
-            ReadMeetingControls(root, TreeWalker.RawViewWalker, controls, 0, ref count);
-            controls.NodesVisited = count;
+            controls.FirstWindowName = Safe(() => root.Current.Name);
+            var anchorButton = FindFirstMeetingButton(root, anchorCommand, expectedState, controls);
+            if (anchorButton == null)
+            {
+                return controls;
+            }
+
+            var toolbarRoot = GetParentElement(anchorButton.Element) ?? root;
+            controls.AnchorButtonName = anchorButton.Name;
+            controls.ParentName = Safe(() => toolbarRoot.Current.Name);
+            controls.MuteMicButton = FindButtonByName(toolbarRoot, "Mute mic", controls);
+            controls.UnmuteMicButton = FindButtonByName(toolbarRoot, "Unmute mic", controls);
+            controls.TurnCameraOnButton = FindButtonByName(toolbarRoot, "Turn camera on", controls);
+            controls.TurnCameraOffButton = FindButtonByName(toolbarRoot, "Turn camera off", controls);
+            controls.RaiseHandButton = FindButtonByName(toolbarRoot, "Raise your hand", controls);
+            controls.LowerHandButton = FindButtonByName(toolbarRoot, "Lower your hand", controls);
             return controls;
         }
 
-        private static void ReadMeetingControls(AutomationElement element, TreeWalker walker, MeetingControls controls,
-            int depth, ref int count)
+        private static ButtonInfo FindFirstMeetingButton(AutomationElement root, TeamsCommand? anchorCommand,
+            CompanionTriState? expectedState, MeetingControls controls)
         {
-            if (element == null || depth > MaxMeetingSearchDepth || count >= MaxMeetingSearchNodes)
+            if (root == null)
             {
-                return;
+                return null;
             }
 
-            count++;
-            ReadControl(element, controls);
-
-            AutomationElement child;
-            try
+            foreach (var name in GetAnchorButtonNames(anchorCommand, expectedState))
             {
-                child = walker.GetFirstChild(element);
-            }
-            catch
-            {
-                return;
-            }
-
-            while (child != null && count < MaxMeetingSearchNodes)
-            {
-                ReadMeetingControls(child, walker, controls, depth + 1, ref count);
-                try
+                var button = FindButtonByName(root, name, controls);
+                if (button != null)
                 {
-                    child = walker.GetNextSibling(child);
+                    return button;
                 }
-                catch
-                {
-                    return;
-                }
+            }
+
+            return null;
+        }
+
+        private static IReadOnlyCollection<string> GetAnchorButtonNames(TeamsCommand? anchorCommand,
+            CompanionTriState? expectedState)
+        {
+            if (!anchorCommand.HasValue)
+            {
+                return MeetingButtonNames;
+            }
+
+            if (!expectedState.HasValue)
+            {
+                return GetCommandButtonNames(anchorCommand.Value);
+            }
+
+            switch (anchorCommand.Value)
+            {
+                case TeamsCommand.ToggleMute:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Unmute mic", "Mute mic" }
+                        : new[] { "Mute mic", "Unmute mic" };
+                case TeamsCommand.ToggleVideo:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Turn camera on", "Turn camera off" }
+                        : new[] { "Turn camera off", "Turn camera on" };
+                case TeamsCommand.ToggleHand:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Raise your hand", "Lower your hand" }
+                        : new[] { "Lower your hand", "Raise your hand" };
+                default:
+                    return MeetingButtonNames;
             }
         }
 
-        private static void ReadControl(AutomationElement element, MeetingControls controls)
+        private static AutomationElement GetParentElement(AutomationElement element)
         {
-            var name = Safe(() => element.Current.Name);
-            var controlType = SafeControlType(element);
-            if (string.IsNullOrWhiteSpace(controls.FirstWindowName) &&
-                controlType == ControlType.Window &&
-                !string.IsNullOrWhiteSpace(name))
+            if (element == null)
             {
-                controls.FirstWindowName = name;
+                return null;
             }
 
-            if (!IsButton(controlType))
+            try
             {
-                return;
+                return TreeWalker.RawViewWalker.GetParent(element);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static ButtonInfo FindButtonByName(AutomationElement root, string name, MeetingControls controls)
+        {
+            if (root == null)
+            {
+                return null;
             }
 
-            var button = CreateButtonInfo(element, name);
-            if (NameEqualsAny(name, MicrophoneButtonNames))
+            controls.NodesVisited++;
+            try
             {
-                if (NameEquals(name, "Mute mic"))
-                {
-                    controls.MuteMicButton = controls.MuteMicButton ?? button;
-                }
-                else
-                {
-                    controls.UnmuteMicButton = controls.UnmuteMicButton ?? button;
-                }
-
-                return;
+                var condition = new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                    new PropertyCondition(AutomationElement.NameProperty, name));
+                var element = root.FindFirst(TreeScope.Descendants, condition);
+                return element == null ? null : CreateButtonInfo(element, name);
             }
-
-            if (NameEqualsAny(name, CameraButtonNames))
+            catch
             {
-                if (NameEquals(name, "Turn camera on"))
-                {
-                    controls.TurnCameraOnButton = controls.TurnCameraOnButton ?? button;
-                }
-                else
-                {
-                    controls.TurnCameraOffButton = controls.TurnCameraOffButton ?? button;
-                }
-
-                return;
-            }
-
-            if (NameEqualsAny(name, HandButtonNames))
-            {
-                if (NameEquals(name, "Raise your hand"))
-                {
-                    controls.RaiseHandButton = controls.RaiseHandButton ?? button;
-                }
-                else
-                {
-                    controls.LowerHandButton = controls.LowerHandButton ?? button;
-                }
+                return null;
             }
         }
 
@@ -793,106 +916,10 @@ namespace X3LaptopCompanion
 
         private static IEnumerable<WindowCandidate> FindCandidateWindows(int processId)
         {
-            var directWindows = GetTopLevelWindows()
+            return GetTopLevelWindows()
                 .Where(w => w.ProcessId == processId)
                 .OrderByDescending(w => !string.IsNullOrWhiteSpace(w.Title))
                 .ToList();
-
-            foreach (var window in directWindows)
-            {
-                yield return window;
-            }
-
-            var directHandles = new HashSet<IntPtr>(directWindows.Select(w => w.Hwnd));
-            foreach (var hostedWindow in FindWindowsHostingProcess(processId))
-            {
-                if (directHandles.Add(hostedWindow.Hwnd))
-                {
-                    yield return hostedWindow;
-                }
-            }
-        }
-
-        private static IEnumerable<WindowCandidate> FindWindowsHostingProcess(int processId)
-        {
-            var matches = new List<WindowCandidate>();
-            foreach (var window in GetTopLevelWindows().Where(w => !string.IsNullOrWhiteSpace(w.Title)))
-            {
-                try
-                {
-                    var root = AutomationElement.FromHandle(window.Hwnd);
-                    if (root != null && ContainsProcessId(root, processId, TreeWalker.RawViewWalker, 0, 0))
-                    {
-                        matches.Add(new WindowCandidate(window.Hwnd, window.ProcessId, window.ProcessName,
-                            window.Title, true));
-                    }
-                }
-                catch
-                {
-                }
-            }
-
-            return matches;
-        }
-
-        private static bool ContainsProcessId(AutomationElement element, int processId, TreeWalker walker, int depth,
-            int nodeCount)
-        {
-            if (element == null || depth > MaxMeetingSearchDepth || nodeCount > MaxMeetingSearchNodes)
-            {
-                return false;
-            }
-
-            if (TryGetElementProcessId(element, out var elementProcessId) && elementProcessId == processId)
-            {
-                return true;
-            }
-
-            AutomationElement child;
-            try
-            {
-                child = walker.GetFirstChild(element);
-            }
-            catch
-            {
-                return false;
-            }
-
-            while (child != null)
-            {
-                nodeCount++;
-                if (ContainsProcessId(child, processId, walker, depth + 1, nodeCount))
-                {
-                    return true;
-                }
-
-                try
-                {
-                    child = walker.GetNextSibling(child);
-                }
-                catch
-                {
-                    return false;
-                }
-            }
-
-            return false;
-        }
-
-        private static bool TryGetElementProcessId(AutomationElement element, out int processId)
-        {
-            processId = 0;
-
-            try
-            {
-                processId = element.Current.ProcessId;
-                return processId > 0;
-            }
-            catch
-            {
-                processId = 0;
-                return false;
-            }
         }
 
         private static List<WindowCandidate> GetTopLevelWindows()
@@ -1146,6 +1173,8 @@ namespace X3LaptopCompanion
             public ButtonInfo RaiseHandButton { get; set; }
             public ButtonInfo LowerHandButton { get; set; }
             public int NodesVisited { get; set; }
+            public string AnchorButtonName { get; set; }
+            public string ParentName { get; set; }
 
             public bool HasMeetingControl
             {
@@ -1193,6 +1222,8 @@ namespace X3LaptopCompanion
             {
                 return "nodes=" + NodesVisited +
                     " firstWindow=\"" + (FirstWindowName ?? string.Empty) + "\"" +
+                    " anchor=\"" + (AnchorButtonName ?? string.Empty) + "\"" +
+                    " parent=\"" + (ParentName ?? string.Empty) + "\"" +
                     " muteButton=\"" + ButtonName(MuteMicButton) + "\"" +
                     " unmuteButton=\"" + ButtonName(UnmuteMicButton) + "\"" +
                     " cameraOnButton=\"" + ButtonName(TurnCameraOnButton) + "\"" +
