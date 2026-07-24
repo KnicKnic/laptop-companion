@@ -43,6 +43,8 @@ namespace X3LaptopCompanion
         private ushort simulatedButtonSequence = 0xFF00;
         private bool wasBleConnected;
         private bool hostStateWriteInFlight;
+        private bool isExiting;
+        private bool statusRefreshInFlight;
         private HostStatePayload lastSentHostState;
         private HostStatePayload pendingHostState;
         private string pendingHostStateReason;
@@ -342,9 +344,29 @@ namespace X3LaptopCompanion
 
         private void OnClosing(object sender, CancelEventArgs e)
         {
+            if (isExiting || Application.Current.Dispatcher.HasShutdownStarted)
+            {
+                HostLog.Write("Main window close requested for app exit.");
+                StopServicesForExit();
+                return;
+            }
+
             HostLog.Write("Main window close requested; hiding to tray.");
             e.Cancel = true;
             Hide();
+        }
+
+        public void ExitApplication()
+        {
+            if (isExiting)
+            {
+                return;
+            }
+
+            HostLog.Write("Application exit requested.");
+            isExiting = true;
+            StopServicesForExit();
+            Application.Current.Shutdown();
         }
 
         private void ToggleMute_Click(object sender, RoutedEventArgs e)
@@ -496,6 +518,11 @@ namespace X3LaptopCompanion
 
         private void OnStatusTimerTick(object sender, System.EventArgs e)
         {
+            if (isExiting)
+            {
+                return;
+            }
+
             if (IsTestMode)
             {
                 ApplyTestStatusToUi();
@@ -510,17 +537,63 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            var snapshot = ReadTeamsMeetingSnapshot();
-            ApplyTeamsSnapshotToUi(snapshot);
-            QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
-                snapshot.Microphone,
-                snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot), "current");
+            if (statusRefreshInFlight)
+            {
+                HostLog.Write("Live Teams status refresh skipped; previous refresh is still running.");
+                return;
+            }
+
+            statusRefreshInFlight = true;
+            _ = RefreshLiveTeamsStatusAsync(ParseCommandTargetProcessId());
+        }
+
+        private async Task RefreshLiveTeamsStatusAsync(int? explicitTargetProcessId)
+        {
+            try
+            {
+                var snapshot = await Task.Run(() => ReadTeamsMeetingSnapshot(true, explicitTargetProcessId));
+                if (isExiting || Dispatcher.HasShutdownStarted)
+                {
+                    return;
+                }
+
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (isExiting)
+                    {
+                        return;
+                    }
+
+                    ApplyTeamsSnapshotToUi(snapshot);
+                    QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
+                        snapshot.Microphone, snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
+                        "current");
+                });
+            }
+            catch (System.Exception ex)
+            {
+                HostLog.Write("Live Teams status refresh failed.", ex);
+            }
+            finally
+            {
+                statusRefreshInFlight = false;
+            }
         }
 
         private void OnConnectionStatusChanged(object sender, CompanionConnectionStatus status)
         {
-            Dispatcher.Invoke(() =>
+            if (isExiting || Dispatcher.HasShutdownStarted)
             {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (isExiting)
+                {
+                    return;
+                }
+
                 HostLog.Write("UI status received. connected=" + status.IsConnected + " message=" + status.Message);
                 ConnectionText = status.IsConnected ? "Connected" : "Disconnected";
                 DetailText = status.Message;
@@ -537,7 +610,7 @@ namespace X3LaptopCompanion
                 {
                     SendCurrentHostStatus(force: true);
                 }
-            });
+            }));
         }
 
         private void OnButtonEventReceived(object sender, CompanionButtonEvent buttonEvent)
@@ -559,8 +632,18 @@ namespace X3LaptopCompanion
             }
 
             lastButtonSequences[buttonEvent.Button] = buttonEvent.Sequence;
-            Dispatcher.Invoke(() =>
+            if (isExiting || Dispatcher.HasShutdownStarted)
             {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (isExiting)
+                {
+                    return;
+                }
+
                 TeamsCommand? command = null;
                 switch (buttonEvent.Button)
                 {
@@ -581,7 +664,7 @@ namespace X3LaptopCompanion
                         " command=" + TeamsController.CommandName(command.Value));
                     SendTeamsCommandFromUi(command.Value);
                 }
-            });
+            }));
         }
 
         private void ApplyTestMode()
@@ -710,6 +793,11 @@ namespace X3LaptopCompanion
 
         private TeamsMeetingSnapshot ReadTeamsMeetingSnapshot(bool refreshAudioProcessCache)
         {
+            return ReadTeamsMeetingSnapshot(refreshAudioProcessCache, ParseCommandTargetProcessId());
+        }
+
+        private TeamsMeetingSnapshot ReadTeamsMeetingSnapshot(bool refreshAudioProcessCache, int? explicitTargetProcessId)
+        {
             var teamsProcessIds = teamsController.TeamsProcessIds;
             if (refreshAudioProcessCache && teamsProcessIds.Count > 0)
             {
@@ -719,7 +807,7 @@ namespace X3LaptopCompanion
             }
 
             return teamsController.GetMeetingSnapshot(mediaStatusSensor.TeamsAudioProcessIds,
-                ParseCommandTargetProcessId());
+                explicitTargetProcessId);
         }
 
         private static string TeamsTextForSnapshot(TeamsMeetingSnapshot snapshot)
@@ -771,6 +859,12 @@ namespace X3LaptopCompanion
             CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message,
             string reason, bool force = false)
         {
+            if (isExiting)
+            {
+                HostLog.Write("Host state write skipped while app is exiting. reason=" + reason);
+                return;
+            }
+
             if (!wasBleConnected)
             {
                 HostLog.Write("Host state write skipped while BLE is disconnected. reason=" + reason);
@@ -816,11 +910,21 @@ namespace X3LaptopCompanion
                 var pendingReason = pendingHostStateReason;
                 pendingHostState = null;
                 pendingHostStateReason = null;
-                if (pending != null && !pending.SameAs(lastSentHostState))
+                if (!isExiting && pending != null && !pending.SameAs(lastSentHostState))
                 {
                     _ = SendHostStatePayloadAsync(pending, pendingReason ?? "pending");
                 }
             }
+        }
+
+        private void StopServicesForExit()
+        {
+            statusTimer.Stop();
+            connectionService.StatusChanged -= OnConnectionStatusChanged;
+            connectionService.ButtonEventReceived -= OnButtonEventReceived;
+            ResetHostStateWriteCache();
+            wasBleConnected = false;
+            connectionService.Dispose();
         }
 
         private void ResetHostStateWriteCache()
