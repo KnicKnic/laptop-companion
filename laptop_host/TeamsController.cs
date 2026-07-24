@@ -810,106 +810,10 @@ namespace X3LaptopCompanion
 
         private static IEnumerable<WindowCandidate> FindCandidateWindows(int processId)
         {
-            var directWindows = GetTopLevelWindows()
+            return GetTopLevelWindows()
                 .Where(w => w.ProcessId == processId)
                 .OrderByDescending(w => !string.IsNullOrWhiteSpace(w.Title))
                 .ToList();
-
-            foreach (var window in directWindows)
-            {
-                yield return window;
-            }
-
-            var directHandles = new HashSet<IntPtr>(directWindows.Select(w => w.Hwnd));
-            foreach (var hostedWindow in FindWindowsHostingProcess(processId))
-            {
-                if (directHandles.Add(hostedWindow.Hwnd))
-                {
-                    yield return hostedWindow;
-                }
-            }
-        }
-
-        private static IEnumerable<WindowCandidate> FindWindowsHostingProcess(int processId)
-        {
-            var matches = new List<WindowCandidate>();
-            foreach (var window in GetTopLevelWindows().Where(w => !string.IsNullOrWhiteSpace(w.Title)))
-            {
-                try
-                {
-                    var root = AutomationElement.FromHandle(window.Hwnd);
-                    if (root != null && ContainsProcessId(root, processId, TreeWalker.RawViewWalker, 0, 0))
-                    {
-                        matches.Add(new WindowCandidate(window.Hwnd, window.ProcessId, window.ProcessName,
-                            window.Title, true));
-                    }
-                }
-                catch
-                {
-                }
-            }
-
-            return matches;
-        }
-
-        private static bool ContainsProcessId(AutomationElement element, int processId, TreeWalker walker, int depth,
-            int nodeCount)
-        {
-            if (element == null || depth > MaxMeetingSearchDepth || nodeCount > MaxMeetingSearchNodes)
-            {
-                return false;
-            }
-
-            if (TryGetElementProcessId(element, out var elementProcessId) && elementProcessId == processId)
-            {
-                return true;
-            }
-
-            AutomationElement child;
-            try
-            {
-                child = walker.GetFirstChild(element);
-            }
-            catch
-            {
-                return false;
-            }
-
-            while (child != null)
-            {
-                nodeCount++;
-                if (ContainsProcessId(child, processId, walker, depth + 1, nodeCount))
-                {
-                    return true;
-                }
-
-                try
-                {
-                    child = walker.GetNextSibling(child);
-                }
-                catch
-                {
-                    return false;
-                }
-            }
-
-            return false;
-        }
-
-        private static bool TryGetElementProcessId(AutomationElement element, out int processId)
-        {
-            processId = 0;
-
-            try
-            {
-                processId = element.Current.ProcessId;
-                return processId > 0;
-            }
-            catch
-            {
-                processId = 0;
-                return false;
-            }
         }
 
         private static List<WindowCandidate> GetTopLevelWindows()
