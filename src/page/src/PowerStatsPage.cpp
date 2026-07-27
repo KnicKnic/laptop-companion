@@ -7,6 +7,38 @@
 
 #include <Arduino.h>
 #include <FreeInkUIDisplayTarget.h>
+#include <FreeInkUIFontSmall.h>
+
+namespace {
+constexpr freeink::ui::FontId kStatsFontSlot = 3;
+constexpr int16_t kStatsLineGap = 2;
+
+int16_t wrappedTextHeight(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content, const char* text,
+                          const freeink::ui::TextStyle& style) {
+  const int16_t lineHeight = target.lineHeight(style.font);
+  const freeink::ui::Size measured = freeink::ui::measureWrappedText(target, text, style, content.width);
+  return measured.height > lineHeight ? measured.height : lineHeight;
+}
+
+void drawPowerRows(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content, int16_t y,
+                   int16_t bottom, const char* const* rows, uint8_t rowCount, uint8_t firstRow,
+                   const freeink::ui::TextStyle& style) {
+  for (uint8_t i = firstRow; i < rowCount; ++i) {
+    const int16_t textHeight = wrappedTextHeight(target, content, rows[i], style);
+    if (static_cast<int16_t>(y + textHeight) > bottom) return;
+    freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, textHeight}, rows[i], style);
+    y = static_cast<int16_t>(y + textHeight + kStatsLineGap);
+  }
+}
+
+void clampScroll(uint8_t& offset, uint8_t rowCount) {
+  if (rowCount == 0) {
+    offset = 0;
+  } else if (offset >= rowCount) {
+    offset = static_cast<uint8_t>(rowCount - 1);
+  }
+}
+}  // namespace
 
 PowerStatsPage::PowerStatsPage(EInkDisplay& display) : Page(display) {}
 
@@ -22,25 +54,50 @@ bool PowerStatsPage::visible() const {
   return copySettings().system.debug.showPowerStatsPage;
 }
 
+bool PowerStatsPage::handleButton(ButtonPressKind kind) {
+  switch (kind) {
+    case ButtonPressKind::Up:
+      if (scrollOffset_ > 0) --scrollOffset_;
+      return true;
+    case ButtonPressKind::Down:
+      if (scrollOffset_ < 255) ++scrollOffset_;
+      return true;
+    default:
+      return false;
+  }
+}
+
 std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTarget& target,
                                                           EInkDisplay::RefreshMode mode, bool forceDraw) {
   (void)forceDraw;
   auto tx = beginRender(mode);
+  target.setFont(kStatsFontSlot, freeink::ui::kNotoSansSmallFont);
   const PowerStatsSnapshot power = copyPowerStats();
+  const std::string totalLine = formatPowerStatsTotalLine(power);
+  const std::string deltaLine = formatPowerStatsDeltaLine(power);
+  const std::string accountingLine = formatPowerStatsAccountingLine(power);
+  const std::string wakeLine = formatPowerStatsWakeLine(power);
+  const std::string timerLine = formatEspTimerActivity();
+  const std::string alarmLine = formatEspTimerAlarmLine();
+  std::string pmLock1;
+  std::string pmLock2;
+  std::string pmLock3;
+  std::string pmLock4;
+  std::string pmLock5;
+  formatPmLockActivity(pmLock1, pmLock2, pmLock3, pmLock4, pmLock5);
+  std::string taskLines[10];
+  const uint8_t taskLineCount = formatTaskActivity(taskLines, 10);
 
   const freeink::ui::Rect content = getPagePanel(target);
 
   freeink::ui::TextStyle title;
-  title.align = freeink::ui::TextAlign::Center;
+  title.font = freeink::ui::FONT_SLOT_BODY;
+  title.align = freeink::ui::TextAlign::Left;
   title.maxLines = 1;
 
   freeink::ui::TextStyle body = title;
+  body.font = kStatsFontSlot;
   body.maxLines = 2;
-
-  char uptime[32];
-  char slept[32];
-  formatDuration(uptime, sizeof(uptime), power.uptimeUs);
-  formatDuration(slept, sizeof(slept), power.lightSleepUs);
 
   const uint64_t activeUs =
       power.freq10MhzUs + power.freq40MhzUs + power.freq80MhzUs + power.freq160MhzUs + power.freqOtherUs;
@@ -51,12 +108,6 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
            power.autoLightSleep ? "on" : "off", power.pmProfilingAvailable ? "on" : "off");
   char rangeLine[96];
   snprintf(rangeLine, sizeof(rangeLine), "DFS range: %d -> %d MHz", power.maxFreqMhz, power.minFreqMhz);
-  char sleepLine[96];
-  snprintf(sleepLine, sizeof(sleepLine), "Light sleep: %s  (%llu ok / %llu reject)", slept,
-           static_cast<unsigned long long>(power.lightSleepEntries),
-           static_cast<unsigned long long>(power.lightSleepRejects));
-  char uptimeLine[96];
-  snprintf(uptimeLine, sizeof(uptimeLine), "PM profiled time: %s", uptime);
   char maxDuration[32];
   formatDuration(maxDuration, sizeof(maxDuration), power.freq160MhzUs);
   char maxLine[96];
@@ -71,26 +122,45 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   snprintf(freqLine2, sizeof(freqLine2), "Other active freq:%lu%%  renders:%lu",
            static_cast<unsigned long>(percentOf(power.freqOtherUs, activeUs)),
            static_cast<unsigned long>(power.renderRequests));
+  char rejectLine[96];
+  snprintf(rejectLine, sizeof(rejectLine), "Light sleep rejects:%llu",
+           static_cast<unsigned long long>(power.lightSleepRejects));
+  const char* rows[32] = {};
+  uint8_t rowCount = 0;
+  auto addRow = [&rows, &rowCount](const char* row) {
+    if (rowCount < 32) rows[rowCount++] = row;
+  };
+  addRow(pmLine);
+  addRow(rangeLine);
+  addRow(totalLine.c_str());
+  addRow(deltaLine.c_str());
+  addRow(accountingLine.c_str());
+  addRow(wakeLine.c_str());
+  addRow(rejectLine);
+  addRow(maxLine);
+  addRow(freqLine1);
+  addRow(freqLine2);
+  addRow(timerLine.c_str());
+  addRow(alarmLine.c_str());
+  addRow(pmLock1.c_str());
+  addRow(pmLock2.c_str());
+  addRow(pmLock3.c_str());
+  addRow(pmLock4.c_str());
+  addRow(pmLock5.c_str());
+  for (uint8_t i = 0; i < taskLineCount; i++) addRow(taskLines[i].c_str());
+  clampScroll(scrollOffset_, rowCount);
 
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 20), content.width, 44},
+  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 8), content.width, 34},
                         "Power Stats", title);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 98), content.width, 40},
-                        pmLine, body);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 148), content.width, 40},
-                        rangeLine, body);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 208), content.width, 40},
-                        uptimeLine, body);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 258), content.width, 40},
-                        sleepLine, body);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 318), content.width, 40},
-                        maxLine, body);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 368), content.width, 40},
-                        freqLine1, body);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 418), content.width, 40},
-                        freqLine2, body);
+  const int16_t y = static_cast<int16_t>(content.y + 44);
+  const int16_t bottom = static_cast<int16_t>(content.bottom() - 38);
+  drawPowerRows(target, content, y, bottom, rows, rowCount, scrollOffset_, body);
+  char scrollLine[64];
+  snprintf(scrollLine, sizeof(scrollLine), "Up/Down scroll  %u/%u", static_cast<unsigned>(scrollOffset_ + 1),
+           static_cast<unsigned>(rowCount));
   freeink::ui::drawText(target,
                         freeink::ui::Rect{content.x, static_cast<int16_t>(content.bottom() - 34), content.width, 24},
-                        "/other/power-stats", body);
+                        scrollLine, body);
   drawPageChrome(target);
   return tx;
 }

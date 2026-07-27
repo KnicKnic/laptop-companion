@@ -14,6 +14,7 @@ EInkDisplay* display = nullptr;
 TaskHandle_t displayTaskHandle = nullptr;
 SequencedRenderSignal renderSignal;
 constexpr UBaseType_t kDisplayTaskPriority = 1;
+constexpr uint32_t kDisplayTaskStackBytes = 12288;
 
 void markRenderComplete(uint32_t sequence) {
   renderSignal.completeWork(sequence);
@@ -56,7 +57,7 @@ void displayTask(void*) {
 bool beginDisplayWorker(EInkDisplay& displayRef) {
   display = &displayRef;
   if (!renderSignal.begin()) return false;
-  xTaskCreate(displayTask, "display", 8192, nullptr, kDisplayTaskPriority, &displayTaskHandle);
+  xTaskCreate(displayTask, "display", kDisplayTaskStackBytes, nullptr, kDisplayTaskPriority, &displayTaskHandle);
   return displayTaskHandle != nullptr;
 }
 

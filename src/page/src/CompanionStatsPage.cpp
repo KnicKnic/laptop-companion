@@ -3,13 +3,18 @@
 #include "DisplayWorker.h"
 #include "PageDrawing.h"
 #include "PageManager.h"
+#include "PowerStats.h"
 #include "Settings.h"
 #include "companion/CompanionBleService.h"
 
 #include <Arduino.h>
 #include <FreeInkUIDisplayTarget.h>
+#include <FreeInkUIFontSmall.h>
 
 namespace {
+constexpr freeink::ui::FontId kStatsFontSlot = 3;
+constexpr int16_t kStatsLineGap = 2;
+
 const char* triStateText(uint8_t value, const char* falseText, const char* trueText) {
   if (value == 2) return trueText;
   if (value == 1) return falseText;
@@ -19,6 +24,32 @@ const char* triStateText(uint8_t value, const char* falseText, const char* trueT
 void requestCompanionStatsRender() {
   if (!displayWorkerReady()) return;
   requestRender(RenderKind::ActivePage, refreshModeFromSettings(copySettings()));
+}
+
+int16_t wrappedTextHeight(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content, const char* text,
+                          const freeink::ui::TextStyle& style) {
+  const int16_t lineHeight = target.lineHeight(style.font);
+  const freeink::ui::Size measured = freeink::ui::measureWrappedText(target, text, style, content.width);
+  return measured.height > lineHeight ? measured.height : lineHeight;
+}
+
+void drawStatsRows(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content, int16_t y, int16_t bottom,
+                   const char* const* rows, uint8_t rowCount, uint8_t firstRow,
+                   const freeink::ui::TextStyle& style) {
+  for (uint8_t i = firstRow; i < rowCount; ++i) {
+    const int16_t textHeight = wrappedTextHeight(target, content, rows[i], style);
+    if (static_cast<int16_t>(y + textHeight) > bottom) return;
+    freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, textHeight}, rows[i], style);
+    y = static_cast<int16_t>(y + textHeight + kStatsLineGap);
+  }
+}
+
+void clampScroll(uint8_t& offset, uint8_t rowCount) {
+  if (rowCount == 0) {
+    offset = 0;
+  } else if (offset >= rowCount) {
+    offset = static_cast<uint8_t>(rowCount - 1);
+  }
 }
 }  // namespace
 
@@ -30,6 +61,19 @@ PageId CompanionStatsPage::id() const {
 
 const char* CompanionStatsPage::name() const {
   return "companion-stats";
+}
+
+bool CompanionStatsPage::handleButton(ButtonPressKind kind) {
+  switch (kind) {
+    case ButtonPressKind::Up:
+      if (scrollOffset_ > 0) --scrollOffset_;
+      return true;
+    case ButtonPressKind::Down:
+      if (scrollOffset_ < 255) ++scrollOffset_;
+      return true;
+    default:
+      return false;
+  }
 }
 
 void CompanionStatsPage::onEnter() {
@@ -46,6 +90,7 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
                                                               EInkDisplay::RefreshMode mode, bool forceDraw) {
   (void)forceDraw;
   auto tx = beginRender(mode);
+  target.setFont(kStatsFontSlot, freeink::ui::kNotoSansSmallFont);
 
   CompanionBleService& service = CompanionBleService::getInstance();
   const CompanionBleService::HostStatus host = service.getHostStatus();
@@ -54,17 +99,35 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   const uint32_t sessionRenderRequests = service.getBluetoothSessionRenderRequests();
   const std::string timing = service.formatTimingDiagnostics();
   const std::string activity = service.formatActivityDeltaDiagnostics();
+  const PowerStatsSnapshot power = copyPowerStats();
+  const std::string powerTotal = formatPowerStatsTotalLine(power);
+  const std::string powerDelta = formatPowerStatsDeltaLine(power);
+  const std::string powerAccounting = formatPowerStatsAccountingLine(power);
+  const std::string powerWake = formatPowerStatsWakeLine(power);
+  const std::string timerLine = formatEspTimerActivity();
+  const std::string alarmLine = formatEspTimerAlarmLine();
+  const std::string btLockLine = formatBtLockTraceDiagnostics();
+  std::string pmLock1;
+  std::string pmLock2;
+  std::string pmLock3;
+  std::string pmLock4;
+  std::string pmLock5;
+  formatPmLockActivity(pmLock1, pmLock2, pmLock3, pmLock4, pmLock5);
+  std::string taskLines[10];
+  const uint8_t taskLineCount = formatTaskActivity(taskLines, 10);
 
   const freeink::ui::Rect panel = pageMainPanel(target);
   const freeink::ui::Rect content = panel.inset(freeink::ui::Insets{24, 8, 24, 18});
   target.fill(panel, freeink::ui::Paint::solid(freeink::ui::Color::White));
 
   freeink::ui::TextStyle title;
+  title.font = freeink::ui::FONT_SLOT_BODY;
   title.align = freeink::ui::TextAlign::Left;
   title.maxLines = 1;
 
   freeink::ui::TextStyle body = title;
-  body.maxLines = 1;
+  body.font = kStatsFontSlot;
+  body.maxLines = 2;
 
   char statusLine[112];
   snprintf(statusLine, sizeof(statusLine), "Status: %s", service.getStatusText().c_str());
@@ -100,36 +163,51 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
            triStateText(host.hand, "lowered", "raised"), static_cast<unsigned>(host.handCounter));
   char hostMessageLine[128];
   snprintf(hostMessageLine, sizeof(hostMessageLine), "Host text: %s", host.message.empty() ? "--" : host.message.c_str());
-
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, content.y, content.width, 34}, "Companion Stats", title);
-  int16_t y = static_cast<int16_t>(content.y + 52);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, statusLine, body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, linkLine, body);
-  y += 44;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, meetingLine, body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, mediaLine, body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, hostMessageLine, body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, gapLine, body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, hostLine, body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, workerLine, body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, renderLine, body);
-  y += 44;
-
   const size_t timingBreak = timing.find('\n');
   const std::string timingA = timingBreak == std::string::npos ? timing : timing.substr(0, timingBreak);
   const std::string timingB = timingBreak == std::string::npos ? "" : timing.substr(timingBreak + 1);
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, timingA.c_str(), body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, timingB.c_str(), body);
-  y += 34;
-  freeink::ui::drawText(target, freeink::ui::Rect{content.x, y, content.width, 28}, activity.c_str(), body);
+  const char* rows[40] = {};
+  uint8_t rowCount = 0;
+  auto addRow = [&rows, &rowCount](const char* row) {
+    if (rowCount < 40) rows[rowCount++] = row;
+  };
+  addRow(statusLine);
+  addRow(linkLine);
+  addRow(meetingLine);
+  addRow(mediaLine);
+  addRow(hostMessageLine);
+  addRow(gapLine);
+  addRow(hostLine);
+  addRow(workerLine);
+  addRow(renderLine);
+  addRow(timingA.c_str());
+  addRow(timingB.c_str());
+  addRow(activity.c_str());
+  addRow(powerTotal.c_str());
+  addRow(powerDelta.c_str());
+  addRow(powerAccounting.c_str());
+  addRow(powerWake.c_str());
+  addRow(timerLine.c_str());
+  addRow(alarmLine.c_str());
+  addRow(btLockLine.c_str());
+  addRow(pmLock1.c_str());
+  addRow(pmLock2.c_str());
+  addRow(pmLock3.c_str());
+  addRow(pmLock4.c_str());
+  addRow(pmLock5.c_str());
+  for (uint8_t i = 0; i < taskLineCount; i++) addRow(taskLines[i].c_str());
+  clampScroll(scrollOffset_, rowCount);
+
+  freeink::ui::drawText(target, freeink::ui::Rect{content.x, content.y, content.width, 34}, "Companion Stats", title);
+  const int16_t y = static_cast<int16_t>(content.y + 42);
+  const int16_t bottom = static_cast<int16_t>(content.bottom() - 30);
+  drawStatsRows(target, content, y, bottom, rows, rowCount, scrollOffset_, body);
+  char scrollLine[64];
+  snprintf(scrollLine, sizeof(scrollLine), "Up/Down scroll  %u/%u", static_cast<unsigned>(scrollOffset_ + 1),
+           static_cast<unsigned>(rowCount));
+  freeink::ui::drawText(target,
+                        freeink::ui::Rect{content.x, static_cast<int16_t>(content.bottom() - 26), content.width, 22},
+                        scrollLine, body);
 
   drawPageChrome(target);
   return tx;
