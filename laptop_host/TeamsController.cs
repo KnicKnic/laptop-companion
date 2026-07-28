@@ -61,6 +61,15 @@ namespace X3LaptopCompanion
         private string cachedMeetingTargetProcessName = string.Empty;
         private readonly object cachedMeetingWindowLock = new object();
 
+        // Last-known meeting state, held so the companion keeps showing the meeting (and cached camera/hand)
+        // while a full-screen Remote Desktop session DWM-cloaks the local Teams window and its UIA tree.
+        private readonly object meetingStateCacheLock = new object();
+        private bool haveCachedMeetingState;
+        private string lastKnownMeetingName = string.Empty;
+        private CompanionTriState lastKnownMicrophone = CompanionTriState.Unknown;
+        private CompanionTriState lastKnownCamera = CompanionTriState.Unknown;
+        private CompanionTriState lastKnownHand = CompanionTriState.Unknown;
+
         public bool IsTeamsRunning
         {
             get { return FindTeamsProcess() != null; }
@@ -101,6 +110,158 @@ namespace X3LaptopCompanion
             }
         }
 
+        private void UpdateMeetingStateCache(string meetingName, CompanionTriState microphone,
+            CompanionTriState camera, CompanionTriState hand)
+        {
+            lock (meetingStateCacheLock)
+            {
+                haveCachedMeetingState = true;
+                lastKnownMeetingName = meetingName ?? string.Empty;
+                lastKnownMicrophone = microphone;
+                lastKnownCamera = camera;
+                lastKnownHand = hand;
+            }
+        }
+
+        private void ClearMeetingStateCache(string reason)
+        {
+            lock (meetingStateCacheLock)
+            {
+                if (!haveCachedMeetingState)
+                {
+                    return;
+                }
+
+                haveCachedMeetingState = false;
+                lastKnownMeetingName = string.Empty;
+                lastKnownMicrophone = CompanionTriState.Unknown;
+                lastKnownCamera = CompanionTriState.Unknown;
+                lastKnownHand = CompanionTriState.Unknown;
+            }
+
+            HostLog.Write("Teams meeting state cache cleared. reason=" + reason);
+        }
+
+        private IntPtr GetCachedMeetingWindowHandle()
+        {
+            lock (cachedMeetingWindowLock)
+            {
+                return cachedMeetingWindowHandle;
+            }
+        }
+
+        // Reports the DWM cloak state of a window. A full-screen Remote Desktop cloaks the local Teams window
+        // (typically cloaked=True(shell)), which is exactly why its UIA controls become unreachable.
+        private static string DescribeCloak(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero)
+            {
+                return "cloaked=Unknown(no hwnd)";
+            }
+
+            try
+            {
+                var hr = DwmGetWindowAttribute(hwnd, DwmwaCloaked, out var cloaked, sizeof(int));
+                if (hr != 0)
+                {
+                    return "cloaked=Unknown(hr=0x" + hr.ToString("X") + ")";
+                }
+
+                if (cloaked == 0)
+                {
+                    return "cloaked=False";
+                }
+
+                string reason;
+                switch (cloaked)
+                {
+                    case 1:
+                        reason = "app";
+                        break;
+                    case 2:
+                        reason = "shell";
+                        break;
+                    case 4:
+                        reason = "inherited";
+                        break;
+                    default:
+                        reason = "0x" + cloaked.ToString("X");
+                        break;
+                }
+
+                return "cloaked=True(" + reason + ")";
+            }
+            catch (Exception ex)
+            {
+                return "cloaked=Unknown(" + ex.Message + ")";
+            }
+        }
+
+        // When meeting audio is active but the Teams window's UIA controls are unreachable (cloaked by a
+        // full-screen Remote Desktop), read live mute from the Windows shell mic indicator and hold the
+        // last-known camera/hand from the cache so the companion keeps a correct meeting view.
+        private TeamsMeetingSnapshot BuildHeldSnapshotOrEmpty(string reason, IntPtr candidateHwnd)
+        {
+            HostLog.Write("Teams meeting controls not found (" + reason + "). candidateHwnd=0x" +
+                candidateHwnd.ToInt64().ToString("X") + " " + DescribeCloak(candidateHwnd));
+
+            var indicator = MicIndicator.Read();
+            if (!indicator.Present || !indicator.ReferencesTeams)
+            {
+                HostLog.Write("Teams meeting controls unavailable and no Teams mic indicator. reason=" + reason +
+                    " indicatorPresent=" + indicator.Present + " referencesTeams=" + indicator.ReferencesTeams);
+                return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
+                    CompanionTriState.Unknown, CompanionTriState.Unknown,
+                    "Teams running; meeting controls not found (" + reason + ")");
+            }
+
+            var microphone = indicator.Muted ? CompanionTriState.Off : CompanionTriState.On;
+            CompanionTriState camera;
+            CompanionTriState hand;
+            string meetingName;
+            lock (meetingStateCacheLock)
+            {
+                haveCachedMeetingState = true;
+                lastKnownMicrophone = microphone;
+                camera = lastKnownCamera;
+                hand = lastKnownHand;
+                meetingName = lastKnownMeetingName;
+            }
+
+            var detail = "held meeting via mic indicator (" + reason + "). mic=" + microphone +
+                " cameraCached=" + camera + " handCached=" + hand +
+                " indicator=\"" + indicator.FirstLine + "\"";
+            HostLog.Write("Teams " + detail);
+            return new TeamsMeetingSnapshot(true, true, meetingName, microphone, camera, hand, detail);
+        }
+
+        private bool TryToggleMuteViaIndicator()
+        {
+            var indicator = MicIndicator.Read();
+            if (!indicator.Present || !indicator.ReferencesTeams)
+            {
+                HostLog.Write("Mic indicator mute path unavailable; falling back to Teams UIA button. present=" +
+                    indicator.Present + " referencesTeams=" + indicator.ReferencesTeams);
+                return false;
+            }
+
+            HostLog.Write("Toggling Teams mute via Windows mic indicator. before=" +
+                (indicator.Muted ? "Muted" : "Live") + " indicator=\"" + indicator.FirstLine + "\"");
+            if (!MicIndicator.TryToggle())
+            {
+                return false;
+            }
+
+            // Reflect the expected new state immediately so a subsequent cloaked snapshot stays consistent.
+            var microphone = indicator.Muted ? CompanionTriState.On : CompanionTriState.Off;
+            lock (meetingStateCacheLock)
+            {
+                lastKnownMicrophone = microphone;
+            }
+
+            return true;
+        }
+
         public bool TryToggleMute()
         {
             return TrySendCommand(TeamsCommand.ToggleMute);
@@ -125,6 +286,16 @@ namespace X3LaptopCompanion
                 HostLog.Write("Teams command skipped. command=" + CommandName(command) +
                     " reason=no UIA button name is configured; hotkeys are disabled.");
                 return false;
+            }
+
+            // Prefer the Windows shell mic indicator for mute: it works even while the Teams window is
+            // DWM-cloaked by a full-screen Remote Desktop, and it is not a keystroke (so nothing is
+            // forwarded to the remote machine). Fall back to the Teams UIA button if it is unavailable.
+            if (command == TeamsCommand.ToggleMute && TryToggleMuteViaIndicator())
+            {
+                HostLog.Write("Teams mute toggled via Windows mic indicator. elapsedMs=" +
+                    stopwatch.ElapsedMilliseconds);
+                return true;
             }
 
             if (!TryFindCommandButtonTarget(command, audioProcessIds, explicitTargetProcessId, out var context,
@@ -174,6 +345,7 @@ namespace X3LaptopCompanion
             var teamsDetected = IsTeamsRunning;
             if (!teamsDetected)
             {
+                ClearMeetingStateCache("Teams not running");
                 return new TeamsMeetingSnapshot(false, false, string.Empty, CompanionTriState.Unknown,
                     CompanionTriState.Unknown, CompanionTriState.Unknown, "Teams not running");
             }
@@ -181,6 +353,7 @@ namespace X3LaptopCompanion
             if (audioMeetingProcessIds.Count == 0)
             {
                 InvalidateMeetingWindowCache("active meeting audio missing");
+                ClearMeetingStateCache("active meeting audio missing");
                 return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
                     CompanionTriState.Unknown, CompanionTriState.Unknown,
                     "Teams running; active meeting audio session not found");
@@ -189,25 +362,26 @@ namespace X3LaptopCompanion
             if (!TryFindMeetingWindow(audioMeetingProcessIds, explicitTargetProcessId, anchorCommand, expectedState,
                     out var context))
             {
-                return new TeamsMeetingSnapshot(true, false, string.Empty, CompanionTriState.Unknown,
-                    CompanionTriState.Unknown, CompanionTriState.Unknown, "Teams running; meeting controls not found");
+                // Meeting audio is active but the meeting window's UIA tree is unreachable. This is the
+                // full-screen Remote Desktop case: DWM cloaks the local Teams window and Chromium tears down
+                // its accessibility tree. Hold cached camera/hand and read live mute from the shell indicator.
+                return BuildHeldSnapshotOrEmpty("meeting window unreachable", GetCachedMeetingWindowHandle());
             }
 
             // The button names describe the next action, so they also tell us the current meeting state:
             // "Mute mic" means the mic is currently live, while "Unmute mic" means Teams is currently muted.
             var controls = context.Controls;
+            if (!controls.HasMeetingControl)
+            {
+                // Window was reachable but exposed no meeting controls (also seen mid-cloak).
+                return BuildHeldSnapshotOrEmpty("meeting controls empty", context.Hwnd);
+            }
+
             var microphone = GetMicrophoneState(controls);
             var camera = GetCameraState(controls);
             var hand = GetHandState(controls);
             var meetingName = ExtractMeetingName(controls.FirstWindowName);
-            var meetingDetected = controls.HasMeetingControl;
-            if (!meetingDetected)
-            {
-                meetingName = string.Empty;
-                microphone = CompanionTriState.Unknown;
-                camera = CompanionTriState.Unknown;
-                hand = CompanionTriState.Unknown;
-            }
+            UpdateMeetingStateCache(meetingName, microphone, camera, hand);
 
             var detail = "target=" + DescribeTarget(context.Target) +
                 " hwnd=0x" + context.Hwnd.ToInt64().ToString("X") +
@@ -215,7 +389,7 @@ namespace X3LaptopCompanion
                 " meeting=\"" + meetingName + "\" " + controls.DescribeState();
 
             HostLog.Write("Teams UIA snapshot. " + detail);
-            return new TeamsMeetingSnapshot(true, meetingDetected, meetingName, microphone, camera, hand, detail);
+            return new TeamsMeetingSnapshot(true, true, meetingName, microphone, camera, hand, detail);
         }
 
         public static string CommandName(TeamsCommand command)
@@ -688,113 +862,107 @@ namespace X3LaptopCompanion
             CompanionTriState? expectedState)
         {
             var controls = new MeetingControls();
-            controls.FirstWindowName = Safe(() => root.Current.Name);
-            var anchorButton = FindFirstMeetingButton(root, anchorCommand, expectedState, controls);
-            if (anchorButton == null)
+            if (root == null)
             {
                 return controls;
             }
 
-            var toolbarRoot = GetParentElement(anchorButton.Element) ?? root;
-            controls.AnchorButtonName = anchorButton.Name;
-            controls.ParentName = Safe(() => toolbarRoot.Current.Name);
-            controls.MuteMicButton = FindButtonByName(toolbarRoot, "Mute mic", controls);
-            controls.UnmuteMicButton = FindButtonByName(toolbarRoot, "Unmute mic", controls);
-            controls.TurnCameraOnButton = FindButtonByName(toolbarRoot, "Turn camera on", controls);
-            controls.TurnCameraOffButton = FindButtonByName(toolbarRoot, "Turn camera off", controls);
-            controls.RaiseHandButton = FindButtonByName(toolbarRoot, "Raise your hand", controls);
-            controls.LowerHandButton = FindButtonByName(toolbarRoot, "Lower your hand", controls);
+            controls.FirstWindowName = Safe(() => root.Current.Name);
+
+            // Locate every meeting-control button in a SINGLE descendant pass (one cross-process tree walk),
+            // instead of issuing a separate FindFirst per button name. The previous approach walked the large
+            // WebView2 tree up to ~12 times per window and dominated scan latency; this mirrors the fast probe
+            // (root.FindAll with an OrCondition) and pulls Name/AutomationId via a cache request so we do not
+            // round-trip to the UI process for each matched element.
+            foreach (var button in FindMeetingButtons(root, controls))
+            {
+                AssignMeetingButton(controls, button);
+            }
+
             return controls;
         }
 
-        private static ButtonInfo FindFirstMeetingButton(AutomationElement root, TeamsCommand? anchorCommand,
-            CompanionTriState? expectedState, MeetingControls controls)
+        private static void AssignMeetingButton(MeetingControls controls, ButtonInfo button)
         {
-            if (root == null)
+            if (button == null)
             {
-                return null;
+                return;
             }
 
-            foreach (var name in GetAnchorButtonNames(anchorCommand, expectedState))
+            if (NameEquals(button.Name, "Mute mic"))
             {
-                var button = FindButtonByName(root, name, controls);
-                if (button != null)
-                {
-                    return button;
-                }
+                controls.MuteMicButton = button;
+            }
+            else if (NameEquals(button.Name, "Unmute mic"))
+            {
+                controls.UnmuteMicButton = button;
+            }
+            else if (NameEquals(button.Name, "Turn camera on"))
+            {
+                controls.TurnCameraOnButton = button;
+            }
+            else if (NameEquals(button.Name, "Turn camera off"))
+            {
+                controls.TurnCameraOffButton = button;
+            }
+            else if (NameEquals(button.Name, "Raise your hand"))
+            {
+                controls.RaiseHandButton = button;
+            }
+            else if (NameEquals(button.Name, "Lower your hand"))
+            {
+                controls.LowerHandButton = button;
             }
 
-            return null;
-        }
-
-        private static IReadOnlyCollection<string> GetAnchorButtonNames(TeamsCommand? anchorCommand,
-            CompanionTriState? expectedState)
-        {
-            if (!anchorCommand.HasValue)
+            if (string.IsNullOrEmpty(controls.AnchorButtonName))
             {
-                return MeetingButtonNames;
-            }
-
-            if (!expectedState.HasValue)
-            {
-                return GetCommandButtonNames(anchorCommand.Value);
-            }
-
-            switch (anchorCommand.Value)
-            {
-                case TeamsCommand.ToggleMute:
-                    return expectedState.Value == CompanionTriState.Off
-                        ? new[] { "Unmute mic", "Mute mic" }
-                        : new[] { "Mute mic", "Unmute mic" };
-                case TeamsCommand.ToggleVideo:
-                    return expectedState.Value == CompanionTriState.Off
-                        ? new[] { "Turn camera on", "Turn camera off" }
-                        : new[] { "Turn camera off", "Turn camera on" };
-                case TeamsCommand.ToggleHand:
-                    return expectedState.Value == CompanionTriState.Off
-                        ? new[] { "Raise your hand", "Lower your hand" }
-                        : new[] { "Lower your hand", "Raise your hand" };
-                default:
-                    return MeetingButtonNames;
+                controls.AnchorButtonName = button.Name;
             }
         }
 
-        private static AutomationElement GetParentElement(AutomationElement element)
+        private static IReadOnlyList<ButtonInfo> FindMeetingButtons(AutomationElement root, MeetingControls controls)
         {
-            if (element == null)
-            {
-                return null;
-            }
-
-            try
-            {
-                return TreeWalker.RawViewWalker.GetParent(element);
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static ButtonInfo FindButtonByName(AutomationElement root, string name, MeetingControls controls)
-        {
-            if (root == null)
-            {
-                return null;
-            }
-
             controls.NodesVisited++;
             try
             {
+                var nameConditions = MeetingButtonNames
+                    .Select(name => (Condition)new PropertyCondition(AutomationElement.NameProperty, name))
+                    .ToArray();
                 var condition = new AndCondition(
                     new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
-                    new PropertyCondition(AutomationElement.NameProperty, name));
-                var element = root.FindFirst(TreeScope.Descendants, condition);
-                return element == null ? null : CreateButtonInfo(element, name);
+                    nameConditions.Length == 1 ? nameConditions[0] : new OrCondition(nameConditions));
+
+                var cacheRequest = new CacheRequest { TreeScope = TreeScope.Element };
+                cacheRequest.Add(AutomationElement.NameProperty);
+                cacheRequest.Add(AutomationElement.AutomationIdProperty);
+
+                AutomationElementCollection matches;
+                var findStopwatch = Stopwatch.StartNew();
+                using (cacheRequest.Activate())
+                {
+                    matches = root.FindAll(TreeScope.Descendants, condition);
+                }
+                findStopwatch.Stop();
+                controls.FindMs = findStopwatch.ElapsedMilliseconds;
+
+                if (matches == null || matches.Count == 0)
+                {
+                    return Array.Empty<ButtonInfo>();
+                }
+
+                var buttons = new List<ButtonInfo>(matches.Count);
+                foreach (AutomationElement element in matches)
+                {
+                    var name = Safe(() => element.Cached.Name);
+                    var automationId = Safe(() => element.Cached.AutomationId);
+                    buttons.Add(new ButtonInfo(element, name, automationId));
+                }
+
+                return buttons;
             }
             catch
             {
-                return null;
+                return Array.Empty<ButtonInfo>();
             }
         }
 
@@ -868,15 +1036,43 @@ namespace X3LaptopCompanion
             var yielded = new HashSet<int>();
             foreach (var audioProcessId in audioProcessIds ?? Array.Empty<int>())
             {
+                // The audio session PID may be a hosted/child Teams process whose ancestors are also Teams
+                // processes (e.g. ms-teams -> ms-teamsupdate -> ...), with the meeting window owned by the top
+                // Teams process in that chain. The immediate parent is no longer reliable (it can be explorer),
+                // so walk up while the ancestor is still a Teams process and prefer that top process for scanning.
+                if (TryGetTopTeamsAncestor(audioProcessId, out var topProcessId, out var topProcessName,
+                        out var ancestorChain))
+                {
+                    HostLog.Write("Teams UIA top ancestor resolved. audioPid=" + audioProcessId +
+                        " top=" + topProcessName + "(" + topProcessId + ") chain=" + ancestorChain);
+                    if (yielded.Add(topProcessId))
+                    {
+                        yield return new CommandTarget(topProcessId, topProcessName,
+                            "top teams ancestor of audio pid " + audioProcessId);
+                    }
+                }
+                else
+                {
+                    HostLog.Write("Teams UIA top ancestor not found; using parent/audio fallback. audioPid=" +
+                        audioProcessId);
+                }
+
                 // The audio session is often owned by a hosted Teams/WebView process, while the meeting window sits
-                // on its parent. Try that parent before falling back to the audio process itself.
+                // on its parent. Try that parent before falling back to the audio process itself -- but only when the
+                // parent is itself a Teams process. The immediate parent is now often explorer.exe (which can never
+                // host meeting controls), and scanning it wastes time on every File Explorer window.
                 if (TryGetParentProcessId(audioProcessId, out var parentProcessId))
                 {
                     var parent = TryGetProcess(parentProcessId);
-                    if (parent != null && yielded.Add(parent.Id))
+                    if (parent != null && IsTeamsProcessName(SafeProcessName(parent)) && yielded.Add(parent.Id))
                     {
                         yield return new CommandTarget(parent.Id, SafeProcessName(parent),
                             "parent of audio pid " + audioProcessId);
+                    }
+                    else if (parent != null && !IsTeamsProcessName(SafeProcessName(parent)))
+                    {
+                        HostLog.Write("Teams UIA parent skipped; not a Teams process. audioPid=" + audioProcessId +
+                            " parent=" + SafeProcessName(parent) + "(" + parent.Id + ")");
                     }
                 }
                 else
@@ -1023,6 +1219,55 @@ namespace X3LaptopCompanion
             }
         }
 
+        // Walks up the process tree from startProcessId while each process is a Teams process, and returns the
+        // topmost Teams process in that contiguous chain (the one whose ancestor is no longer Teams, e.g. explorer).
+        // Uses Process.GetProcessById for the name and the proven toolhelp parent lookup for the walk, rather than
+        // the PROCESSENTRY32 szExeFile field (which the rest of the code never relies on).
+        private static bool TryGetTopTeamsAncestor(int startProcessId, out int topProcessId,
+            out string topProcessName, out string chain)
+        {
+            topProcessId = 0;
+            topProcessName = string.Empty;
+            chain = string.Empty;
+
+            var visited = new HashSet<int>();
+            var steps = new List<string>();
+            var current = startProcessId;
+            while (current > 0 && visited.Add(current))
+            {
+                var process = TryGetProcess(current);
+                if (process == null)
+                {
+                    break;
+                }
+
+                var name = SafeProcessName(process);
+                if (!IsTeamsProcessName(name))
+                {
+                    break;
+                }
+
+                topProcessId = current;
+                topProcessName = name;
+                steps.Add(name + "(" + current + ")");
+
+                if (!TryGetParentProcessId(current, out var parentProcessId) || parentProcessId <= 0)
+                {
+                    break;
+                }
+
+                current = parentProcessId;
+            }
+
+            if (topProcessId == 0)
+            {
+                return false;
+            }
+
+            chain = string.Join(" <- ", steps);
+            return true;
+        }
+
         private static string GetWindowTitle(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero)
@@ -1067,6 +1312,11 @@ namespace X3LaptopCompanion
 
         [DllImport("user32.dll")]
         private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+
+        private const int DwmwaCloaked = 14;
 
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
@@ -1173,6 +1423,7 @@ namespace X3LaptopCompanion
             public ButtonInfo RaiseHandButton { get; set; }
             public ButtonInfo LowerHandButton { get; set; }
             public int NodesVisited { get; set; }
+            public long FindMs { get; set; }
             public string AnchorButtonName { get; set; }
             public string ParentName { get; set; }
 
@@ -1221,6 +1472,7 @@ namespace X3LaptopCompanion
             public string DescribeState()
             {
                 return "nodes=" + NodesVisited +
+                    " findMs=" + FindMs +
                     " firstWindow=\"" + (FirstWindowName ?? string.Empty) + "\"" +
                     " anchor=\"" + (AnchorButtonName ?? string.Empty) + "\"" +
                     " parent=\"" + (ParentName ?? string.Empty) + "\"" +
