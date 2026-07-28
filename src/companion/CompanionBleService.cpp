@@ -3,6 +3,7 @@
 #include "AppLog.h"
 #include "CompanionProtocol.h"
 #include "DisplayWorker.h"
+#include "PowerStats.h"
 
 #include <NimBLEDevice.h>
 #include <NimBLEUtils.h>
@@ -517,6 +518,7 @@ void CompanionBleService::onHostDisconnected() {
 }
 
 void CompanionBleService::onConnParamsUpdated(uint16_t interval, uint16_t latency, uint16_t timeout) {
+  setBtLockTraceConnectionParams(interval, latency);
   lockState();
   activityStats_.connParamUpdates++;
   negotiatedConnInterval_ = interval;

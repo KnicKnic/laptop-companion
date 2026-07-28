@@ -262,7 +262,7 @@ namespace X3LaptopCompanion
             return true;
         }
 
-        public bool TryToggleMute()
+
         {
             return TrySendCommand(TeamsCommand.ToggleMute);
         }
@@ -917,6 +917,38 @@ namespace X3LaptopCompanion
             if (string.IsNullOrEmpty(controls.AnchorButtonName))
             {
                 controls.AnchorButtonName = button.Name;
+            }
+        }
+
+        private static IReadOnlyCollection<string> GetAnchorButtonNames(TeamsCommand? anchorCommand,
+            CompanionTriState? expectedState)
+        {
+            if (!anchorCommand.HasValue)
+            {
+                return MeetingButtonNames;
+            }
+
+            if (!expectedState.HasValue)
+            {
+                return GetCommandButtonNames(anchorCommand.Value);
+            }
+
+            switch (anchorCommand.Value)
+            {
+                case TeamsCommand.ToggleMute:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Unmute mic", "Mute mic" }
+                        : new[] { "Mute mic", "Unmute mic" };
+                case TeamsCommand.ToggleVideo:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Turn camera on", "Turn camera off" }
+                        : new[] { "Turn camera off", "Turn camera on" };
+                case TeamsCommand.ToggleHand:
+                    return expectedState.Value == CompanionTriState.Off
+                        ? new[] { "Raise your hand", "Lower your hand" }
+                        : new[] { "Lower your hand", "Raise your hand" };
+                default:
+                    return MeetingButtonNames;
             }
         }
 

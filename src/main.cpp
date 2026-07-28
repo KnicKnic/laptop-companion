@@ -13,6 +13,7 @@
 #include "IsrInput.h"
 #include "LinkerQuirks.h"
 #include "PageManager.h"
+#include "PowerManagement.h"
 #include "PowerStats.h"
 #include "Settings.h"
 
@@ -21,6 +22,8 @@ namespace {
 EInkDisplay* display = nullptr;
 
 constexpr uint32_t kMissingSettingsDelayMs = 20000;
+constexpr uint32_t kBootMaxPowerMs = 10000;
+constexpr uint32_t kButtonMaxPowerMs = 1000;
 
 PageId startupPageFromSettings(const CompanionSettings& settings) {
   const String& startup = settings.system.page.startup;
@@ -47,6 +50,26 @@ void enterDeepSleepAfterScreenRender() {
   freeink::PowerManager::waitForPowerButtonRelease();
   freeink::PowerManager::armPowerButtonWakeup();
   freeink::PowerManager::deepSleep();
+}
+
+bool dynamicPowerManagementConfigured() {
+  return copyPowerManagementState().configured;
+}
+
+void armMaxPowerIfConfigured(uint32_t milliseconds) {
+  if (!dynamicPowerManagementConfigured()) return;
+  maxPowerLock().ensureArmed(milliseconds);
+}
+
+uint32_t maxPowerMillisecondsLeft() {
+  if (!dynamicPowerManagementConfigured()) return 0;
+  return maxPowerLock().millisecondsLeft();
+}
+
+TickType_t inputWaitTicksForMaxPowerWindow(uint32_t millisecondsLeft) {
+  if (millisecondsLeft == 0) return portMAX_DELAY;
+  const TickType_t ticks = pdMS_TO_TICKS(millisecondsLeft);
+  return ticks > 0 ? ticks : 1;
 }
 
 }  // namespace
@@ -95,7 +118,8 @@ void setup() {
     dumpSdDirectory("/sleep");
   }
 
-
+  configurePowerManagementFromSettings();
+  armMaxPowerIfConfigured(kBootMaxPowerMs);
   beginPowerStats();
 
   display = new EInkDisplay(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.display.mosi,
@@ -126,10 +150,13 @@ void setup() {
 
 void loop() {
   ButtonPress press;
+  const uint32_t maxPowerLeftMs = maxPowerMillisecondsLeft();
+  const TickType_t inputTimeoutTicks = inputWaitTicksForMaxPowerWindow(maxPowerLeftMs);
 
-  if (!consumeInputEvents(press)) {
+  if (!consumeInputEvents(press, inputTimeoutTicks)) {
     return;
   }
+  armMaxPowerIfConfigured(kButtonMaxPowerMs);
   logPrintf("Got ButtonPress kind=%d\n", static_cast<int>(press.kind));
 
   if (!appIsSleeping() && press.kind == ButtonPressKind::Power) {

@@ -354,8 +354,8 @@ bool getNextButtonPress(ButtonPress& press, TickType_t timeoutTicks) {
   return adcButtons.getNextButtonPress(press, timeoutTicks);
 }
 
-bool consumeInputEvents(ButtonPress& press) {
-  if (!getNextButtonPress(press, portMAX_DELAY)) {
+bool consumeInputEvents(ButtonPress& press, TickType_t timeoutTicks) {
+  if (!getNextButtonPress(press, timeoutTicks)) {
     return false;
   }
 

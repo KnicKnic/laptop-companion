@@ -22,4 +22,4 @@ struct ButtonPress {
 bool beginInput();
 bool powerButtonPressed();
 bool getNextButtonPress(ButtonPress& press, TickType_t timeoutTicks);
-bool consumeInputEvents(ButtonPress& press);
+bool consumeInputEvents(ButtonPress& press, TickType_t timeoutTicks = portMAX_DELAY);
