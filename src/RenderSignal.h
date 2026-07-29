@@ -8,6 +8,7 @@
 
 enum class RenderKind : uint8_t {
   ActivePage,
+  DirectoryOverlay,
   Sleep,
 };
 

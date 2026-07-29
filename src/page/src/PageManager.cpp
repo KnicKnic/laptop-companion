@@ -297,12 +297,85 @@ void drawDirectoryRow(freeink::ui::DisplayTarget& target, const freeink::ui::Rec
   freeink::ui::drawText(target, row.inset(freeink::ui::Insets{8, 3, 8, 0}), path, style);
 }
 
+freeink::ui::Rect directoryPopupRect(freeink::ui::DisplayTarget& target) {
+  const int16_t width = target.logicalWidth();
+  const int16_t height = target.logicalHeight();
+  return freeink::ui::Rect{24, static_cast<int16_t>((height - 430) / 2), static_cast<int16_t>(width - 48), 430};
+}
+
+freeink::ui::Rect directoryRowRect(freeink::ui::DisplayTarget& target, uint8_t index) {
+  constexpr int16_t rowH = 34;
+  constexpr int16_t rowGap = 4;
+  const freeink::ui::Rect popup = directoryPopupRect(target);
+  return freeink::ui::Rect{static_cast<int16_t>(popup.x + 16),
+                           static_cast<int16_t>(popup.y + 78 + index * (rowH + rowGap)),
+                           static_cast<int16_t>(popup.width - 32), rowH};
+}
+
+bool panelWindowForLogicalRect(const freeink::ui::DisplayTarget& target, freeink::ui::Rect logical, uint16_t& x,
+                               uint16_t& y, uint16_t& w, uint16_t& h) {
+  if (pageDisplay == nullptr || logical.empty()) return false;
+
+  int16_t px = 0;
+  int16_t py = 0;
+  int16_t pw = 0;
+  int16_t ph = 0;
+  switch (target.orientation()) {
+    case freeink::ui::Orientation::Portrait:
+      px = logical.y;
+      py = static_cast<int16_t>(pageDisplay->getDisplayHeight() - logical.right());
+      pw = logical.height;
+      ph = logical.width;
+      break;
+    case freeink::ui::Orientation::PortraitInverted:
+      px = static_cast<int16_t>(pageDisplay->getDisplayWidth() - logical.bottom());
+      py = logical.x;
+      pw = logical.height;
+      ph = logical.width;
+      break;
+    case freeink::ui::Orientation::LandscapeClockwise:
+      px = static_cast<int16_t>(pageDisplay->getDisplayWidth() - logical.right());
+      py = static_cast<int16_t>(pageDisplay->getDisplayHeight() - logical.bottom());
+      pw = logical.width;
+      ph = logical.height;
+      break;
+    case freeink::ui::Orientation::LandscapeCounterClockwise:
+    default:
+      px = logical.x;
+      py = logical.y;
+      pw = logical.width;
+      ph = logical.height;
+      break;
+  }
+
+  if (px < 0) {
+    pw = static_cast<int16_t>(pw + px);
+    px = 0;
+  }
+  if (py < 0) {
+    ph = static_cast<int16_t>(ph + py);
+    py = 0;
+  }
+  if (px >= pageDisplay->getDisplayWidth() || py >= pageDisplay->getDisplayHeight() || pw <= 0 || ph <= 0) {
+    return false;
+  }
+  if (px + pw > pageDisplay->getDisplayWidth()) pw = static_cast<int16_t>(pageDisplay->getDisplayWidth() - px);
+  if (py + ph > pageDisplay->getDisplayHeight()) ph = static_cast<int16_t>(pageDisplay->getDisplayHeight() - py);
+
+  const int16_t alignedX = static_cast<int16_t>(px & ~0x7);
+  const int16_t alignedRight = static_cast<int16_t>(((px + pw + 7) / 8) * 8);
+  x = static_cast<uint16_t>(alignedX);
+  y = static_cast<uint16_t>(py);
+  w = static_cast<uint16_t>(alignedRight - alignedX);
+  h = static_cast<uint16_t>(ph);
+  if (x + w > pageDisplay->getDisplayWidth()) w = static_cast<uint16_t>(pageDisplay->getDisplayWidth() - x);
+  return w > 0 && h > 0;
+}
+
 void drawDirectoryOverlay(freeink::ui::DisplayTarget& target) {
   if (!directoryOpen) return;
 
-  const int16_t width = target.logicalWidth();
-  const int16_t height = target.logicalHeight();
-  const freeink::ui::Rect popup{24, static_cast<int16_t>((height - 430) / 2), static_cast<int16_t>(width - 48), 430};
+  const freeink::ui::Rect popup = directoryPopupRect(target);
   target.fill(popup, freeink::ui::Paint::solid(freeink::ui::Color::White));
   target.stroke(popup, freeink::ui::Paint::solid(freeink::ui::Color::Black), 2, 4);
 
@@ -320,14 +393,8 @@ void drawDirectoryOverlay(freeink::ui::DisplayTarget& target) {
                                           static_cast<int16_t>(popup.width - 32), 26},
                         currentLine, body);
 
-  constexpr int16_t rowH = 34;
-  int16_t y = static_cast<int16_t>(popup.y + 78);
   for (uint8_t i = 0; i < routeCount(); ++i) {
-    drawDirectoryRow(target,
-                     freeink::ui::Rect{static_cast<int16_t>(popup.x + 16), y,
-                                       static_cast<int16_t>(popup.width - 32), rowH},
-                     routes[i].path, i == directoryIndex);
-    y = static_cast<int16_t>(y + rowH + 4);
+    drawDirectoryRow(target, directoryRowRect(target, i), routes[i].path, i == directoryIndex);
   }
 
   freeink::ui::TextStyle footer;
@@ -405,7 +472,7 @@ PageId showPreviousPage() {
   return setCurrentPage(parentFor(currentPage));
 }
 
-PageId handlePageButton(ButtonPressKind kind) {
+PageButtonResult handlePageButton(ButtonPressKind kind) {
   const PageId page = activePage();
 
   xSemaphoreTake(pageMutex, portMAX_DELAY);
@@ -418,31 +485,31 @@ PageId handlePageButton(ButtonPressKind kind) {
         xSemaphoreTake(pageMutex, portMAX_DELAY);
         directoryOpen = false;
         xSemaphoreGive(pageMutex);
-        return activePage();
+        return PageButtonResult{activePage(), true, false};
       case ButtonPressKind::Left:
         xSemaphoreTake(pageMutex, portMAX_DELAY);
         moveDirectorySelection(-1);
         xSemaphoreGive(pageMutex);
-        return activePage();
+        return PageButtonResult{activePage(), true, true};
       case ButtonPressKind::Right:
         xSemaphoreTake(pageMutex, portMAX_DELAY);
         moveDirectorySelection(1);
         xSemaphoreGive(pageMutex);
-        return activePage();
+        return PageButtonResult{activePage(), true, true};
       case ButtonPressKind::Confirm: {
         xSemaphoreTake(pageMutex, portMAX_DELAY);
         const PageId selected = routes[directoryIndex].id;
         directoryOpen = false;
         xSemaphoreGive(pageMutex);
         logPrintf("Directory selected: %s\n", routeFor(selected).path);
-        return setCurrentPage(selected);
+        return PageButtonResult{setCurrentPage(selected), true, false};
       }
       case ButtonPressKind::Up:
       case ButtonPressKind::Down:
       case ButtonPressKind::Gpio1:
       case ButtonPressKind::Gpio2:
       case ButtonPressKind::Power:
-        return activePage();
+        return PageButtonResult{activePage(), false, false};
     }
   }
 
@@ -452,26 +519,19 @@ PageId handlePageButton(ButtonPressKind kind) {
       syncDirectorySelection(page);
       directoryOpen = true;
       xSemaphoreGive(pageMutex);
-      return page;
+      return PageButtonResult{page, true, true};
     case ButtonPressKind::Up:
     case ButtonPressKind::Down:
-      pageFor(page).handleButton(kind);
-      return activePage();
     case ButtonPressKind::Left:
-      pageFor(page).handleButton(kind);
-      return activePage();
     case ButtonPressKind::Right:
-      pageFor(page).handleButton(kind);
-      return activePage();
     case ButtonPressKind::Confirm:
-      pageFor(page).handleButton(kind);
-      return activePage();
+      return PageButtonResult{activePage(), pageFor(page).handleButton(kind), false};
     case ButtonPressKind::Gpio1:
     case ButtonPressKind::Gpio2:
     case ButtonPressKind::Power:
-      return activePage();
+      return PageButtonResult{activePage(), false, false};
   }
-  return activePage();
+  return PageButtonResult{activePage(), false, false};
 }
 
 const char* pageName(PageId page) {
@@ -546,7 +606,34 @@ void renderActivePage(EInkDisplay::RefreshMode mode) {
   if (transaction) {
     drawDirectoryOverlay(*pageTarget);
   }
-  transaction.reset();
   page.postRender(*pageTarget, mode, forceDraw);
   xSemaphoreGive(pageMutex);
+  transaction.reset();
+}
+
+void renderDirectoryOverlay(EInkDisplay::RefreshMode mode) {
+  if (pageDisplay == nullptr || pageTarget == nullptr) return;
+
+  freeink::ui::Rect dirty;
+  bool shouldDisplay = false;
+  xSemaphoreTake(pageMutex, portMAX_DELAY);
+  pageTarget->setOrientation(freeink::ui::Orientation::Portrait);
+  if (directoryOpen) {
+    drawDirectoryOverlay(*pageTarget);
+    dirty = directoryPopupRect(*pageTarget);
+    shouldDisplay = true;
+  }
+  xSemaphoreGive(pageMutex);
+
+  if (!shouldDisplay) return;
+
+  uint16_t x = 0;
+  uint16_t y = 0;
+  uint16_t w = 0;
+  uint16_t h = 0;
+  if (panelWindowForLogicalRect(*pageTarget, dirty, x, y, w, h)) {
+    pageDisplay->displayWindow(x, y, w, h);
+  } else {
+    pageDisplay->displayBuffer(mode);
+  }
 }

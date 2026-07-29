@@ -164,9 +164,16 @@ void loop() {
     return;
   }
 
-  const PageId page = handlePageButton(press.kind);
-  logPrintf("Selected page: %s\n", pageName(page));
+  const PageButtonResult result = handlePageButton(press.kind);
+  logPrintf("Selected page: %s\n", pageName(result.page));
 
-  const uint32_t seq = requestRender(RenderKind::ActivePage, refreshModeFromSettings(copySettings()));
-  logPrintf("Queued counter render request %lu\n", static_cast<unsigned long>(seq));
+  if (!result.renderRequired) {
+    logPrintf("No render queued for unchanged button state.\n");
+    return;
+  }
+
+  const RenderKind renderKind = result.overlayOnly ? RenderKind::DirectoryOverlay : RenderKind::ActivePage;
+  const uint32_t seq = requestRender(renderKind, refreshModeFromSettings(copySettings()));
+  logPrintf("Queued %s render request %lu\n", result.overlayOnly ? "directory overlay" : "active page",
+            static_cast<unsigned long>(seq));
 }

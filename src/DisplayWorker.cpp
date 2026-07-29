@@ -42,12 +42,17 @@ void displayTask(void*) {
   for (;;) {
     const RenderRequest request = renderSignal.waitForWork();
 
-    if (request.kind == RenderKind::Sleep) {
-      renderSleepScreenAndShutdownDisplay(request.sequence);
-      continue;
+    switch (request.kind) {
+      case RenderKind::Sleep:
+        renderSleepScreenAndShutdownDisplay(request.sequence);
+        continue;
+      case RenderKind::DirectoryOverlay:
+        renderDirectoryOverlay(request.mode);
+        break;
+      case RenderKind::ActivePage:
+        renderActivePage(request.mode);
+        break;
     }
-
-    renderActivePage(request.mode);
     markRenderComplete(request.sequence);
   }
 }
