@@ -19,7 +19,8 @@ namespace X3LaptopCompanion
     public sealed class TeamsMeetingSnapshot
     {
         public TeamsMeetingSnapshot(bool teamsDetected, bool meetingDetected, string meetingName,
-            CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string detail)
+            CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string detail,
+            bool cameraLocked = false, bool handLocked = false)
         {
             TeamsDetected = teamsDetected;
             MeetingDetected = meetingDetected;
@@ -28,6 +29,8 @@ namespace X3LaptopCompanion
             Camera = camera;
             Hand = hand;
             Detail = detail ?? string.Empty;
+            CameraLocked = cameraLocked;
+            HandLocked = handLocked;
         }
 
         public bool TeamsDetected { get; }
@@ -37,6 +40,8 @@ namespace X3LaptopCompanion
         public CompanionTriState Camera { get; }
         public CompanionTriState Hand { get; }
         public string Detail { get; }
+        public bool CameraLocked { get; }
+        public bool HandLocked { get; }
     }
 
     public sealed class TeamsController
@@ -232,7 +237,8 @@ namespace X3LaptopCompanion
                 " cameraCached=" + camera + " handCached=" + hand +
                 " indicator=\"" + indicator.FirstLine + "\"";
             HostLog.Write("Teams " + detail);
-            return new TeamsMeetingSnapshot(true, true, meetingName, microphone, camera, hand, detail);
+            return new TeamsMeetingSnapshot(true, true, meetingName, microphone, camera, hand, detail,
+                cameraLocked: true, handLocked: true);
         }
 
         private bool TryToggleMuteViaIndicator()
@@ -262,7 +268,7 @@ namespace X3LaptopCompanion
             return true;
         }
 
-
+        public bool TryToggleMute()
         {
             return TrySendCommand(TeamsCommand.ToggleMute);
         }

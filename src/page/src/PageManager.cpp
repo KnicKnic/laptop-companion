@@ -579,8 +579,21 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
   target.line(freeink::ui::Point{0, footer.y}, freeink::ui::Point{width, footer.y}, 1,
               freeink::ui::Paint::solid(freeink::ui::Color::Black));
   constexpr const char* defaultLabels[] = {"Directory", "Confirm", "Left", "Right"};
-  constexpr const char* companionLabels[] = {"Directory", "Camera", "Mute", "Hand"};
-  const char* const* labels = currentPage == PageId::Companion ? companionLabels : defaultLabels;
+  const char* labels[] = {"Directory", "Camera", "Mute", "Hand"};
+  char cameraLabel[16] = "Camera";
+  char handLabel[16] = "Hand";
+  if (currentPage == PageId::Companion) {
+    const CompanionBleService::HostStatus host = CompanionBleService::getInstance().getHostStatus();
+    if (host.cameraLocked) {
+      snprintf(cameraLabel, sizeof(cameraLabel), "Camera locked");
+    }
+    if (host.handLocked) {
+      snprintf(handLabel, sizeof(handLabel), "Hand locked");
+    }
+    labels[1] = cameraLabel;
+    labels[3] = handLabel;
+  }
+  const char* const* activeLabels = currentPage == PageId::Companion ? labels : defaultLabels;
   const int16_t buttonW = static_cast<int16_t>(width / 4);
   freeink::ui::TextStyle buttonText;
   buttonText.align = freeink::ui::TextAlign::Center;
@@ -589,7 +602,7 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
     freeink::ui::drawText(target,
                           freeink::ui::Rect{static_cast<int16_t>(i * buttonW), static_cast<int16_t>(footer.y + 1),
                                             buttonW, 24},
-                          labels[i], buttonText);
+                          activeLabels[i], buttonText);
   }
 }
 

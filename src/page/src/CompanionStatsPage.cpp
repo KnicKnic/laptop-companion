@@ -157,10 +157,12 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   snprintf(meetingLine, sizeof(meetingLine), "Meeting:%s  Name:%s", host.meetingDetected ? "active" : "none",
            host.meetingName.empty() ? "--" : host.meetingName.c_str());
   char mediaLine[112];
-  snprintf(mediaLine, sizeof(mediaLine), "Mic:%s #%u  Camera:%s #%u  Hand:%s #%u",
+  snprintf(mediaLine, sizeof(mediaLine), "Mic:%s #%u  Camera:%s%s #%u  Hand:%s%s #%u",
            triStateText(host.microphone, "muted", "live"), static_cast<unsigned>(host.microphoneCounter),
-           triStateText(host.camera, "off", "on"), static_cast<unsigned>(host.cameraCounter),
-           triStateText(host.hand, "lowered", "raised"), static_cast<unsigned>(host.handCounter));
+           triStateText(host.camera, "off", "on"), host.cameraLocked ? "(locked)" : "",
+           static_cast<unsigned>(host.cameraCounter),
+           triStateText(host.hand, "lowered", "raised"), host.handLocked ? "(locked)" : "",
+           static_cast<unsigned>(host.handCounter));
   char hostMessageLine[128];
   snprintf(hostMessageLine, sizeof(hostMessageLine), "Host text: %s", host.message.empty() ? "--" : host.message.c_str());
   const size_t timingBreak = timing.find('\n');

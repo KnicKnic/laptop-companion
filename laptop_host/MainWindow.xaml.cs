@@ -66,7 +66,7 @@ namespace X3LaptopCompanion
             public HostStatePayload(bool teamsDetected, bool meetingDetected, string meetingName,
                 CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message,
                 ushort teamsCounter, ushort meetingCounter, ushort microphoneCounter, ushort cameraCounter,
-                ushort handCounter)
+                ushort handCounter, bool cameraLocked, bool handLocked)
             {
                 TeamsDetected = teamsDetected;
                 MeetingDetected = meetingDetected;
@@ -80,6 +80,8 @@ namespace X3LaptopCompanion
                 MicrophoneCounter = microphoneCounter;
                 CameraCounter = cameraCounter;
                 HandCounter = handCounter;
+                CameraLocked = cameraLocked;
+                HandLocked = handLocked;
             }
 
             public bool TeamsDetected { get; }
@@ -94,6 +96,8 @@ namespace X3LaptopCompanion
             public ushort MicrophoneCounter { get; }
             public ushort CameraCounter { get; }
             public ushort HandCounter { get; }
+            public bool CameraLocked { get; }
+            public bool HandLocked { get; }
 
             public ushort CounterFor(CompanionButton button)
             {
@@ -119,6 +123,8 @@ namespace X3LaptopCompanion
                     Microphone == other.Microphone &&
                     Camera == other.Camera &&
                     Hand == other.Hand &&
+                    CameraLocked == other.CameraLocked &&
+                    HandLocked == other.HandLocked &&
                     string.Equals(Message, other.Message, System.StringComparison.Ordinal) &&
                     TeamsCounter == other.TeamsCounter &&
                     MeetingCounter == other.MeetingCounter &&
@@ -136,7 +142,7 @@ namespace X3LaptopCompanion
             connectionService.StatusChanged += OnConnectionStatusChanged;
             connectionService.ButtonEventReceived += OnButtonEventReceived;
             connectionService.ParticipationEventReceived += OnParticipationEventReceived;
-            statusTimer.Interval = System.TimeSpan.FromSeconds(2);
+            statusTimer.Interval = System.TimeSpan.FromSeconds(1);
             statusTimer.Tick += OnStatusTimerTick;
             Loaded += OnLoaded;
             Closing += OnClosing;
@@ -509,8 +515,8 @@ namespace X3LaptopCompanion
                 ? (string.IsNullOrWhiteSpace(snapshot.MeetingName) ? "Yes" : snapshot.MeetingName)
                 : "No";
             MicrophoneText = TriStateText(snapshot.Microphone, "Muted", "Live");
-            CameraText = TriStateText(snapshot.Camera, "Off", "Active");
-            HandText = TriStateText(snapshot.Hand, "Lowered", "Raised");
+            CameraText = TriStateText(snapshot.Camera, "Off", "Active") + (snapshot.CameraLocked ? " (locked)" : "");
+            HandText = TriStateText(snapshot.Hand, "Lowered", "Raised") + (snapshot.HandLocked ? " (locked)" : "");
         }
 
         private void OnStatusTimerTick(object sender, System.EventArgs e)
@@ -576,7 +582,7 @@ namespace X3LaptopCompanion
                     ApplyTeamsSnapshotToUi(snapshot);
                     QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
                         snapshot.Microphone, snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
-                        "current", force);
+                        "current", force, snapshot.CameraLocked, snapshot.HandLocked);
                 });
             }
             catch (System.Exception ex)
@@ -829,7 +835,8 @@ namespace X3LaptopCompanion
                         {
                             QueueHostStatusIfChanged(failedSnapshot.TeamsDetected, failedSnapshot.MeetingDetected,
                                 failedSnapshot.MeetingName, failedSnapshot.Microphone, failedSnapshot.Camera,
-                                failedSnapshot.Hand, StatusMessageForSnapshot(failedSnapshot), "teams command missing");
+                                failedSnapshot.Hand, StatusMessageForSnapshot(failedSnapshot), "teams command missing",
+                                cameraLocked: failedSnapshot.CameraLocked, handLocked: failedSnapshot.HandLocked);
                         }
                     }));
                     return;
@@ -1006,7 +1013,8 @@ namespace X3LaptopCompanion
                     ApplyTeamsSnapshotToUi(snapshot);
                     QueueHostStatusIfChanged(snapshot.TeamsDetected, snapshot.MeetingDetected, snapshot.MeetingName,
                         snapshot.Microphone, snapshot.Camera, snapshot.Hand, StatusMessageForSnapshot(snapshot),
-                        "post-command refresh " + delaysMs[attempt] + "ms");
+                        "post-command refresh " + delaysMs[attempt] + "ms",
+                        cameraLocked: snapshot.CameraLocked, handLocked: snapshot.HandLocked);
                 }), DispatcherPriority.Send);
                 return;
             }
@@ -1160,7 +1168,7 @@ namespace X3LaptopCompanion
 
         private void QueueHostStatusIfChanged(bool teamsDetected, bool meetingDetected, string meetingName,
             CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message,
-            string reason, bool force = false)
+            string reason, bool force = false, bool cameraLocked = false, bool handLocked = false)
         {
             if (isExiting)
             {
@@ -1175,7 +1183,7 @@ namespace X3LaptopCompanion
             }
 
             var payload = BuildHostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
-                message);
+                message, cameraLocked, handLocked);
             if (!force && payload.SameAs(lastSentHostState))
             {
                 HostLog.Write("Host state unchanged; BLE write skipped. reason=" + reason);
@@ -1194,7 +1202,8 @@ namespace X3LaptopCompanion
         }
 
         private HostStatePayload BuildHostStatePayload(bool teamsDetected, bool meetingDetected, string meetingName,
-            CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message)
+            CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand, string message,
+            bool cameraLocked, bool handLocked)
         {
             if (pendingButton.HasValue && pendingButtonExpectedState.HasValue &&
                 StateForButton(pendingButton.Value, microphone, camera, hand) == pendingButtonExpectedState.Value)
@@ -1216,7 +1225,7 @@ namespace X3LaptopCompanion
 
             return new HostStatePayload(teamsDetected, meetingDetected, meetingName, microphone, camera, hand,
                 message, 0, 0, microphoneStateCounter, cameraStateCounter,
-                handStateCounter);
+                handStateCounter, cameraLocked, handLocked);
         }
 
         private async Task SendHostStatePayloadAsync(HostStatePayload payload, string reason)
@@ -1232,7 +1241,7 @@ namespace X3LaptopCompanion
                 var sent = await connectionService.SendHostStatusAsync(payload.TeamsDetected, payload.MeetingDetected,
                     payload.MeetingName, payload.Microphone, payload.Camera, payload.Hand, payload.Message,
                     payload.TeamsCounter, payload.MeetingCounter, payload.MicrophoneCounter, payload.CameraCounter,
-                    payload.HandCounter, priorityButton);
+                    payload.HandCounter, payload.CameraLocked, payload.HandLocked, priorityButton);
                 if (sent)
                 {
                     lastSentHostState = payload;

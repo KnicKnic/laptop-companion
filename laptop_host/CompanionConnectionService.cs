@@ -118,7 +118,8 @@ namespace X3LaptopCompanion
         public async Task<bool> SendHostStatusAsync(bool teamsDetected, bool meetingDetected,
             string meetingName, CompanionTriState microphone, CompanionTriState camera, CompanionTriState hand,
             string message, ushort teamsCounter = 0, ushort meetingCounter = 0, ushort microphoneCounter = 0,
-            ushort cameraCounter = 0, ushort handCounter = 0, CompanionButton? priorityButton = null)
+            ushort cameraCounter = 0, ushort handCounter = 0, bool cameraLocked = false, bool handLocked = false,
+            CompanionButton? priorityButton = null)
         {
             if (!await hostStateWriteLock.WaitAsync(0))
             {
@@ -128,8 +129,10 @@ namespace X3LaptopCompanion
 
             try
             {
-                if (hostTeamsStateCharacteristic == null || hostMicrophoneStateCharacteristic == null ||
-                    hostCameraStateCharacteristic == null || hostStatusMessageCharacteristic == null)
+                if (hostTeamsStateCharacteristic == null || hostMeetingStateCharacteristic == null ||
+                    hostMeetingNameCharacteristic == null || hostMicrophoneStateCharacteristic == null ||
+                    hostCameraStateCharacteristic == null || hostHandStateCharacteristic == null ||
+                    hostStatusMessageCharacteristic == null)
                 {
                     HostLog.Write("Host state skipped; one or more state characteristics are not available.");
                     return false;
@@ -139,7 +142,8 @@ namespace X3LaptopCompanion
                 HostLog.Write("Host state write starting option=WriteWithoutResponse teams=" + teamsDetected +
                     " meeting=" + meetingDetected + " meetingName=" + meetingName +
                     " mic=" + microphone + " camera=" + camera +
-                    " hand=" + hand + " counters=" + teamsCounter + "/" + meetingCounter + "/" +
+                    " cameraLocked=" + cameraLocked + " hand=" + hand + " handLocked=" + handLocked +
+                    " counters=" + teamsCounter + "/" + meetingCounter + "/" +
                     microphoneCounter + "/" + cameraCounter + "/" + handCounter +
                     " priorityButton=" + (priorityButton.HasValue ? priorityButton.Value.ToString() : "(none)") +
                     " message=" + message);
@@ -158,20 +162,19 @@ namespace X3LaptopCompanion
                 else if (priorityButton == CompanionButton.ToggleCamera)
                 {
                     cameraStatus = await WriteEncodedStateAsync(hostCameraStateCharacteristic,
-                        CompanionProtocol.TriStateIsOn(camera), cameraCounter, "camera");
+                        CompanionProtocol.TriStateIsOn(camera), cameraCounter, "camera", cameraLocked);
                 }
                 else if (priorityButton == CompanionButton.ToggleHand)
                 {
-                    handStatus = await WriteOptionalByteStateAsync(hostHandStateCharacteristic,
-                        CompanionProtocol.TriStateIsOn(hand), handCounter, "hand");
+                    handStatus = await WriteEncodedStateAsync(hostHandStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(hand), handCounter, "hand", handLocked);
                 }
 
                 teamsStatus = await WriteEncodedStateAsync(hostTeamsStateCharacteristic, teamsDetected,
                     teamsCounter, "teams");
-                meetingStatus = await WriteOptionalByteStateAsync(hostMeetingStateCharacteristic,
+                meetingStatus = await WriteEncodedStateAsync(hostMeetingStateCharacteristic,
                     meetingDetected, meetingCounter, "meeting");
-                meetingNameStatus = await WriteOptionalStringStateAsync(hostMeetingNameCharacteristic,
-                    meetingName, "meeting name");
+                meetingNameStatus = await WriteStringStateAsync(hostMeetingNameCharacteristic, meetingName, "meeting name");
                 if (priorityButton != CompanionButton.ToggleMute)
                 {
                     microphoneStatus = await WriteEncodedStateAsync(hostMicrophoneStateCharacteristic,
@@ -181,13 +184,13 @@ namespace X3LaptopCompanion
                 if (priorityButton != CompanionButton.ToggleCamera)
                 {
                     cameraStatus = await WriteEncodedStateAsync(hostCameraStateCharacteristic,
-                        CompanionProtocol.TriStateIsOn(camera), cameraCounter, "camera");
+                        CompanionProtocol.TriStateIsOn(camera), cameraCounter, "camera", cameraLocked);
                 }
 
                 if (priorityButton != CompanionButton.ToggleHand)
                 {
-                    handStatus = await WriteOptionalByteStateAsync(hostHandStateCharacteristic,
-                        CompanionProtocol.TriStateIsOn(hand), handCounter, "hand");
+                    handStatus = await WriteEncodedStateAsync(hostHandStateCharacteristic,
+                        CompanionProtocol.TriStateIsOn(hand), handCounter, "hand", handLocked);
                 }
 
                 var messageStatus = await WriteStringStateAsync(hostStatusMessageCharacteristic, message, "message");
@@ -228,33 +231,21 @@ namespace X3LaptopCompanion
         }
 
         private static async Task<GattCommunicationStatus> WriteEncodedStateAsync(GattCharacteristic characteristic,
-            bool on, ushort counter, string name)
+            bool on, ushort counter, string name, bool locked = false)
         {
             var writer = new DataWriter
             {
                 ByteOrder = ByteOrder.LittleEndian
             };
-            var encoded = CompanionProtocol.EncodeState(on, counter);
+            var encoded = CompanionProtocol.EncodeState(on, counter, locked);
             writer.WriteUInt16(encoded);
             var buffer = writer.DetachBuffer();
             HostLog.Write("Host state write " + name + " bytes=" + buffer.Length +
                 " properties=" + characteristic.CharacteristicProperties);
             var status = await characteristic.WriteValueAsync(buffer, GattWriteOption.WriteWithoutResponse);
             HostLog.Write("Host state write " + name + " status=" + status + " on=" + on +
-                " counter=" + counter + " encoded=" + encoded);
+                " locked=" + locked + " counter=" + counter + " encoded=" + encoded);
             return status;
-        }
-
-        private static async Task<GattCommunicationStatus> WriteOptionalByteStateAsync(GattCharacteristic characteristic,
-            bool on, ushort counter, string name)
-        {
-            if (characteristic == null)
-            {
-                HostLog.Write("Host state write " + name + " skipped; optional characteristic is missing.");
-                return GattCommunicationStatus.Success;
-            }
-
-            return await WriteEncodedStateAsync(characteristic, on, counter, name);
         }
 
         private static async Task<GattCommunicationStatus> WriteStringStateAsync(GattCharacteristic characteristic, string value, string name)
@@ -271,18 +262,6 @@ namespace X3LaptopCompanion
             var status = await characteristic.WriteValueAsync(buffer, GattWriteOption.WriteWithoutResponse);
             HostLog.Write("Host state write " + name + " status=" + status);
             return status;
-        }
-
-        private static async Task<GattCommunicationStatus> WriteOptionalStringStateAsync(GattCharacteristic characteristic,
-            string value, string name)
-        {
-            if (characteristic == null)
-            {
-                HostLog.Write("Host state write " + name + " skipped; optional characteristic is missing.");
-                return GattCommunicationStatus.Success;
-            }
-
-            return await WriteStringStateAsync(characteristic, value, name);
         }
 
         private async void OnDeviceAdded(DeviceWatcher sender, DeviceInformation args)
@@ -591,17 +570,19 @@ namespace X3LaptopCompanion
             hostMicrophoneStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMicrophoneStateUuid, "host microphone state");
             hostCameraStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostCameraStateUuid, "host camera state");
             hostStatusMessageCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostStatusMessageUuid, "host status message");
-            hostMeetingStateCharacteristic = await GetOptionalCharacteristicAsync(service, CompanionProtocol.HostMeetingStateUuid, "host meeting state");
-            hostHandStateCharacteristic = await GetOptionalCharacteristicAsync(service, CompanionProtocol.HostHandStateUuid, "host hand state");
-            hostMeetingNameCharacteristic = await GetOptionalCharacteristicAsync(service, CompanionProtocol.HostMeetingNameUuid, "host meeting name");
+            hostMeetingStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingStateUuid, "host meeting state");
+            hostHandStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostHandStateUuid, "host hand state");
+            hostMeetingNameCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingNameUuid, "host meeting name");
             buttonEventCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.ButtonEventUuid, "button event");
-            participationCharacteristic = await GetOptionalCharacteristicAsync(service,
+            participationCharacteristic = await GetCharacteristicAsync(service,
                 CompanionProtocol.ConnectionParticipationUuid, "connection participation");
             deviceInfoCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.DeviceInfoUuid, "device info");
 
             if (hostTeamsStateCharacteristic == null || hostMicrophoneStateCharacteristic == null ||
                 hostCameraStateCharacteristic == null || hostStatusMessageCharacteristic == null ||
-                buttonEventCharacteristic == null)
+                hostMeetingStateCharacteristic == null || hostMeetingNameCharacteristic == null ||
+                hostHandStateCharacteristic == null || buttonEventCharacteristic == null ||
+                participationCharacteristic == null || deviceInfoCharacteristic == null)
             {
                 HostLog.Write("Required characteristic missing. teams=" + (hostTeamsStateCharacteristic != null) +
                     " microphone=" + (hostMicrophoneStateCharacteristic != null) +
@@ -619,18 +600,28 @@ namespace X3LaptopCompanion
                 return;
             }
 
+            var protocolVersion = await ReadProtocolVersionAsync(deviceInfoCharacteristic);
+            if (protocolVersion != CompanionProtocol.ProtocolVersion)
+            {
+                HostLog.Write("Protocol version mismatch. expected=" + CompanionProtocol.ProtocolVersion +
+                    " actual=" + (protocolVersion.HasValue ? protocolVersion.Value.ToString() : "unreadable"));
+                PublishStatus(false, "X3 companion protocol version mismatch.");
+                ResetGattState();
+                RestartAdvertisementWatcherIfNeeded("protocol mismatch");
+                return;
+            }
+
             HostLog.Write("Characteristic properties. teams=" + hostTeamsStateCharacteristic.CharacteristicProperties +
                 " microphone=" + hostMicrophoneStateCharacteristic.CharacteristicProperties +
                 " camera=" + hostCameraStateCharacteristic.CharacteristicProperties +
                 " message=" + hostStatusMessageCharacteristic.CharacteristicProperties +
-                " meeting=" + (hostMeetingStateCharacteristic == null ? "missing" : hostMeetingStateCharacteristic.CharacteristicProperties.ToString()) +
-                " meetingName=" + (hostMeetingNameCharacteristic == null ? "missing" : hostMeetingNameCharacteristic.CharacteristicProperties.ToString()) +
-                " hand=" + (hostHandStateCharacteristic == null ? "missing" : hostHandStateCharacteristic.CharacteristicProperties.ToString()) +
+                " meeting=" + hostMeetingStateCharacteristic.CharacteristicProperties +
+                " meetingName=" + hostMeetingNameCharacteristic.CharacteristicProperties +
+                " hand=" + hostHandStateCharacteristic.CharacteristicProperties +
                 " button=" + buttonEventCharacteristic.CharacteristicProperties +
-                " participation=" +
-                (participationCharacteristic == null ? "missing" : participationCharacteristic.CharacteristicProperties.ToString()) +
-                " deviceInfo=" +
-                (deviceInfoCharacteristic == null ? "missing" : deviceInfoCharacteristic.CharacteristicProperties.ToString()));
+                " participation=" + participationCharacteristic.CharacteristicProperties +
+                " deviceInfo=" + deviceInfoCharacteristic.CharacteristicProperties +
+                " protocolVersion=" + protocolVersion.Value);
 
             buttonEventCharacteristic.ValueChanged += OnButtonEventValueChanged;
             var status = await buttonEventCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
@@ -644,13 +635,17 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            if (participationCharacteristic != null)
+            participationCharacteristic.ValueChanged += OnParticipationValueChanged;
+            var participationStatus =
+                await participationCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
+                    GattClientCharacteristicConfigurationDescriptorValue.Notify);
+            HostLog.Write("Participation notification subscribe status=" + participationStatus);
+            if (participationStatus != GattCommunicationStatus.Success)
             {
-                participationCharacteristic.ValueChanged += OnParticipationValueChanged;
-                var participationStatus =
-                    await participationCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
-                        GattClientCharacteristicConfigurationDescriptorValue.Notify);
-                HostLog.Write("Participation notification subscribe status=" + participationStatus);
+                PublishStatus(false, "Could not subscribe to X3 sync notifications.");
+                ResetGattState();
+                RestartAdvertisementWatcherIfNeeded("participation subscribe failed");
+                return;
             }
 
             PublishStatus(true, "Connected to X3 companion.");
@@ -671,10 +666,32 @@ namespace X3LaptopCompanion
             return await GetCharacteristicAsync(service, uuid, name, 5);
         }
 
-        private static async Task<GattCharacteristic> GetOptionalCharacteristicAsync(GattDeviceService service,
-            Guid uuid, string name)
+        private static async Task<byte?> ReadProtocolVersionAsync(GattCharacteristic characteristic)
         {
-            return await GetCharacteristicAsync(service, uuid, name, 1);
+            if (characteristic == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                var result = await characteristic.ReadValueAsync(BluetoothCacheMode.Uncached);
+                if (result.Status != GattCommunicationStatus.Success || result.Value == null ||
+                    result.Value.Length < 1)
+                {
+                    HostLog.Write("Device info read failed. status=" + result.Status +
+                        " bytes=" + (result.Value == null ? 0 : result.Value.Length));
+                    return null;
+                }
+
+                var reader = DataReader.FromBuffer(result.Value);
+                return reader.ReadByte();
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("Device info read failed with exception.", ex);
+                return null;
+            }
         }
 
         private static async Task<GattCharacteristic> GetCharacteristicAsync(GattDeviceService service, Guid uuid,

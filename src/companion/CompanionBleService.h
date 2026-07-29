@@ -30,8 +30,10 @@ class CompanionBleService {
     uint16_t microphoneCounter = 0;
     uint8_t camera = 0;
     uint16_t cameraCounter = 0;
+    bool cameraLocked = false;
     uint8_t hand = 0;
     uint16_t handCounter = 0;
+    bool handLocked = false;
     std::string message;
   };
 

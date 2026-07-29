@@ -64,12 +64,16 @@ std::string acknowledgedText(const char* label, uint16_t counter, uint32_t laten
 }
 
 void drawStatusTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile, const freeink::Icon& icon,
-                    const char* label, const char* value, bool active) {
-  const freeink::ui::Color ink = active ? freeink::ui::Color::White : freeink::ui::Color::Black;
-  if (active) {
+                    const char* label, const char* value, bool active, bool locked = false) {
+  const freeink::ui::Color ink = active && !locked ? freeink::ui::Color::White : freeink::ui::Color::Black;
+  if (active && !locked) {
     target.fill(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 4);
   } else {
     target.stroke(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
+    if (locked && tile.width > 12 && tile.height > 12) {
+      target.stroke(tile.inset(freeink::ui::Insets{5, 5, 5, 5}), freeink::ui::Paint::solid(freeink::ui::Color::Black),
+                    1, 3);
+    }
   }
 
   freeink::ui::TextStyle labelStyle;
@@ -81,9 +85,14 @@ void drawStatusTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect&
 
   drawIcon(target, freeink::ui::Rect{static_cast<int16_t>(tile.x + 14), static_cast<int16_t>(tile.y + 14), 36, 36},
            icon, ink);
+  if (locked) {
+    drawIcon(target,
+             freeink::ui::Rect{static_cast<int16_t>(tile.right() - 44), static_cast<int16_t>(tile.y + 14), 28, 28},
+             icon_lock_28);
+  }
   freeink::ui::drawText(target,
                         freeink::ui::Rect{static_cast<int16_t>(tile.x + 62), static_cast<int16_t>(tile.y + 16),
-                                          static_cast<int16_t>(tile.width - 76), 28},
+                                          static_cast<int16_t>(tile.width - (locked ? 112 : 76)), 28},
                         label, labelStyle);
   freeink::ui::drawText(target,
                         freeink::ui::Rect{static_cast<int16_t>(tile.x + 62), static_cast<int16_t>(tile.y + 52),
@@ -157,15 +166,24 @@ void CompanionPage::onEnter() {
 bool CompanionPage::handleButton(ButtonPressKind kind) {
   CompanionBleService& service = CompanionBleService::getInstance();
   ensureStarted();
+  const CompanionBleService::HostStatus host = service.getHostStatus();
   uint16_t counter = 0;
   switch (kind) {
     case ButtonPressKind::Left:
       actionMessage_ = service.notifyToggleMuteReleased(&counter) ? pressedText("Mute", counter) : "Host not ready";
       return true;
     case ButtonPressKind::Right:
+      if (host.handLocked) {
+        actionMessage_ = "Hand locked";
+        return true;
+      }
       actionMessage_ = service.notifyToggleHandReleased(&counter) ? pressedText("Hand", counter) : "Host not ready";
       return true;
     case ButtonPressKind::Confirm:
+      if (host.cameraLocked) {
+        actionMessage_ = "Camera locked";
+        return true;
+      }
       actionMessage_ = service.notifyToggleCameraReleased(&counter) ? pressedText("Camera", counter) : "Host not ready";
       return true;
     default:
@@ -223,9 +241,12 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
                  "Microphone", triStateText(host.microphone, "Muted", "Live"), micLive);
   drawStatusTile(target,
                  freeink::ui::Rect{static_cast<int16_t>(content.x + tileW + gap), mediaTileY, tileW, 100},
-                 cameraStatusIcon(host.camera), "Camera", triStateText(host.camera, "Off", "Active"), cameraLive);
+                 cameraStatusIcon(host.camera), "Camera",
+                 host.cameraLocked ? "Locked" : triStateText(host.camera, "Off", "Active"), cameraLive,
+                 host.cameraLocked);
   drawStatusTile(target, freeink::ui::Rect{content.x, static_cast<int16_t>(mediaTileY + 124), content.width, 88},
-                 icon_activity_36, "Hand", triStateText(host.hand, "Lowered", "Raised"), handRaised);
+                 icon_activity_36, "Hand", host.handLocked ? "Locked" : triStateText(host.hand, "Lowered", "Raised"),
+                 handRaised, host.handLocked);
 
   std::string pendingText;
   if (pending.mutePending) {

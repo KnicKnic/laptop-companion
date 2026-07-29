@@ -16,12 +16,12 @@ namespace X3LaptopCompanion
         public static readonly Guid HostMeetingNameUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000a");
         public static readonly Guid ConnectionParticipationUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000b");
 
-        public const byte ProtocolVersion = 2;
-        public const ushort StateCounterMask = 0x7FFF;
+        public const byte ProtocolVersion = 3;
+        public const ushort StateCounterMask = 0x3FFF;
 
-        public static ushort EncodeState(bool on, ushort counter)
+        public static ushort EncodeState(bool on, ushort counter, bool locked = false)
         {
-            return (ushort)(((counter & StateCounterMask) << 1) | (on ? 1 : 0));
+            return (ushort)(((counter & StateCounterMask) << 2) | (locked ? 0x0002 : 0) | (on ? 1 : 0));
         }
 
         public static bool TriStateIsOn(CompanionTriState state)

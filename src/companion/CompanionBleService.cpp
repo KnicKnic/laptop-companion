@@ -32,7 +32,7 @@ constexpr uint16_t kConnTimeoutResponsive = 400;     // 4 s
 
 constexpr uint16_t kConnIntervalIdleMin = 80;        // 100 ms
 constexpr uint16_t kConnIntervalIdleMax = 96;        // 120 ms
-constexpr uint16_t kConnLatencyIdle = 39;
+constexpr uint16_t kConnLatencyIdle = 10;
 constexpr uint16_t kConnTimeoutIdle = 1500;          // 15 s
 constexpr uint16_t kAdvIntervalLowPowerMin = 800;    // 500 ms
 constexpr uint16_t kAdvIntervalLowPowerMax = 1600;   // 1000 ms
@@ -91,48 +91,28 @@ uint16_t decodeLe16(const std::string& value) {
          static_cast<uint16_t>(static_cast<uint8_t>(value[1]) << 8);
 }
 
-uint8_t decodeTriStateByte(uint8_t value) {
-  if (value == static_cast<uint8_t>(CompanionProtocol::TriState::On) ||
-      value == static_cast<uint8_t>(CompanionProtocol::TriState::Off) ||
-      value == static_cast<uint8_t>(CompanionProtocol::TriState::Unknown)) {
-    return value;
-  }
-  return value != 0 ? static_cast<uint8_t>(CompanionProtocol::TriState::On)
-                    : static_cast<uint8_t>(CompanionProtocol::TriState::Off);
-}
-
-bool decodeBoolState(const std::string& value, bool* on, uint16_t* counter) {
-  if (value.empty() || !on || !counter) return false;
-  if (value.size() >= kEncodedStateLen) {
-    const uint16_t encoded = decodeLe16(value);
-    *on = (encoded & 0x0001U) != 0;
-    *counter = static_cast<uint16_t>(encoded >> 1);
-    return true;
-  }
-
-  *on = value[0] != 0;
-  *counter = 0;
+bool decodeBoolState(const std::string& value, bool* on, uint16_t* counter, bool* locked = nullptr) {
+  if (value.size() != kEncodedStateLen || !on || !counter) return false;
+  const uint16_t encoded = decodeLe16(value);
+  *on = (encoded & 0x0001U) != 0;
+  if (locked) *locked = (encoded & 0x0002U) != 0;
+  *counter = static_cast<uint16_t>(encoded >> 2);
   return true;
 }
 
-bool decodeTriState(const std::string& value, uint8_t* state, uint16_t* counter) {
-  if (value.empty() || !state || !counter) return false;
-  if (value.size() >= kEncodedStateLen) {
-    const uint16_t encoded = decodeLe16(value);
-    *state = (encoded & 0x0001U) != 0 ? static_cast<uint8_t>(CompanionProtocol::TriState::On)
-                                      : static_cast<uint8_t>(CompanionProtocol::TriState::Off);
-    *counter = static_cast<uint16_t>(encoded >> 1);
-    return true;
-  }
-
-  *state = decodeTriStateByte(static_cast<uint8_t>(value[0]));
-  *counter = 0;
+bool decodeTriState(const std::string& value, uint8_t* state, uint16_t* counter, bool* locked = nullptr) {
+  if (value.size() != kEncodedStateLen || !state || !counter) return false;
+  const uint16_t encoded = decodeLe16(value);
+  *state = (encoded & 0x0001U) != 0 ? static_cast<uint8_t>(CompanionProtocol::TriState::On)
+                                    : static_cast<uint8_t>(CompanionProtocol::TriState::Off);
+  if (locked) *locked = (encoded & 0x0002U) != 0;
+  *counter = static_cast<uint16_t>(encoded >> 2);
   return true;
 }
 
-void setEncodedStateValue(NimBLECharacteristic* characteristic, bool on, uint16_t counter) {
+void setEncodedStateValue(NimBLECharacteristic* characteristic, bool on, uint16_t counter, bool locked = false) {
   if (!characteristic) return;
-  const uint16_t encoded = CompanionProtocol::encodeState(on, counter);
+  const uint16_t encoded = CompanionProtocol::encodeState(on, counter, locked);
   const uint8_t payload[] = {
       static_cast<uint8_t>(encoded & 0xFF),
       static_cast<uint8_t>((encoded >> 8) & 0xFF),
@@ -468,7 +448,8 @@ bool CompanionBleService::notifyToggleMuteReleased(uint16_t* counter) {
 
 bool CompanionBleService::notifyToggleHandReleased(uint16_t* counter) {
   lockState();
-  const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
+  const bool ready =
+      running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_ && !hostStatus_.handLocked;
   unlockState();
   if (!ready) {
     logPrintf("Companion BLE: hand event skipped\n");
@@ -481,7 +462,8 @@ bool CompanionBleService::notifyToggleHandReleased(uint16_t* counter) {
 
 bool CompanionBleService::notifyToggleCameraReleased(uint16_t* counter) {
   lockState();
-  const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
+  const bool ready =
+      running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_ && !hostStatus_.cameraLocked;
   unlockState();
   if (!ready) {
     logPrintf("Companion BLE: camera event skipped\n");
@@ -697,16 +679,20 @@ void CompanionBleService::onHostCameraStateWritten(NimBLECharacteristic* charact
 
   uint8_t next = 0;
   uint16_t counter = 0;
-  if (!decodeTriState(value, &next, &counter)) {
+  bool locked = false;
+  if (!decodeTriState(value, &next, &counter, &locked)) {
     unlockState();
     return;
   }
 
   const bool acknowledged = pendingButtons_.cameraPending && pendingButtons_.cameraCounter == counter;
-  const bool changed = hostStatus_.camera != next || hostStatus_.cameraCounter != counter || acknowledged;
+  const bool changed =
+      hostStatus_.camera != next || hostStatus_.cameraCounter != counter || hostStatus_.cameraLocked != locked ||
+      acknowledged;
   const bool firstStateWrite = !hostStateReceived_;
   hostStatus_.camera = next;
   hostStatus_.cameraCounter = counter;
+  hostStatus_.cameraLocked = locked;
   if (acknowledged) {
     const uint32_t latencyMs = millis() - pendingButtons_.cameraPressedAtMs;
     pendingButtons_.cameraPending = false;
@@ -744,16 +730,20 @@ void CompanionBleService::onHostHandStateWritten(NimBLECharacteristic* character
 
   uint8_t next = 0;
   uint16_t counter = 0;
-  if (!decodeTriState(value, &next, &counter)) {
+  bool locked = false;
+  if (!decodeTriState(value, &next, &counter, &locked)) {
     unlockState();
     return;
   }
 
   const bool acknowledged = pendingButtons_.handPending && pendingButtons_.handCounter == counter;
-  const bool changed = hostStatus_.hand != next || hostStatus_.handCounter != counter || acknowledged;
+  const bool changed =
+      hostStatus_.hand != next || hostStatus_.handCounter != counter || hostStatus_.handLocked != locked ||
+      acknowledged;
   const bool firstStateWrite = !hostStateReceived_;
   hostStatus_.hand = next;
   hostStatus_.handCounter = counter;
+  hostStatus_.handLocked = locked;
   if (acknowledged) {
     const uint32_t latencyMs = millis() - pendingButtons_.handPressedAtMs;
     pendingButtons_.handPending = false;
@@ -987,10 +977,10 @@ void CompanionBleService::publishHostStateValues() {
                        hostStatus_.microphoneCounter);
   setEncodedStateValue(hostCameraStateCharacteristic_,
                        hostStatus_.camera == static_cast<uint8_t>(CompanionProtocol::TriState::On),
-                       hostStatus_.cameraCounter);
+                       hostStatus_.cameraCounter, hostStatus_.cameraLocked);
   setEncodedStateValue(hostHandStateCharacteristic_,
                        hostStatus_.hand == static_cast<uint8_t>(CompanionProtocol::TriState::On),
-                       hostStatus_.handCounter);
+                       hostStatus_.handCounter, hostStatus_.handLocked);
   if (hostStatusMessageCharacteristic_) hostStatusMessageCharacteristic_->setValue(hostStatus_.message);
   unlockState();
 }

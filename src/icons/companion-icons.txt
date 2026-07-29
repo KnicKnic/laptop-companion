@@ -9,3 +9,4 @@ video = video
 video_off = video-off
 radio_tower = radio-tower
 activity = activity
+lock = lock
