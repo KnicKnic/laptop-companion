@@ -580,18 +580,14 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
               freeink::ui::Paint::solid(freeink::ui::Color::Black));
   constexpr const char* defaultLabels[] = {"Directory", "Confirm", "Left", "Right"};
   const char* labels[] = {"Directory", "Camera", "Mute", "Hand"};
-  char cameraLabel[16] = "Camera";
-  char handLabel[16] = "Hand";
   if (currentPage == PageId::Companion) {
     const CompanionBleService::HostStatus host = CompanionBleService::getInstance().getHostStatus();
     if (host.cameraLocked) {
-      snprintf(cameraLabel, sizeof(cameraLabel), "Camera locked");
+      labels[1] = "";
     }
     if (host.handLocked) {
-      snprintf(handLabel, sizeof(handLabel), "Hand locked");
+      labels[3] = "";
     }
-    labels[1] = cameraLabel;
-    labels[3] = handLabel;
   }
   const char* const* activeLabels = currentPage == PageId::Companion ? labels : defaultLabels;
   const int16_t buttonW = static_cast<int16_t>(width / 4);

@@ -65,15 +65,15 @@ std::string acknowledgedText(const char* label, uint16_t counter, uint32_t laten
 
 void drawStatusTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile, const freeink::Icon& icon,
                     const char* label, const char* value, bool active, bool locked = false) {
-  const freeink::ui::Color ink = active && !locked ? freeink::ui::Color::White : freeink::ui::Color::Black;
-  if (active && !locked) {
+  const freeink::ui::Color ink = active ? freeink::ui::Color::White : freeink::ui::Color::Black;
+  if (active) {
     target.fill(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 4);
   } else {
     target.stroke(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
-    if (locked && tile.width > 12 && tile.height > 12) {
-      target.stroke(tile.inset(freeink::ui::Insets{5, 5, 5, 5}), freeink::ui::Paint::solid(freeink::ui::Color::Black),
-                    1, 3);
-    }
+  }
+  if (locked && tile.width > 12 && tile.height > 12) {
+    target.stroke(tile.inset(freeink::ui::Insets{5, 5, 5, 5}),
+                  freeink::ui::Paint::solid(active ? freeink::ui::Color::White : freeink::ui::Color::Black), 1, 3);
   }
 
   freeink::ui::TextStyle labelStyle;
@@ -88,7 +88,7 @@ void drawStatusTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect&
   if (locked) {
     drawIcon(target,
              freeink::ui::Rect{static_cast<int16_t>(tile.right() - 44), static_cast<int16_t>(tile.y + 14), 28, 28},
-             icon_lock_28);
+             icon_lock_28, ink);
   }
   freeink::ui::drawText(target,
                         freeink::ui::Rect{static_cast<int16_t>(tile.x + 62), static_cast<int16_t>(tile.y + 16),
