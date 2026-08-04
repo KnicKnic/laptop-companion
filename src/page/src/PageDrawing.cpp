@@ -28,7 +28,7 @@ const char* boolText(bool value) {
 freeink::ui::Rect pageMainPanel(freeink::ui::DisplayTarget& target) {
   constexpr int16_t headerH = 22;
   constexpr int16_t navH = 0;
-  constexpr int16_t footerH = 34;
+  constexpr int16_t footerH = 0;
   constexpr int16_t gap = 0;
   const int16_t y = static_cast<int16_t>(headerH + navH + gap);
   const int16_t h = static_cast<int16_t>(target.logicalHeight() - y - footerH - gap);

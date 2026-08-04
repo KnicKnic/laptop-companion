@@ -2,14 +2,16 @@
 
 #include "AppLog.h"
 #include "AppState.h"
+#include "X4ProInputManager.h"
 
 #include <BoardConfig.h>
-#include <InputManager.h>
 #include <driver/gpio.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
 namespace {
+
+using InputManager = X4ProInputManager;
 
 enum class InputWorkflow : uint8_t {
   AdcButtons,
@@ -41,6 +43,10 @@ const char* buttonPressName(ButtonPressKind kind) {
       return "Up";
     case ButtonPressKind::Down:
       return "Down";
+    case ButtonPressKind::Touch:
+      return "Touch";
+    case ButtonPressKind::Directory:
+      return "Directory";
   }
   return "Unknown";
 }
@@ -83,6 +89,8 @@ uint8_t inputManagerButtonFromKind(ButtonPressKind kind) {
       return InputManager::BTN_POWER;
     case ButtonPressKind::Gpio1:
     case ButtonPressKind::Gpio2:
+    case ButtonPressKind::Touch:
+    case ButtonPressKind::Directory:
       return InputManager::BTN_POWER;
   }
   return InputManager::BTN_POWER;
@@ -109,6 +117,9 @@ void recordButtonPress(ButtonPressKind kind) {
     case ButtonPressKind::Down:
       recordGpio2ButtonPress(inputManagerButtonFromKind(kind));
       break;
+    case ButtonPressKind::Touch:
+    case ButtonPressKind::Directory:
+      break;
   }
 }
 
@@ -122,7 +133,7 @@ class AdcButtonPressSource {
     xTaskCreate(taskTrampoline, "adc_buttons", 4096, this, 2, &task_);
     if (!task_) return false;
 
-    logPrintf("Input workflow: ADC polling task; GPIO interrupts disabled.\n");
+    logPrintf("Input workflow: InputManager polling task (digital buttons, touch, and Home key).\n");
     return true;
   }
 
@@ -151,6 +162,25 @@ class AdcButtonPressSource {
           ButtonPress press{buttonKindFromInputManager(button)};
           xQueueSend(queue_, &press, 0);
         }
+      }
+      if (input_.wasHomeKeyTapped()) {
+        const ButtonPress press{ButtonPressKind::Directory};
+        xQueueSend(queue_, &press, 0);
+      }
+      float touchX = 0.0f;
+      float touchY = 0.0f;
+      if (input_.wasTouchTap(touchX, touchY)) {
+        const ButtonPress press{ButtonPressKind::Touch, touchX, touchY};
+        xQueueSend(queue_, &press, 0);
+      }
+      float swipeXStart = 0.0f;
+      float swipeYStart = 0.0f;
+      float swipeXEnd = 0.0f;
+      float swipeYEnd = 0.0f;
+      if (input_.wasSwipe(swipeXStart, swipeYStart, swipeXEnd, swipeYEnd)) {
+        const ButtonPressKind kind = swipeXEnd > swipeXStart ? ButtonPressKind::Down : ButtonPressKind::Up;
+        const ButtonPress press{kind};
+        xQueueSend(queue_, &press, 0);
       }
       vTaskDelay(pdMS_TO_TICKS(kAdcPollMs));
     }
@@ -289,6 +319,8 @@ class GpioButtonPressSource {
       case ButtonPressKind::Right:
       case ButtonPressKind::Up:
       case ButtonPressKind::Down:
+      case ButtonPressKind::Touch:
+      case ButtonPressKind::Directory:
         return nullptr;
     }
     return nullptr;

@@ -6,12 +6,34 @@
 #include "Settings.h"
 
 #include <Arduino.h>
+#include <BatteryMonitor.h>
+#include <BoardConfig.h>
 #include <FreeInkUIDisplayTarget.h>
 #include <FreeInkUIFontSmall.h>
 
 namespace {
 constexpr freeink::ui::FontId kStatsFontSlot = 3;
 constexpr int16_t kStatsLineGap = 2;
+
+const char* displayDriverName() {
+  switch (BoardConfig::ACTIVE.displayController) {
+    case BoardConfig::DisplayController::SSD1677:
+      return "SSD1677";
+    case BoardConfig::DisplayController::UC8179:
+      return "UC8179";
+    case BoardConfig::DisplayController::UC8279:
+      return "UC8279";
+    case BoardConfig::DisplayController::UC8253:
+      return "UC8253";
+    case BoardConfig::DisplayController::ED2208:
+      return "ED2208";
+    case BoardConfig::DisplayController::LgfxEpd:
+      return "Lgfx EPD";
+    case BoardConfig::DisplayController::IT8951:
+      return "IT8951";
+  }
+  return "unknown";
+}
 
 int16_t wrappedTextHeight(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content, const char* text,
                           const freeink::ui::TextStyle& style) {
@@ -73,6 +95,12 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   auto tx = beginRender(mode);
   target.setFont(kStatsFontSlot, freeink::ui::kNotoSansSmallFont);
   const PowerStatsSnapshot power = copyPowerStats();
+  BatteryMonitor battery;
+  const BatteryMonitor::Status batteryStatus = battery.readStatus();
+  uint16_t checkedSoc = 0;
+  const bool checkedSocKnown = battery.readPercentageChecked(checkedSoc);
+  const uint16_t directMillivolts = battery.readMillivolts();
+  const auto& gauge = BoardConfig::ACTIVE.batteryGauge;
   const std::string totalLine = formatPowerStatsTotalLine(power);
   const std::string deltaLine = formatPowerStatsDeltaLine(power);
   const std::string accountingLine = formatPowerStatsAccountingLine(power);
@@ -106,6 +134,18 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   snprintf(pmLine, sizeof(pmLine), "PM:%s Auto sleep:%s Profile:%s",
            !power.pmEnabledBySettings ? "off" : (power.pmConfigured ? "on" : esp_err_to_name(power.pmConfigResult)),
            power.autoLightSleep ? "on" : "off", power.pmProfilingAvailable ? "on" : "off");
+  char displayDriverLine[64];
+  snprintf(displayDriverLine, sizeof(displayDriverLine), "Display driver: %s", displayDriverName());
+  char batteryBusLine[112];
+  snprintf(batteryBusLine, sizeof(batteryBusLine), "Battery I2C: 0x%02X Wire%u SDA%d SCL%d", gauge.gaugeAddr,
+           static_cast<unsigned>(gauge.i2cBus), gauge.i2cSda, gauge.i2cScl);
+  char batteryStatusLine[128];
+  snprintf(batteryStatusLine, sizeof(batteryStatusLine), "Battery status: supported:%u soc:%u/%u mv:%u/%u",
+           batteryStatus.supported, batteryStatus.percentage, batteryStatus.percentageKnown,
+           batteryStatus.millivolts, batteryStatus.millivoltsKnown);
+  char batteryDirectLine[112];
+  snprintf(batteryDirectLine, sizeof(batteryDirectLine), "Battery direct: checked SoC:%u/%u read mV:%u",
+           checkedSoc, checkedSocKnown, directMillivolts);
   char rangeLine[96];
   snprintf(rangeLine, sizeof(rangeLine), "DFS range: %d -> %d MHz", power.maxFreqMhz, power.minFreqMhz);
   char maxDuration[32];
@@ -131,6 +171,10 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
     if (rowCount < 32) rows[rowCount++] = row;
   };
   addRow(pmLine);
+  addRow(displayDriverLine);
+  addRow(batteryBusLine);
+  addRow(batteryStatusLine);
+  addRow(batteryDirectLine);
   addRow(rangeLine);
   addRow(totalLine.c_str());
   addRow(deltaLine.c_str());

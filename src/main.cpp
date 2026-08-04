@@ -83,6 +83,7 @@ void setup() {
   BoardConfig::holdPowerRails();
 
   const bool detectedX3 = freeink::selectXteinkDevice();
+  freeink::applyXteinkDisplayController();
   BoardConfig::releaseSdRail();
 
   if (!beginAppState()) {
@@ -164,7 +165,11 @@ void loop() {
     return;
   }
 
-  const PageButtonResult result = handlePageButton(press.kind);
+  const PageButtonResult result = press.kind == ButtonPressKind::Touch
+                                      ? handlePageTouch(press.touchX, press.touchY)
+                                      : handlePageButton(press.kind == ButtonPressKind::Directory
+                                                             ? ButtonPressKind::Back
+                                                             : press.kind);
   logPrintf("Selected page: %s\n", pageName(result.page));
 
   if (!result.renderRequired) {

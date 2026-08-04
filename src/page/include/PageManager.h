@@ -21,6 +21,7 @@ PageId showPage(PageId page);
 PageId showNextPage();
 PageId showPreviousPage();
 PageButtonResult handlePageButton(ButtonPressKind kind);
+PageButtonResult handlePageTouch(float panelX, float panelY);
 const char* pageName(PageId page);
 void renderActivePage(EInkDisplay::RefreshMode mode);
 void renderDirectoryOverlay(EInkDisplay::RefreshMode mode);

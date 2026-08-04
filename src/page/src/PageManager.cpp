@@ -75,6 +75,9 @@ bool batteryKnown = false;
 uint16_t batteryPercent = 0;
 unsigned long batteryReadAtMs = 0;
 constexpr unsigned long kBatteryRefreshMs = 5UL * 60UL * 1000UL;
+// The CW2017 can briefly return 0% while its profile settles after boot. Don't
+// pin that provisional value in the page chrome's five-minute cache.
+constexpr unsigned long kBatteryRetryMs = 2UL * 1000UL;
 
 constexpr size_t pageCount() {
   return sizeof(pages) / sizeof(pages[0]);
@@ -115,7 +118,8 @@ bool isCompanionRoute(PageId page) {
 
 void refreshBatteryForRender() {
   const unsigned long now = millis();
-  if (batteryCached && now - batteryReadAtMs < kBatteryRefreshMs) return;
+  const unsigned long refreshInterval = (batteryKnown && batteryPercent > 0) ? kBatteryRefreshMs : kBatteryRetryMs;
+  if (batteryCached && now - batteryReadAtMs < refreshInterval) return;
 
   BatteryMonitor battery;
   const BatteryMonitor::Status status = battery.readStatus();
@@ -404,7 +408,7 @@ void drawDirectoryOverlay(freeink::ui::DisplayTarget& target) {
                         freeink::ui::Rect{static_cast<int16_t>(popup.x + 16),
                                           static_cast<int16_t>(popup.bottom() - 32),
                                           static_cast<int16_t>(popup.width - 32), 24},
-                        "Left/Right browse   Confirm select   Directory close", footer);
+                        "Tap a route to open it. Home closes.", footer);
 }
 
 }  // namespace
@@ -505,10 +509,20 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
         return PageButtonResult{setCurrentPage(selected), true, false};
       }
       case ButtonPressKind::Up:
+        xSemaphoreTake(pageMutex, portMAX_DELAY);
+        moveDirectorySelection(-1);
+        xSemaphoreGive(pageMutex);
+        return PageButtonResult{activePage(), true, true};
       case ButtonPressKind::Down:
+        xSemaphoreTake(pageMutex, portMAX_DELAY);
+        moveDirectorySelection(1);
+        xSemaphoreGive(pageMutex);
+        return PageButtonResult{activePage(), true, true};
       case ButtonPressKind::Gpio1:
       case ButtonPressKind::Gpio2:
       case ButtonPressKind::Power:
+      case ButtonPressKind::Touch:
+      case ButtonPressKind::Directory:
         return PageButtonResult{activePage(), false, false};
     }
   }
@@ -522,6 +536,11 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
       return PageButtonResult{page, true, true};
     case ButtonPressKind::Up:
     case ButtonPressKind::Down:
+      if (pageFor(page).handleButton(kind)) {
+        return PageButtonResult{activePage(), true, false};
+      }
+      return PageButtonResult{
+          kind == ButtonPressKind::Up ? showPreviousPage() : showNextPage(), true, false};
     case ButtonPressKind::Left:
     case ButtonPressKind::Right:
     case ButtonPressKind::Confirm:
@@ -529,9 +548,45 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
     case ButtonPressKind::Gpio1:
     case ButtonPressKind::Gpio2:
     case ButtonPressKind::Power:
+    case ButtonPressKind::Touch:
+    case ButtonPressKind::Directory:
       return PageButtonResult{activePage(), false, false};
   }
   return PageButtonResult{activePage(), false, false};
+}
+
+PageButtonResult handlePageTouch(float panelX, float panelY) {
+  if (pageTarget == nullptr) return PageButtonResult{activePage(), false, false};
+
+  // InputManager normalizes GT911 contacts in the panel's native 800x480 frame.
+  // PageTarget renders portrait, so invert its 90-degree clockwise transform.
+  const int16_t x = static_cast<int16_t>((1.0f - panelY) * pageTarget->logicalWidth());
+  const int16_t y = static_cast<int16_t>(panelX * pageTarget->logicalHeight());
+
+  xSemaphoreTake(pageMutex, portMAX_DELAY);
+  const bool overlayOpen = directoryOpen;
+  if (overlayOpen) {
+    for (uint8_t i = 0; i < routeCount(); ++i) {
+      if (directoryRowRect(*pageTarget, i).contains(x, y)) {
+        const PageId selected = routes[i].id;
+        directoryOpen = false;
+        xSemaphoreGive(pageMutex);
+        return PageButtonResult{setCurrentPage(selected), true, false};
+      }
+    }
+    directoryOpen = false;
+    xSemaphoreGive(pageMutex);
+    return PageButtonResult{activePage(), true, false};
+  }
+  xSemaphoreGive(pageMutex);
+
+  // Three semantic touch bands replace the old footer buttons without reserving
+  // a bottom strip. They map to each page's existing left/confirm/right actions.
+  const int16_t width = pageTarget->logicalWidth();
+  const ButtonPressKind action = x < width / 3 ? ButtonPressKind::Left
+                                      : x < (width * 2) / 3 ? ButtonPressKind::Confirm
+                                                              : ButtonPressKind::Right;
+  return handlePageButton(action);
 }
 
 const char* pageName(PageId page) {
@@ -574,32 +629,6 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
   freeink::ui::batteryIndicator(frame, freeink::ui::Rect{static_cast<int16_t>(width - 122), 3, 112, 30},
                                 batteryProps);
 
-  const freeink::ui::Rect footer{0, static_cast<int16_t>(height - 34), width, 34};
-  target.fill(footer, freeink::ui::Paint::solid(freeink::ui::Color::White));
-  target.line(freeink::ui::Point{0, footer.y}, freeink::ui::Point{width, footer.y}, 1,
-              freeink::ui::Paint::solid(freeink::ui::Color::Black));
-  constexpr const char* defaultLabels[] = {"Directory", "Confirm", "Left", "Right"};
-  const char* labels[] = {"Directory", "Camera", "Mute", "Hand"};
-  if (currentPage == PageId::Companion) {
-    const CompanionBleService::HostStatus host = CompanionBleService::getInstance().getHostStatus();
-    if (host.cameraLocked) {
-      labels[1] = "";
-    }
-    if (host.handLocked) {
-      labels[3] = "";
-    }
-  }
-  const char* const* activeLabels = currentPage == PageId::Companion ? labels : defaultLabels;
-  const int16_t buttonW = static_cast<int16_t>(width / 4);
-  freeink::ui::TextStyle buttonText;
-  buttonText.align = freeink::ui::TextAlign::Center;
-  buttonText.maxLines = 1;
-  for (uint8_t i = 0; i < 4; ++i) {
-    freeink::ui::drawText(target,
-                          freeink::ui::Rect{static_cast<int16_t>(i * buttonW), static_cast<int16_t>(footer.y + 1),
-                                            buttonW, 24},
-                          activeLabels[i], buttonText);
-  }
 }
 
 void renderActivePage(EInkDisplay::RefreshMode mode) {

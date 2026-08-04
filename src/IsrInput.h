@@ -13,10 +13,14 @@ enum class ButtonPressKind : uint8_t {
   Right,
   Up,
   Down,
+  Touch,
+  Directory,
 };
 
 struct ButtonPress {
   ButtonPressKind kind = ButtonPressKind::Gpio1;
+  float touchX = 0.0f;
+  float touchY = 0.0f;
 };
 
 bool beginInput();
