@@ -103,7 +103,9 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   const std::string powerTotal = formatPowerStatsTotalLine(power);
   const std::string powerDelta = formatPowerStatsDeltaLine(power);
   const std::string powerAccounting = formatPowerStatsAccountingLine(power);
-  const std::string powerWake = formatPowerStatsWakeLine(power);
+  std::string powerWakeLines[POWER_STATS_WAKE_CAUSE_COUNT];
+  const uint8_t powerWakeLineCount =
+      formatPowerStatsWakeDeltaLines(power, powerWakeLines, POWER_STATS_WAKE_CAUSE_COUNT);
   const std::string timerLine = formatEspTimerActivity();
   const std::string alarmLine = formatEspTimerAlarmLine();
   const std::string btLockLine = formatBtLockTraceDiagnostics();
@@ -168,10 +170,14 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   const size_t timingBreak = timing.find('\n');
   const std::string timingA = timingBreak == std::string::npos ? timing : timing.substr(0, timingBreak);
   const std::string timingB = timingBreak == std::string::npos ? "" : timing.substr(timingBreak + 1);
-  const char* rows[40] = {};
+  char wakeBitsLine[96];
+  snprintf(wakeBitsLine, sizeof(wakeBitsLine), "Last wake mask: 0x%08lX; unmapped: 0x%08lX",
+           static_cast<unsigned long>(power.lastWakeCauseBits),
+           static_cast<unsigned long>(power.unmappedWakeCauseBits));
+  const char* rows[64] = {};
   uint8_t rowCount = 0;
   auto addRow = [&rows, &rowCount](const char* row) {
-    if (rowCount < 40) rows[rowCount++] = row;
+    if (rowCount < 64) rows[rowCount++] = row;
   };
   addRow(statusLine);
   addRow(linkLine);
@@ -188,7 +194,10 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   addRow(powerTotal.c_str());
   addRow(powerDelta.c_str());
   addRow(powerAccounting.c_str());
-  addRow(powerWake.c_str());
+  // Keep collecting wake-source diagnostics, but do not show them while the
+  // source attribution is still being investigated.
+  // for (uint8_t i = 0; i < powerWakeLineCount; ++i) addRow(powerWakeLines[i].c_str());
+  // addRow(wakeBitsLine);
   addRow(timerLine.c_str());
   addRow(alarmLine.c_str());
   addRow(btLockLine.c_str());

@@ -298,7 +298,7 @@ void drawDirectoryRow(freeink::ui::DisplayTarget& target, const freeink::ui::Rec
   style.maxLines = 1;
   style.color = selected ? freeink::ui::Color::White : freeink::ui::Color::Black;
 
-  freeink::ui::drawText(target, row.inset(freeink::ui::Insets{8, 3, 8, 0}), path, style);
+  freeink::ui::drawText(target, row.inset(freeink::ui::Insets{12, 8, 12, 0}), path, style);
 }
 
 freeink::ui::Rect directoryPopupRect(freeink::ui::DisplayTarget& target) {
@@ -308,12 +308,37 @@ freeink::ui::Rect directoryPopupRect(freeink::ui::DisplayTarget& target) {
 }
 
 freeink::ui::Rect directoryRowRect(freeink::ui::DisplayTarget& target, uint8_t index) {
-  constexpr int16_t rowH = 34;
+  constexpr int16_t rowH = 42;
   constexpr int16_t rowGap = 4;
   const freeink::ui::Rect popup = directoryPopupRect(target);
   return freeink::ui::Rect{static_cast<int16_t>(popup.x + 16),
                            static_cast<int16_t>(popup.y + 78 + index * (rowH + rowGap)),
                            static_cast<int16_t>(popup.width - 32), rowH};
+}
+
+int directoryHitIndex(freeink::ui::DisplayTarget& target, int16_t x, int16_t y) {
+  const freeink::ui::Rect first = directoryRowRect(target, 0);
+  const freeink::ui::Rect last = directoryRowRect(target, static_cast<uint8_t>(routeCount() - 1));
+  if (x < first.x || x >= first.right()) return -1;
+
+  // The visible gutters remain, but they are not dead touch zones.  Between
+  // rows, choose the nearest target; the outer boundary stays inside the list.
+  const int16_t top = static_cast<int16_t>(first.y - 2);
+  const int16_t bottom = static_cast<int16_t>(last.bottom() + 2);
+  if (y < top || y >= bottom) return -1;
+
+  uint8_t closest = 0;
+  int closestDistance = 0x7FFF;
+  for (uint8_t i = 0; i < routeCount(); ++i) {
+    const freeink::ui::Rect row = directoryRowRect(target, i);
+    const int distance = y > row.y + row.height / 2 ? y - (row.y + row.height / 2)
+                                                      : (row.y + row.height / 2) - y;
+    if (distance < closestDistance) {
+      closestDistance = distance;
+      closest = i;
+    }
+  }
+  return closest;
 }
 
 bool panelWindowForLogicalRect(const freeink::ui::DisplayTarget& target, freeink::ui::Rect logical, uint16_t& x,
@@ -566,13 +591,12 @@ PageButtonResult handlePageTouch(float panelX, float panelY) {
   xSemaphoreTake(pageMutex, portMAX_DELAY);
   const bool overlayOpen = directoryOpen;
   if (overlayOpen) {
-    for (uint8_t i = 0; i < routeCount(); ++i) {
-      if (directoryRowRect(*pageTarget, i).contains(x, y)) {
-        const PageId selected = routes[i].id;
-        directoryOpen = false;
-        xSemaphoreGive(pageMutex);
-        return PageButtonResult{setCurrentPage(selected), true, false};
-      }
+    const int hit = directoryHitIndex(*pageTarget, x, y);
+    if (hit >= 0) {
+      const PageId selected = routes[hit].id;
+      directoryOpen = false;
+      xSemaphoreGive(pageMutex);
+      return PageButtonResult{setCurrentPage(selected), true, false};
     }
     directoryOpen = false;
     xSemaphoreGive(pageMutex);

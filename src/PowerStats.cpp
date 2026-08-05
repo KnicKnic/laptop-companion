@@ -114,13 +114,18 @@ PowerStatsSnapshot previousPowerStats;
 bool hasPreviousPowerStats = false;
 
 portMUX_TYPE lightSleepStatsMux = portMUX_INITIALIZER_UNLOCKED;
-uint64_t lightSleepEnterCount = 0;
+uint64_t lightSleepAttemptCount = 0;
 uint64_t lightSleepTotalUs = 0;
 uint64_t lightSleepRequestedTotalUs = 0;
 uint64_t lightSleepEarlyWakeCount = 0;
 int64_t lightSleepEnteredAtUs = 0;
 uint64_t lightSleepRequestedUs = 0;
 uint64_t lightSleepWakeCauseCounts[POWER_STATS_WAKE_CAUSE_COUNT] = {};
+uint64_t lightSleepWakeCauseUs[POWER_STATS_WAKE_CAUSE_COUNT] = {};
+uint64_t lightSleepWakeCauseSampleCount = 0;
+uint32_t observedLightSleepWakeCauseBits = 0;
+uint32_t lastLightSleepWakeCauseBits = 0;
+uint32_t unmappedLightSleepWakeCauseBits = 0;
 uint64_t lightSleepRequestBucketCounts[POWER_STATS_REQUEST_BUCKET_COUNT] = {};
 bool lightSleepCallbacksRegistered = false;
 
@@ -182,14 +187,6 @@ uint64_t counterDelta(uint64_t current, uint64_t previous) {
   return current >= previous ? current - previous : 0;
 }
 
-uint8_t lightSleepWakeCauseIndex(esp_sleep_wakeup_cause_t cause) {
-  const auto index = static_cast<uint32_t>(cause);
-  if (index < POWER_STATS_WAKE_CAUSE_UNKNOWN_INDEX) {
-    return static_cast<uint8_t>(index);
-  }
-  return POWER_STATS_WAKE_CAUSE_UNKNOWN_INDEX;
-}
-
 uint8_t lightSleepRequestBucketIndex(uint64_t requestedUs) {
   if (requestedUs < 1000ULL) return 0;
   if (requestedUs < 5000ULL) return 1;
@@ -207,6 +204,12 @@ bool isEarlyLightSleepWake(uint64_t requestedUs, uint64_t sleptUs) {
   return sleptUs + measurementSlackUs < expectedUs;
 }
 
+void recordLightSleepWakeCause(uint8_t cause, uint64_t sleptUs) {
+  if (cause >= POWER_STATS_WAKE_CAUSE_COUNT) cause = POWER_STATS_WAKE_CAUSE_UNKNOWN_INDEX;
+  lightSleepWakeCauseCounts[cause]++;
+  lightSleepWakeCauseUs[cause] += sleptUs;
+}
+
 #if CONFIG_PM_LIGHT_SLEEP_CALLBACKS
 esp_err_t onLightSleepEnter(int64_t sleepTimeUs, void*) {
   const int64_t nowUs = esp_timer_get_time();
@@ -214,22 +217,50 @@ esp_err_t onLightSleepEnter(int64_t sleepTimeUs, void*) {
   portENTER_CRITICAL(&lightSleepStatsMux);
   lightSleepEnteredAtUs = nowUs;
   lightSleepRequestedUs = requestedUs;
-  lightSleepEnterCount++;
+  lightSleepAttemptCount++;
   portEXIT_CRITICAL(&lightSleepStatsMux);
   return ESP_OK;
 }
 
-esp_err_t onLightSleepExit(int64_t, void*) {
-  const int64_t nowUs = esp_timer_get_time();
+esp_err_t onLightSleepExit(int64_t sleptUsFromPm, void*) {
   portENTER_CRITICAL(&lightSleepStatsMux);
-  if (lightSleepEnteredAtUs > 0 && nowUs >= lightSleepEnteredAtUs) {
-    const uint64_t sleptUs = static_cast<uint64_t>(nowUs - lightSleepEnteredAtUs);
-    lightSleepTotalUs += sleptUs;
-    lightSleepRequestedTotalUs += lightSleepRequestedUs;
-    if (isEarlyLightSleepWake(lightSleepRequestedUs, sleptUs)) {
+  if (lightSleepEnteredAtUs > 0) {
+    const uint64_t sleptUs = sleptUsFromPm > 0 ? static_cast<uint64_t>(sleptUsFromPm) : 0;
+    if (sleptUs == 0) {
       lightSleepEarlyWakeCount++;
+    } else {
+      lightSleepTotalUs += sleptUs;
+      lightSleepRequestedTotalUs += lightSleepRequestedUs;
+      if (isEarlyLightSleepWake(lightSleepRequestedUs, sleptUs)) {
+        lightSleepEarlyWakeCount++;
+      }
+      const uint32_t causes = esp_sleep_get_wakeup_causes();
+      lastLightSleepWakeCauseBits = causes;
+      lightSleepWakeCauseSampleCount++;
+      observedLightSleepWakeCauseBits |= causes;
+      // esp_sleep_get_wakeup_causes() returns a bitmap.  In particular,
+      // UNDEFINED is BIT(ESP_SLEEP_WAKEUP_UNDEFINED) == 0x00000001, not 0.
+      // A numeric zero is defensive only; current ESP-IDF returns that same
+      // UNDEFINED bit when no hardware wake source is available.
+      if (causes == 0) {
+        recordLightSleepWakeCause(ESP_SLEEP_WAKEUP_UNDEFINED, sleptUs);
+      } else {
+        uint32_t knownBits = 0;
+        for (uint8_t cause = ESP_SLEEP_WAKEUP_UNDEFINED; cause < POWER_STATS_WAKE_CAUSE_UNKNOWN_INDEX; cause++) {
+          // ALL is a control value for disabling sources, never a wake cause.
+          if (cause == ESP_SLEEP_WAKEUP_ALL) continue;
+          const uint32_t bit = 1UL << cause;
+          if ((causes & bit) == 0) continue;
+          knownBits |= bit;
+          recordLightSleepWakeCause(cause, sleptUs);
+        }
+        const uint32_t unmappedBits = causes & ~knownBits;
+        if (unmappedBits != 0) {
+          unmappedLightSleepWakeCauseBits |= unmappedBits;
+          recordLightSleepWakeCause(POWER_STATS_WAKE_CAUSE_UNKNOWN_INDEX, sleptUs);
+        }
+      }
     }
-    lightSleepWakeCauseCounts[lightSleepWakeCauseIndex(esp_sleep_get_wakeup_cause())]++;
     lightSleepRequestBucketCounts[lightSleepRequestBucketIndex(lightSleepRequestedUs)]++;
   }
   lightSleepEnteredAtUs = 0;
@@ -258,35 +289,30 @@ void registerLightSleepCallbacks() {
 void copyLightSleepStats(PowerStatsSnapshot& snapshot) {
   const int64_t nowUs = esp_timer_get_time();
   portENTER_CRITICAL(&lightSleepStatsMux);
-  snapshot.lightSleepEntries = lightSleepEnterCount;
+  // Keep the callback count as a fallback for builds without PM profiling.
+  // loadPmProfilingStats replaces lightSleepEntries with the authoritative
+  // successful esp_light_sleep_start() count on this X4 Pro build.
+  snapshot.lightSleepAttempts = lightSleepAttemptCount;
+  snapshot.lightSleepEntries = lightSleepAttemptCount;
   snapshot.lightSleepUs = lightSleepTotalUs;
   snapshot.lightSleepRequestedUs = lightSleepRequestedTotalUs;
   snapshot.lightSleepEarlyWakeCount = lightSleepEarlyWakeCount;
+  snapshot.wakeCauseSampleCount = lightSleepWakeCauseSampleCount;
+  snapshot.observedWakeCauseBits = observedLightSleepWakeCauseBits;
+  snapshot.lastWakeCauseBits = lastLightSleepWakeCauseBits;
+  snapshot.unmappedWakeCauseBits = unmappedLightSleepWakeCauseBits;
   if (lightSleepEnteredAtUs > 0 && nowUs >= lightSleepEnteredAtUs) {
     snapshot.lightSleepUs += static_cast<uint64_t>(nowUs - lightSleepEnteredAtUs);
     snapshot.lightSleepRequestedUs += lightSleepRequestedUs;
   }
   for (uint8_t i = 0; i < POWER_STATS_WAKE_CAUSE_COUNT; i++) {
     snapshot.wakeCauseCounts[i] = lightSleepWakeCauseCounts[i];
+    snapshot.wakeCauseSleepUs[i] = lightSleepWakeCauseUs[i];
   }
   for (uint8_t i = 0; i < POWER_STATS_REQUEST_BUCKET_COUNT; i++) {
     snapshot.requestBucketCounts[i] = lightSleepRequestBucketCounts[i];
   }
   portEXIT_CRITICAL(&lightSleepStatsMux);
-}
-
-void addFreqResidency(PowerStatsSnapshot& snapshot, uint32_t freqMhz, uint64_t elapsedUs) {
-  if (freqMhz == 10) {
-    snapshot.freq10MhzUs += elapsedUs;
-  } else if (freqMhz == 40) {
-    snapshot.freq40MhzUs += elapsedUs;
-  } else if (freqMhz == 80) {
-    snapshot.freq80MhzUs += elapsedUs;
-  } else if (freqMhz == 160) {
-    snapshot.freq160MhzUs += elapsedUs;
-  } else {
-    snapshot.freqOtherUs += elapsedUs;
-  }
 }
 
 void parseModeStatsLine(PowerStatsSnapshot& snapshot, const char* line) {
@@ -295,12 +321,14 @@ void parseModeStatsLine(PowerStatsSnapshot& snapshot, const char* line) {
   unsigned long long timeUs = 0;
   if (std::sscanf(line, " %15s %luM %llu", mode, &freqMhz, &timeUs) != 3) return;
   if (std::strcmp(mode, "SLEEP") == 0) {
-    if (snapshot.lightSleepUs == 0) {
-      snapshot.lightSleepUs += timeUs;
-    }
-  } else if (std::strcmp(mode, "APB_MIN") == 0 || std::strcmp(mode, "APB_MAX") == 0 ||
-             std::strcmp(mode, "CPU_MAX") == 0) {
-    addFreqResidency(snapshot, static_cast<uint32_t>(freqMhz), timeUs);
+    // PM profiling measures only time that ESP-IDF actually spent asleep.
+    snapshot.lightSleepUs = timeUs;
+  } else if (std::strcmp(mode, "CPU_MAX") == 0) {
+    snapshot.cpuMaxUs = timeUs;
+  } else if (std::strcmp(mode, "APB_MAX") == 0) {
+    snapshot.apbMaxUs = timeUs;
+  } else if (std::strcmp(mode, "APB_MIN") == 0) {
+    snapshot.dfsAwakeUs = timeUs;
   }
 }
 
@@ -308,9 +336,9 @@ void parseSleepStatsLine(PowerStatsSnapshot& snapshot, const char* line) {
   unsigned long counts = 0;
   unsigned long rejects = 0;
   if (std::sscanf(line, " light_sleep_counts:%lu light_sleep_reject_counts:%lu", &counts, &rejects) == 2) {
-    if (snapshot.lightSleepEntries == 0) {
-      snapshot.lightSleepEntries = counts;
-    }
+    // Unlike the callback count, this is incremented only after a successful
+    // esp_light_sleep_start().
+    snapshot.lightSleepEntries = counts;
     snapshot.lightSleepRejects = rejects;
   }
 }
@@ -338,8 +366,7 @@ bool loadPmProfilingStats(PowerStatsSnapshot& snapshot) {
   }
 
   std::free(dump);
-  snapshot.uptimeUs = snapshot.lightSleepUs + snapshot.freq10MhzUs + snapshot.freq40MhzUs + snapshot.freq80MhzUs +
-                      snapshot.freq160MhzUs + snapshot.freqOtherUs;
+  snapshot.uptimeUs = snapshot.lightSleepUs + snapshot.cpuMaxUs + snapshot.apbMaxUs + snapshot.dfsAwakeUs;
   snapshot.pmProfilingAvailable = snapshot.uptimeUs > 0;
   return snapshot.pmProfilingAvailable;
 #else
@@ -827,8 +854,9 @@ std::string formatPowerStatsTotalLine(const PowerStatsSnapshot& power) {
   const uint64_t percentTenths = power.uptimeUs > 0 ? (power.lightSleepUs * 1000ULL) / power.uptimeUs : 0;
 
   char line[112];
-  snprintf(line, sizeof(line), "Total: %llu x, sleep %s / %s (%llu.%01llu%%)",
-           static_cast<unsigned long long>(power.lightSleepEntries), slept, uptime,
+  snprintf(line, sizeof(line), "Sleep: %llu ok / %llu candidates, %s / %s (%llu.%01llu%%)",
+           static_cast<unsigned long long>(power.lightSleepEntries),
+           static_cast<unsigned long long>(power.lightSleepAttempts), slept, uptime,
            static_cast<unsigned long long>(percentTenths / 10ULL),
            static_cast<unsigned long long>(percentTenths % 10ULL));
   return line;
@@ -838,6 +866,9 @@ std::string formatPowerStatsDeltaLine(const PowerStatsSnapshot& power) {
   const uint64_t enterDelta = hasPreviousPowerStats ? counterDelta(power.lightSleepEntries,
                                                                    previousPowerStats.lightSleepEntries)
                                                     : 0;
+  const uint64_t attemptDelta = hasPreviousPowerStats ? counterDelta(power.lightSleepAttempts,
+                                                                      previousPowerStats.lightSleepAttempts)
+                                                      : 0;
   const uint64_t sleptDelta = hasPreviousPowerStats ? counterDelta(power.lightSleepUs, previousPowerStats.lightSleepUs)
                                                     : 0;
   const uint64_t elapsedDelta = hasPreviousPowerStats ? counterDelta(power.uptimeUs, previousPowerStats.uptimeUs) : 0;
@@ -849,8 +880,8 @@ std::string formatPowerStatsDeltaLine(const PowerStatsSnapshot& power) {
   formatDurationUsShort(elapsedDelta, elapsed, sizeof(elapsed));
 
   char line[112];
-  snprintf(line, sizeof(line), "Delta: +%llu x, sleep %s / %s (%llu.%01llu%%)",
-           static_cast<unsigned long long>(enterDelta), slept, elapsed,
+  snprintf(line, sizeof(line), "Sleep delta: +%llu ok / +%llu candidates, %s / %s (%llu.%01llu%%)",
+           static_cast<unsigned long long>(enterDelta), static_cast<unsigned long long>(attemptDelta), slept, elapsed,
            static_cast<unsigned long long>(percentTenths / 10ULL),
            static_cast<unsigned long long>(percentTenths % 10ULL));
   return line;
@@ -861,88 +892,43 @@ std::string formatPowerStatsAccountingLine(const PowerStatsSnapshot& power) {
                                                     : 0;
   const uint64_t requestedDelta =
       hasPreviousPowerStats ? counterDelta(power.lightSleepRequestedUs, previousPowerStats.lightSleepRequestedUs) : 0;
-  const uint64_t elapsedDelta = hasPreviousPowerStats ? counterDelta(power.uptimeUs, previousPowerStats.uptimeUs) : 0;
-  const uint64_t awakeDelta = elapsedDelta > sleptDelta ? elapsedDelta - sleptDelta : 0;
   const uint64_t requestedNotSleptDelta = requestedDelta > sleptDelta ? requestedDelta - sleptDelta : 0;
-  const uint64_t awakePercentTenths = elapsedDelta > 0 ? (awakeDelta * 1000ULL) / elapsedDelta : 0;
-  const uint64_t lostPercentTenths = elapsedDelta > 0 ? (requestedNotSleptDelta * 1000ULL) / elapsedDelta : 0;
 
-  char awake[16];
   char requested[16];
+  char actual[16];
   char lost[16];
-  formatDurationUsShort(awakeDelta, awake, sizeof(awake));
   formatDurationUsShort(requestedDelta, requested, sizeof(requested));
+  formatDurationUsShort(sleptDelta, actual, sizeof(actual));
   formatDurationUsShort(requestedNotSleptDelta, lost, sizeof(lost));
 
   char line[128];
-  snprintf(line, sizeof(line), "Acct: awake %s %llu.%llu%% req %s lost %s %llu.%llu%%", awake,
-           static_cast<unsigned long long>(awakePercentTenths / 10ULL),
-           static_cast<unsigned long long>(awakePercentTenths % 10ULL), requested, lost,
-           static_cast<unsigned long long>(lostPercentTenths / 10ULL),
-           static_cast<unsigned long long>(lostPercentTenths % 10ULL));
+  snprintf(line, sizeof(line), "Sleep windows: requested %s actual %s miss %s", requested, actual, lost);
   return line;
 }
 
-std::string formatPowerStatsWakeLine(const PowerStatsSnapshot& power) {
-  NamedDelta top[5] = {};
-  NamedDelta requestTop[3] = {};
-  const uint64_t earlyDelta =
-      hasPreviousPowerStats ? counterDelta(power.lightSleepEarlyWakeCount, previousPowerStats.lightSleepEarlyWakeCount)
-                            : 0;
-  if (hasPreviousPowerStats) {
-    for (uint8_t i = 1; i < POWER_STATS_WAKE_CAUSE_COUNT; i++) {
-      const uint64_t delta = counterDelta(power.wakeCauseCounts[i], previousPowerStats.wakeCauseCounts[i]);
-      if (delta == 0) continue;
-      for (uint8_t slot = 0; slot < 5; slot++) {
-        if (delta <= top[slot].count) continue;
-        for (uint8_t shift = 4; shift > slot; shift--) top[shift] = top[shift - 1];
-        top[slot] = NamedDelta{.name = wakeCauseName(i), .count = delta};
-        break;
-      }
-    }
-
-    for (uint8_t i = 0; i < POWER_STATS_REQUEST_BUCKET_COUNT; i++) {
-      const uint64_t delta = counterDelta(power.requestBucketCounts[i], previousPowerStats.requestBucketCounts[i]);
-      if (delta == 0) continue;
-      for (uint8_t slot = 0; slot < 3; slot++) {
-        if (delta <= requestTop[slot].count) continue;
-        for (uint8_t shift = 2; shift > slot; shift--) requestTop[shift] = requestTop[shift - 1];
-        requestTop[slot] = NamedDelta{.name = requestBucketName(i), .count = delta};
-        break;
-      }
-    }
+uint8_t formatPowerStatsWakeDeltaLines(const PowerStatsSnapshot& power, std::string* lines, uint8_t maxLines) {
+  if (lines == nullptr || maxLines == 0) return 0;
+  const bool baseline = !hasPreviousPowerStats;
+  const uint8_t count = std::min<uint8_t>(POWER_STATS_WAKE_CAUSE_COUNT, maxLines);
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint64_t hits = baseline ? 0 : counterDelta(power.wakeCauseCounts[i], previousPowerStats.wakeCauseCounts[i]);
+    const uint64_t sleptUs = baseline ? 0 : counterDelta(power.wakeCauseSleepUs[i], previousPowerStats.wakeCauseSleepUs[i]);
+    char deltaSlept[16];
+    char totalSlept[16];
+    formatDurationUsShort(sleptUs, deltaSlept, sizeof(deltaSlept));
+    formatDurationUsShort(power.wakeCauseSleepUs[i], totalSlept, sizeof(totalSlept));
+    char line[144];
+    // The display can redraw twice in quick succession, so retain the
+    // lifetime total beside the render-to-render delta.  The latter may be
+    // zero even though the cause accumulator is working normally.
+    snprintf(line, sizeof(line), "Wake %-10s hit +%llu / %llu sleep +%s / %s%s", wakeCauseName(i),
+             static_cast<unsigned long long>(hits), static_cast<unsigned long long>(power.wakeCauseCounts[i]),
+             deltaSlept, totalSlept, baseline ? " (baseline)" : "");
+    lines[i] = line;
   }
-
-  std::string line = top[0].count != 0 ? "Wake:" : "Req:";
-  if (top[0].count != 0) {
-    for (const auto& item : top) {
-      if (item.count == 0) break;
-      char part[32];
-      snprintf(part, sizeof(part), " %s+%llu", item.name, static_cast<unsigned long long>(item.count));
-      line += part;
-    }
-  }
-  if (earlyDelta > 0) {
-    char earlyPart[28];
-    snprintf(earlyPart, sizeof(earlyPart), " early+%llu", static_cast<unsigned long long>(earlyDelta));
-    line += earlyPart;
-  }
-
-  if (top[0].count == 0 && earlyDelta == 0 && requestTop[0].count == 0) {
-    line += hasPreviousPowerStats ? " none" : " baseline";
-  } else {
-    if (top[0].count != 0 && requestTop[0].count != 0) line += " Req:";
-    for (const auto& item : requestTop) {
-      if (item.count == 0) break;
-      char part[32];
-      snprintf(part, sizeof(part), " %s+%llu", item.name, static_cast<unsigned long long>(item.count));
-      line += part;
-    }
-  }
-
   previousPowerStats = power;
   hasPreviousPowerStats = true;
-  return line;
+  return count;
 }
 
 std::string formatEspTimerActivity() {

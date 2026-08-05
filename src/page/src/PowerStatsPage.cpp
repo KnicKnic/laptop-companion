@@ -104,7 +104,8 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   const std::string totalLine = formatPowerStatsTotalLine(power);
   const std::string deltaLine = formatPowerStatsDeltaLine(power);
   const std::string accountingLine = formatPowerStatsAccountingLine(power);
-  const std::string wakeLine = formatPowerStatsWakeLine(power);
+  std::string wakeLines[POWER_STATS_WAKE_CAUSE_COUNT];
+  const uint8_t wakeLineCount = formatPowerStatsWakeDeltaLines(power, wakeLines, POWER_STATS_WAKE_CAUSE_COUNT);
   const std::string timerLine = formatEspTimerActivity();
   const std::string alarmLine = formatEspTimerAlarmLine();
   std::string pmLock1;
@@ -127,9 +128,6 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   body.font = kStatsFontSlot;
   body.maxLines = 2;
 
-  const uint64_t activeUs =
-      power.freq10MhzUs + power.freq40MhzUs + power.freq80MhzUs + power.freq160MhzUs + power.freqOtherUs;
-
   char pmLine[96];
   snprintf(pmLine, sizeof(pmLine), "PM:%s Auto sleep:%s Profile:%s",
            !power.pmEnabledBySettings ? "off" : (power.pmConfigured ? "on" : esp_err_to_name(power.pmConfigResult)),
@@ -148,27 +146,36 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
            checkedSoc, checkedSocKnown, directMillivolts);
   char rangeLine[96];
   snprintf(rangeLine, sizeof(rangeLine), "DFS range: %d -> %d MHz", power.maxFreqMhz, power.minFreqMhz);
-  char maxDuration[32];
-  formatDuration(maxDuration, sizeof(maxDuration), power.freq160MhzUs);
-  char maxLine[96];
-  snprintf(maxLine, sizeof(maxLine), "160 MHz: %s  %lu%%", maxDuration,
-           static_cast<unsigned long>(percentOf(power.freq160MhzUs, activeUs)));
-  char freqLine1[96];
-  snprintf(freqLine1, sizeof(freqLine1), "80 MHz:%lu%%  40 MHz:%lu%%  10 MHz:%lu%%",
-           static_cast<unsigned long>(percentOf(power.freq80MhzUs, activeUs)),
-           static_cast<unsigned long>(percentOf(power.freq40MhzUs, activeUs)),
-           static_cast<unsigned long>(percentOf(power.freq10MhzUs, activeUs)));
-  char freqLine2[96];
-  snprintf(freqLine2, sizeof(freqLine2), "Other active freq:%lu%%  renders:%lu",
-           static_cast<unsigned long>(percentOf(power.freqOtherUs, activeUs)),
-           static_cast<unsigned long>(power.renderRequests));
+  char cpuMaxDuration[32];
+  char apbMaxDuration[32];
+  char dfsDuration[32];
+  formatDuration(cpuMaxDuration, sizeof(cpuMaxDuration), power.cpuMaxUs);
+  formatDuration(apbMaxDuration, sizeof(apbMaxDuration), power.apbMaxUs);
+  formatDuration(dfsDuration, sizeof(dfsDuration), power.dfsAwakeUs);
+  char cpuMaxLine[96];
+  snprintf(cpuMaxLine, sizeof(cpuMaxLine), "CPU max 240 MHz: %s  %lu%%", cpuMaxDuration,
+           static_cast<unsigned long>(percentOf(power.cpuMaxUs, power.uptimeUs)));
+  char apbMaxLine[96];
+  snprintf(apbMaxLine, sizeof(apbMaxLine), "APB max 80 MHz: %s  %lu%%", apbMaxDuration,
+           static_cast<unsigned long>(percentOf(power.apbMaxUs, power.uptimeUs)));
+  char dfsLine[96];
+  snprintf(dfsLine, sizeof(dfsLine), "DFS awake 10 MHz: %s  %lu%%", dfsDuration,
+           static_cast<unsigned long>(percentOf(power.dfsAwakeUs, power.uptimeUs)));
+  char renderLine[96];
+  snprintf(renderLine, sizeof(renderLine), "Render requests:%lu", static_cast<unsigned long>(power.renderRequests));
   char rejectLine[96];
   snprintf(rejectLine, sizeof(rejectLine), "Light sleep rejects:%llu",
            static_cast<unsigned long long>(power.lightSleepRejects));
-  const char* rows[32] = {};
+  char wakeBitsLine[96];
+  snprintf(wakeBitsLine, sizeof(wakeBitsLine), "Last wake mask: 0x%08lX (bit0=undefined)",
+           static_cast<unsigned long>(power.lastWakeCauseBits));
+  char unmappedWakeBitsLine[96];
+  snprintf(unmappedWakeBitsLine, sizeof(unmappedWakeBitsLine), "Unmapped wake-mask bits: 0x%08lX",
+           static_cast<unsigned long>(power.unmappedWakeCauseBits));
+  const char* rows[64] = {};
   uint8_t rowCount = 0;
   auto addRow = [&rows, &rowCount](const char* row) {
-    if (rowCount < 32) rows[rowCount++] = row;
+    if (rowCount < 64) rows[rowCount++] = row;
   };
   addRow(pmLine);
   addRow(displayDriverLine);
@@ -179,11 +186,16 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   addRow(totalLine.c_str());
   addRow(deltaLine.c_str());
   addRow(accountingLine.c_str());
-  addRow(wakeLine.c_str());
+  // Keep collecting wake-source diagnostics, but do not show them while the
+  // source attribution is still being investigated.
+  // for (uint8_t i = 0; i < wakeLineCount; ++i) addRow(wakeLines[i].c_str());
+  // addRow(wakeBitsLine);
+  // addRow(unmappedWakeBitsLine);
   addRow(rejectLine);
-  addRow(maxLine);
-  addRow(freqLine1);
-  addRow(freqLine2);
+  addRow(cpuMaxLine);
+  addRow(apbMaxLine);
+  addRow(dfsLine);
+  addRow(renderLine);
   addRow(timerLine.c_str());
   addRow(alarmLine.c_str());
   addRow(pmLock1.c_str());

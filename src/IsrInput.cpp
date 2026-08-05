@@ -4,23 +4,11 @@
 #include "AppState.h"
 #include "X4ProInputManager.h"
 
-#include <BoardConfig.h>
-#include <driver/gpio.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
 namespace {
 
-using InputManager = X4ProInputManager;
-
-enum class InputWorkflow : uint8_t {
-  AdcButtons,
-  GpioInterrupts,
-};
-
-constexpr InputWorkflow kInputWorkflow = InputWorkflow::AdcButtons;
-constexpr uint32_t kReleaseSettleMs = 5;
-constexpr uint32_t kAdcPollMs = 15;
 constexpr uint8_t kButtonQueueLen = 16;
 
 const char* buttonPressName(ButtonPressKind kind) {
@@ -51,49 +39,49 @@ const char* buttonPressName(ButtonPressKind kind) {
   return "Unknown";
 }
 
-ButtonPressKind buttonKindFromInputManager(uint8_t button) {
+ButtonPressKind buttonKindFromInput(uint8_t button) {
   switch (button) {
-    case InputManager::BTN_BACK:
+    case X4ProInputManager::BTN_BACK:
       return ButtonPressKind::Back;
-    case InputManager::BTN_CONFIRM:
+    case X4ProInputManager::BTN_CONFIRM:
       return ButtonPressKind::Confirm;
-    case InputManager::BTN_LEFT:
+    case X4ProInputManager::BTN_LEFT:
       return ButtonPressKind::Left;
-    case InputManager::BTN_RIGHT:
+    case X4ProInputManager::BTN_RIGHT:
       return ButtonPressKind::Right;
-    case InputManager::BTN_UP:
+    case X4ProInputManager::BTN_UP:
       return ButtonPressKind::Up;
-    case InputManager::BTN_DOWN:
+    case X4ProInputManager::BTN_DOWN:
       return ButtonPressKind::Down;
-    case InputManager::BTN_POWER:
+    case X4ProInputManager::BTN_POWER:
       return ButtonPressKind::Power;
   }
   return ButtonPressKind::Power;
 }
 
-uint8_t inputManagerButtonFromKind(ButtonPressKind kind) {
+uint8_t inputButtonFromKind(ButtonPressKind kind) {
   switch (kind) {
     case ButtonPressKind::Back:
-      return InputManager::BTN_BACK;
+      return X4ProInputManager::BTN_BACK;
     case ButtonPressKind::Confirm:
-      return InputManager::BTN_CONFIRM;
+      return X4ProInputManager::BTN_CONFIRM;
     case ButtonPressKind::Left:
-      return InputManager::BTN_LEFT;
+      return X4ProInputManager::BTN_LEFT;
     case ButtonPressKind::Right:
-      return InputManager::BTN_RIGHT;
+      return X4ProInputManager::BTN_RIGHT;
     case ButtonPressKind::Up:
-      return InputManager::BTN_UP;
+      return X4ProInputManager::BTN_UP;
     case ButtonPressKind::Down:
-      return InputManager::BTN_DOWN;
+      return X4ProInputManager::BTN_DOWN;
     case ButtonPressKind::Power:
-      return InputManager::BTN_POWER;
+      return X4ProInputManager::BTN_POWER;
     case ButtonPressKind::Gpio1:
     case ButtonPressKind::Gpio2:
     case ButtonPressKind::Touch:
     case ButtonPressKind::Directory:
-      return InputManager::BTN_POWER;
+      return X4ProInputManager::BTN_POWER;
   }
-  return InputManager::BTN_POWER;
+  return X4ProInputManager::BTN_POWER;
 }
 
 void recordButtonPress(ButtonPressKind kind) {
@@ -111,11 +99,11 @@ void recordButtonPress(ButtonPressKind kind) {
     case ButtonPressKind::Confirm:
     case ButtonPressKind::Left:
     case ButtonPressKind::Right:
-      recordGpio1ButtonPress(inputManagerButtonFromKind(kind));
+      recordGpio1ButtonPress(inputButtonFromKind(kind));
       break;
     case ButtonPressKind::Up:
     case ButtonPressKind::Down:
-      recordGpio2ButtonPress(inputManagerButtonFromKind(kind));
+      recordGpio2ButtonPress(inputButtonFromKind(kind));
       break;
     case ButtonPressKind::Touch:
     case ButtonPressKind::Directory:
@@ -123,23 +111,37 @@ void recordButtonPress(ButtonPressKind kind) {
   }
 }
 
-class AdcButtonPressSource {
+// X4 Pro has three direct active-low buttons and a GT911 which asserts INT low
+// until its status frame is acknowledged.  The manager configures every one
+// with ONLOW_WE: it is an interrupt source while awake and a GPIO wake source
+// during automatic light sleep.  There is no idle polling task.
+class X4ProInterruptPressSource {
  public:
   bool begin() {
     queue_ = xQueueCreate(kButtonQueueLen, sizeof(ButtonPress));
     if (!queue_) return false;
 
     input_.begin();
-    xTaskCreate(taskTrampoline, "adc_buttons", 4096, this, 2, &task_);
-    if (!task_) return false;
-
-    logPrintf("Input workflow: InputManager polling task (digital buttons, touch, and Home key).\n");
+    logPrintf("Input workflow: X4 Pro GPIO/GT911 interrupts with light-sleep wake.\n");
     return true;
   }
 
   bool getNextButtonPress(ButtonPress& press, TickType_t timeoutTicks) {
     if (!queue_) return false;
-    return xQueueReceive(queue_, &press, timeoutTicks) == pdTRUE;
+    const TickType_t startedAt = xTaskGetTickCount();
+    TickType_t remainingTicks = timeoutTicks;
+
+    for (;;) {
+      input_.update();
+      enqueueInputEvents();
+      if (xQueueReceive(queue_, &press, 0) == pdTRUE) return true;
+
+      // waitForEvent may use a shorter internal timeout to retry a failed
+      // GT911 transaction or to re-arm a released button. Those maintenance
+      // deadlines must not be mistaken for the caller's input deadline.
+      input_.waitForEvent(remainingTicks);
+      if (!updateRemainingTicks(startedAt, timeoutTicks, remainingTicks)) return false;
+    }
   }
 
   bool powerButtonPressed() const {
@@ -147,105 +149,6 @@ class AdcButtonPressSource {
   }
 
  private:
-  static void taskTrampoline(void* self) {
-    static_cast<AdcButtonPressSource*>(self)->pollLoop();
-  }
-
-  void pollLoop() {
-    static const uint8_t buttons[] = {InputManager::BTN_BACK,  InputManager::BTN_CONFIRM, InputManager::BTN_LEFT,
-                                      InputManager::BTN_RIGHT, InputManager::BTN_UP,      InputManager::BTN_DOWN,
-                                      InputManager::BTN_POWER};
-    for (;;) {
-      input_.update();
-      for (const uint8_t button : buttons) {
-        if (input_.wasPressed(button)) {
-          ButtonPress press{buttonKindFromInputManager(button)};
-          xQueueSend(queue_, &press, 0);
-        }
-      }
-      if (input_.wasHomeKeyTapped()) {
-        const ButtonPress press{ButtonPressKind::Directory};
-        xQueueSend(queue_, &press, 0);
-      }
-      float touchX = 0.0f;
-      float touchY = 0.0f;
-      if (input_.wasTouchTap(touchX, touchY)) {
-        const ButtonPress press{ButtonPressKind::Touch, touchX, touchY};
-        xQueueSend(queue_, &press, 0);
-      }
-      float swipeXStart = 0.0f;
-      float swipeYStart = 0.0f;
-      float swipeXEnd = 0.0f;
-      float swipeYEnd = 0.0f;
-      if (input_.wasSwipe(swipeXStart, swipeYStart, swipeXEnd, swipeYEnd)) {
-        const ButtonPressKind kind = swipeXEnd > swipeXStart ? ButtonPressKind::Down : ButtonPressKind::Up;
-        const ButtonPress press{kind};
-        xQueueSend(queue_, &press, 0);
-      }
-      vTaskDelay(pdMS_TO_TICKS(kAdcPollMs));
-    }
-  }
-
-  InputManager input_;
-  QueueHandle_t queue_ = nullptr;
-  TaskHandle_t task_ = nullptr;
-};
-
-class GpioButtonPressSource {
- public:
-  bool begin() {
-    instance_ = this;
-    queue_ = xQueueCreate(kButtonQueueLen, sizeof(ButtonPress));
-    if (!queue_) return false;
-
-    powerInput_.pin = BoardConfig::ACTIVE.input.power;
-    powerInterruptPin_ = powerInput_.pin;
-
-    configureInput(gpio1Input_, onGpio1Low);
-    configureInput(gpio2Input_, onGpio2Low);
-    configureInput(powerInput_, onPowerLow);
-    logPrintf("Input workflow: GPIO ONLOW_WE interrupts; ADC reads disabled.\n");
-    return true;
-  }
-
-  bool getNextButtonPress(ButtonPress& press, TickType_t timeoutTicks) {
-    rearmReleasedInputs();
-
-    const TickType_t startedAt = xTaskGetTickCount();
-    TickType_t remainingTicks = timeoutTicks;
-    for (;;) {
-      ButtonPress signaledPress;
-      if (xQueueReceive(queue_, &signaledPress, remainingTicks) != pdTRUE) {
-        return false;
-      }
-
-      GpioDownInput* input = inputForKind(signaledPress.kind);
-      if (!input) continue;
-
-      if (!digitalInputPressed(*input)) {
-        enableInterruptForPin(input->pin);
-        if (!updateRemainingTicks(startedAt, timeoutTicks, remainingTicks)) return false;
-        continue;
-      }
-
-      input->waitingForRelease = true;
-      press = signaledPress;
-      logPrintf("%s ONLOW_WE ISR confirmed low\n", buttonPressName(press.kind));
-      return true;
-    }
-  }
-
-  bool powerButtonPressed() const {
-    return digitalInputPressed(powerInput_);
-  }
-
- private:
-  struct GpioDownInput {
-    int8_t pin = -1;
-    ButtonPressKind kind = ButtonPressKind::Gpio1;
-    bool waitingForRelease = false;
-  };
-
   static bool updateRemainingTicks(TickType_t startedAt, TickType_t timeoutTicks, TickType_t& remainingTicks) {
     if (timeoutTicks == portMAX_DELAY) {
       remainingTicks = portMAX_DELAY;
@@ -258,132 +161,59 @@ class GpioButtonPressSource {
     return true;
   }
 
-  static void IRAM_ATTR disableInterruptForPin(int8_t pin) {
-    if (pin >= 0) {
-      gpio_intr_disable(static_cast<gpio_num_t>(pin));
-    }
-  }
-
-  static void enableInterruptForPin(int8_t pin) {
-    if (pin >= 0) {
-      gpio_intr_enable(static_cast<gpio_num_t>(pin));
-    }
-  }
-
-  static bool digitalInputPressed(const GpioDownInput& input) {
-    return input.pin >= 0 && digitalRead(input.pin) == LOW;
-  }
-
-  static void configureInput(const GpioDownInput& input, void (*isr)()) {
-    if (input.pin < 0) return;
-
-    pinMode(input.pin, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(input.pin), isr, ONLOW_WE);
-  }
-
-  static void IRAM_ATTR onGpio1Low() {
-    if (instance_) instance_->signalFromIsr(ButtonPressKind::Gpio1, InputManager::BUTTON_ADC_PIN_1);
-  }
-
-  static void IRAM_ATTR onGpio2Low() {
-    if (instance_) instance_->signalFromIsr(ButtonPressKind::Gpio2, InputManager::BUTTON_ADC_PIN_2);
-  }
-
-  static void IRAM_ATTR onPowerLow() {
-    if (instance_) instance_->signalFromIsr(ButtonPressKind::Power, instance_->powerInterruptPin_);
-  }
-
-  void IRAM_ATTR signalFromIsr(ButtonPressKind kind, int8_t pin) {
-    disableInterruptForPin(pin);
-    if (!queue_) return;
-
-    ButtonPress press{kind};
-    BaseType_t higherPriorityTaskWoken = pdFALSE;
-    xQueueSendFromISR(queue_, &press, &higherPriorityTaskWoken);
-    if (higherPriorityTaskWoken == pdTRUE) {
-      portYIELD_FROM_ISR();
-    }
-  }
-
-  GpioDownInput* inputForKind(ButtonPressKind kind) {
-    switch (kind) {
-      case ButtonPressKind::Gpio1:
-        return &gpio1Input_;
-      case ButtonPressKind::Gpio2:
-        return &gpio2Input_;
-      case ButtonPressKind::Power:
-        return &powerInput_;
-      case ButtonPressKind::Back:
-      case ButtonPressKind::Confirm:
-      case ButtonPressKind::Left:
-      case ButtonPressKind::Right:
-      case ButtonPressKind::Up:
-      case ButtonPressKind::Down:
-      case ButtonPressKind::Touch:
-      case ButtonPressKind::Directory:
-        return nullptr;
-    }
-    return nullptr;
-  }
-
-  void rearmReleasedInputs() {
-    rearmReleasedInput(gpio1Input_);
-    rearmReleasedInput(gpio2Input_);
-    rearmReleasedInput(powerInput_);
-  }
-
-  void rearmReleasedInput(GpioDownInput& input) {
-    if (!input.waitingForRelease) return;
-
-    for (;;) {
-      while (digitalInputPressed(input)) {
-        vTaskDelay(pdMS_TO_TICKS(kReleaseSettleMs));
-      }
-
-      vTaskDelay(pdMS_TO_TICKS(kReleaseSettleMs));
-      if (!digitalInputPressed(input)) {
-        input.waitingForRelease = false;
-        enableInterruptForPin(input.pin);
-        return;
+  void enqueueInputEvents() {
+    static const uint8_t buttons[] = {X4ProInputManager::BTN_BACK,  X4ProInputManager::BTN_CONFIRM,
+                                      X4ProInputManager::BTN_LEFT,  X4ProInputManager::BTN_RIGHT,
+                                      X4ProInputManager::BTN_UP,    X4ProInputManager::BTN_DOWN,
+                                      X4ProInputManager::BTN_POWER};
+    for (uint8_t button : buttons) {
+      if (input_.wasPressed(button)) {
+        const ButtonPress event{buttonKindFromInput(button)};
+        xQueueSend(queue_, &event, 0);
       }
     }
+
+    if (input_.wasHomeKeyTapped()) {
+      const ButtonPress event{ButtonPressKind::Directory};
+      xQueueSend(queue_, &event, 0);
+    }
+
+    float touchX = 0.0f;
+    float touchY = 0.0f;
+    if (input_.wasTouchTap(touchX, touchY)) {
+      const ButtonPress event{ButtonPressKind::Touch, touchX, touchY};
+      xQueueSend(queue_, &event, 0);
+    }
+
+    float swipeXStart = 0.0f;
+    float swipeYStart = 0.0f;
+    float swipeXEnd = 0.0f;
+    float swipeYEnd = 0.0f;
+    if (input_.wasSwipe(swipeXStart, swipeYStart, swipeXEnd, swipeYEnd)) {
+      const ButtonPressKind kind = swipeXEnd > swipeXStart ? ButtonPressKind::Down : ButtonPressKind::Up;
+      const ButtonPress event{kind};
+      xQueueSend(queue_, &event, 0);
+    }
   }
 
-  static GpioButtonPressSource* instance_;
-
+  X4ProInputManager input_;
   QueueHandle_t queue_ = nullptr;
-  int8_t powerInterruptPin_ = -1;
-  GpioDownInput gpio1Input_{InputManager::BUTTON_ADC_PIN_1, ButtonPressKind::Gpio1, false};
-  GpioDownInput gpio2Input_{InputManager::BUTTON_ADC_PIN_2, ButtonPressKind::Gpio2, false};
-  GpioDownInput powerInput_{-1, ButtonPressKind::Power, false};
 };
 
-GpioButtonPressSource* GpioButtonPressSource::instance_ = nullptr;
-
-AdcButtonPressSource adcButtons;
-GpioButtonPressSource gpioButtons;
+X4ProInterruptPressSource x4ProInput;
 
 }  // namespace
 
 bool beginInput() {
-  if (kInputWorkflow == InputWorkflow::GpioInterrupts) {
-    return gpioButtons.begin();
-  }
-  return adcButtons.begin();
+  return x4ProInput.begin();
 }
 
 bool powerButtonPressed() {
-  if (kInputWorkflow == InputWorkflow::GpioInterrupts) {
-    return gpioButtons.powerButtonPressed();
-  }
-  return adcButtons.powerButtonPressed();
+  return x4ProInput.powerButtonPressed();
 }
 
 bool getNextButtonPress(ButtonPress& press, TickType_t timeoutTicks) {
-  if (kInputWorkflow == InputWorkflow::GpioInterrupts) {
-    return gpioButtons.getNextButtonPress(press, timeoutTicks);
-  }
-  return adcButtons.getNextButtonPress(press, timeoutTicks);
+  return x4ProInput.getNextButtonPress(press, timeoutTicks);
 }
 
 bool consumeInputEvents(ButtonPress& press, TickType_t timeoutTicks) {

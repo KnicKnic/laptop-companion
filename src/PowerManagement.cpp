@@ -9,7 +9,7 @@
 
 namespace {
 
-constexpr int kMaxCpuMhz = 160;
+constexpr int kMaxCpuMhz = 240;
 constexpr int kMinCpuMhz = 10;
 
 PowerManagementState state;

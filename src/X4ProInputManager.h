@@ -1,10 +1,12 @@
 #pragma once
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
-// X4 Pro-only input backend. It intentionally mirrors the subset of
-// InputManager consumed by IsrInput.cpp while using the GT911's GPIO10 IRQ to
-// avoid continuous I2C polling during idle.
+// X4 Pro-only input backend. GPIO0, GPIO7, GPIO3 and the GT911 INT line are
+// interrupt-driven and wake automatic light sleep; I2C is only touched after
+// the GT911 raises its interrupt.
 class X4ProInputManager {
  public:
   static constexpr uint8_t BTN_BACK = 0;
@@ -14,8 +16,6 @@ class X4ProInputManager {
   static constexpr uint8_t BTN_UP = 4;
   static constexpr uint8_t BTN_DOWN = 5;
   static constexpr uint8_t BTN_POWER = 6;
-  // Compatibility-only: the app's inactive GPIO-interrupt fallback references
-  // these legacy Xteink ADC pins.
   static constexpr int BUTTON_ADC_PIN_1 = 1;
   static constexpr int BUTTON_ADC_PIN_2 = 2;
 
@@ -26,6 +26,9 @@ class X4ProInputManager {
   bool wasHomeKeyTapped() const;
   bool wasTouchTap(float& x, float& y) const;
   bool wasSwipe(float& xStart, float& yStart, float& xEnd, float& yEnd) const;
+  bool waitForEvent(TickType_t timeoutTicks);
+  uint32_t touchIrqCount() const;
+  uint32_t buttonIrqCount() const;
 
  private:
   struct Point {
@@ -33,17 +36,29 @@ class X4ProInputManager {
     uint16_t y = 0;
   };
 
-  static void IRAM_ATTR irqTrampoline(void* self);
-  void IRAM_ATTR signalIrq();
-  bool takeIrq();
+  static void IRAM_ATTR touchIrqTrampoline(void* self);
+  static void IRAM_ATTR buttonIrqTrampoline(void* self);
+  void IRAM_ATTR signalTouchIrq();
+  void IRAM_ATTR signalButtonIrq();
+  bool takeTouchIrq();
+  void rearmReleasedButtonInterrupts();
+  void enableInterruptForPin(int8_t pin) const;
   bool readReg(uint16_t reg, uint8_t* data, uint8_t length);
   void clearStatus();
   void pollTouch(unsigned long now);
   void finishTouch(unsigned long now);
   bool isPressed(uint8_t button) const;
 
-  volatile bool irqPending_ = false;
+  volatile bool touchIrqPending_ = false;
+  volatile bool touchRetryPending_ = false;
+  volatile bool eventPending_ = false;
+  volatile uint32_t touchIrqCount_ = 0;
+  volatile uint32_t buttonIrqCount_ = 0;
   portMUX_TYPE irqMux_ = portMUX_INITIALIZER_UNLOCKED;
+  TaskHandle_t eventTask_ = nullptr;
+  int8_t touchIrqPin_ = -1;
+  int8_t buttonPins_[3] = {-1, -1, -1};
+  bool buttonRearmPending_ = false;
   uint8_t gt911Address_ = 0;
   unsigned long ignorePowerUntil_ = 0;
   uint8_t buttonState_ = 0;
@@ -71,4 +86,6 @@ class X4ProInputManager {
   static constexpr int kSwipeMinPx = 60;
   static constexpr unsigned long kSwipeMaxMs = 700;
   static constexpr unsigned long kIgnoreBootPowerMs = 5000;
+  static constexpr TickType_t kTouchRetryTicks = pdMS_TO_TICKS(15);
+  static constexpr TickType_t kButtonRearmTicks = pdMS_TO_TICKS(5);
 };
