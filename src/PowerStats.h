@@ -18,6 +18,10 @@ struct PowerStatsSnapshot {
   esp_err_t pmConfigResult = ESP_OK;
   int maxFreqMhz = 0;
   int minFreqMhz = 0;
+  // Monotonic elapsed wall time since power statistics started. Unlike the PM
+  // profiling mode totals, this is the ground-truth denominator for interval
+  // percentages and is independent of core count.
+  uint64_t wallUptimeUs = 0;
   uint64_t uptimeUs = 0;
   uint64_t lightSleepUs = 0;
   uint64_t lightSleepRequestedUs = 0;
@@ -55,11 +59,13 @@ PowerStatsSnapshot copyPowerStats();
 std::string formatPowerStatsTotalLine(const PowerStatsSnapshot& power);
 std::string formatPowerStatsDeltaLine(const PowerStatsSnapshot& power);
 std::string formatPowerStatsAccountingLine(const PowerStatsSnapshot& power);
+void formatPowerStatsFrequencyLines(const PowerStatsSnapshot& power, std::string& cpuMaxLine, std::string& apbMaxLine,
+                                    std::string& dfsLine);
 uint8_t formatPowerStatsWakeDeltaLines(const PowerStatsSnapshot& power, std::string* lines, uint8_t maxLines);
 std::string formatEspTimerActivity();
 std::string formatEspTimerAlarmLine();
 uint8_t formatTaskActivity(std::string* lines, uint8_t maxLines);
 void formatPmLockActivity(std::string& line1, std::string& line2, std::string& line3, std::string& line4,
-                          std::string& line5);
+                          std::string& line5, std::string& line6, std::string& line7);
 void setBtLockTraceConnectionParams(uint16_t intervalUnits, uint16_t latency);
 std::string formatBtLockTraceDiagnostics();

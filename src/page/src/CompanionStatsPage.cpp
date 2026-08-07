@@ -103,6 +103,10 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   const std::string powerTotal = formatPowerStatsTotalLine(power);
   const std::string powerDelta = formatPowerStatsDeltaLine(power);
   const std::string powerAccounting = formatPowerStatsAccountingLine(power);
+  std::string cpuMaxLine;
+  std::string apbMaxLine;
+  std::string dfsLine;
+  formatPowerStatsFrequencyLines(power, cpuMaxLine, apbMaxLine, dfsLine);
   std::string powerWakeLines[POWER_STATS_WAKE_CAUSE_COUNT];
   const uint8_t powerWakeLineCount =
       formatPowerStatsWakeDeltaLines(power, powerWakeLines, POWER_STATS_WAKE_CAUSE_COUNT);
@@ -114,7 +118,9 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   std::string pmLock3;
   std::string pmLock4;
   std::string pmLock5;
-  formatPmLockActivity(pmLock1, pmLock2, pmLock3, pmLock4, pmLock5);
+  std::string pmLock6;
+  std::string pmLock7;
+  formatPmLockActivity(pmLock1, pmLock2, pmLock3, pmLock4, pmLock5, pmLock6, pmLock7);
   std::string taskLines[10];
   const uint8_t taskLineCount = formatTaskActivity(taskLines, 10);
 
@@ -194,10 +200,12 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   addRow(powerTotal.c_str());
   addRow(powerDelta.c_str());
   addRow(powerAccounting.c_str());
-  // Keep collecting wake-source diagnostics, but do not show them while the
-  // source attribution is still being investigated.
+  addRow(cpuMaxLine.c_str());
+  addRow(apbMaxLine.c_str());
+  addRow(dfsLine.c_str());
+  // Wake-cause detail is still collected, but hidden from the companion stats page for now.
   // for (uint8_t i = 0; i < powerWakeLineCount; ++i) addRow(powerWakeLines[i].c_str());
-  // addRow(wakeBitsLine);
+  addRow(wakeBitsLine);
   addRow(timerLine.c_str());
   addRow(alarmLine.c_str());
   addRow(btLockLine.c_str());
@@ -206,6 +214,8 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   addRow(pmLock3.c_str());
   addRow(pmLock4.c_str());
   addRow(pmLock5.c_str());
+  addRow(pmLock6.c_str());
+  addRow(pmLock7.c_str());
   for (uint8_t i = 0; i < taskLineCount; i++) addRow(taskLines[i].c_str());
   clampScroll(scrollOffset_, rowCount);
 

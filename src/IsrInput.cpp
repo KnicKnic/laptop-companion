@@ -4,11 +4,18 @@
 #include "AppState.h"
 #include "X4ProInputManager.h"
 
+#ifndef FREEINK_X4PRO_POLLING_INPUT
+#define FREEINK_X4PRO_POLLING_INPUT 0
+#endif
+
+#if FREEINK_X4PRO_POLLING_INPUT
+#include <InputManager.h>
+#endif
+
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
 namespace {
-
 constexpr uint8_t kButtonQueueLen = 16;
 
 const char* buttonPressName(ButtonPressKind kind) {
@@ -200,7 +207,87 @@ class X4ProInterruptPressSource {
   QueueHandle_t queue_ = nullptr;
 };
 
+#if FREEINK_X4PRO_POLLING_INPUT
+class X4ProPollingPressSource {
+ public:
+  bool begin() {
+    input_.begin();
+    queue_ = xQueueCreate(kButtonQueueLen, sizeof(ButtonPress));
+    if (!queue_) return false;
+    logPrintf("Input workflow: X4 Pro polling GPIO/GT911 (20 ms interval); GPIO wake IRQs disabled.\n");
+    return true;
+  }
+
+  bool getNextButtonPress(ButtonPress& press, TickType_t timeoutTicks) {
+    if (!queue_) return false;
+    const TickType_t startedAt = xTaskGetTickCount();
+    for (;;) {
+      input_.update();
+      enqueueInputEvents();
+      if (xQueueReceive(queue_, &press, 0) == pdTRUE) return true;
+
+      if (timeoutTicks != portMAX_DELAY) {
+        const TickType_t elapsed = xTaskGetTickCount() - startedAt;
+        if (elapsed >= timeoutTicks) return false;
+      }
+      TickType_t delayTicks = pdMS_TO_TICKS(20);
+      if (delayTicks == 0) delayTicks = 1;
+      if (timeoutTicks != portMAX_DELAY) {
+        const TickType_t elapsed = xTaskGetTickCount() - startedAt;
+        const TickType_t remaining = timeoutTicks > elapsed ? timeoutTicks - elapsed : 0;
+        if (remaining == 0) return false;
+        if (delayTicks > remaining) delayTicks = remaining;
+      }
+      vTaskDelay(delayTicks);
+    }
+  }
+
+  bool powerButtonPressed() const { return input_.isPowerButtonPressed(); }
+
+ private:
+  void enqueueInputEvents() {
+    static const uint8_t buttons[] = {InputManager::BTN_BACK, InputManager::BTN_CONFIRM,
+                                      InputManager::BTN_LEFT, InputManager::BTN_RIGHT,
+                                      InputManager::BTN_UP, InputManager::BTN_DOWN,
+                                      InputManager::BTN_POWER};
+    for (uint8_t button : buttons) {
+      if (input_.wasPressed(button)) {
+        const ButtonPress event{buttonKindFromInput(button)};
+        xQueueSend(queue_, &event, 0);
+      }
+    }
+
+    if (input_.wasHomeKeyTapped()) {
+      const ButtonPress event{ButtonPressKind::Directory};
+      xQueueSend(queue_, &event, 0);
+    }
+
+    float touchX = 0.0f;
+    float touchY = 0.0f;
+    if (input_.wasTouchTap(touchX, touchY)) {
+      const ButtonPress event{ButtonPressKind::Touch, touchX, touchY};
+      xQueueSend(queue_, &event, 0);
+    }
+
+    float swipeXStart = 0.0f;
+    float swipeYStart = 0.0f;
+    float swipeXEnd = 0.0f;
+    float swipeYEnd = 0.0f;
+    if (input_.wasSwipe(swipeXStart, swipeYStart, swipeXEnd, swipeYEnd)) {
+      const ButtonPressKind kind = swipeXEnd > swipeXStart ? ButtonPressKind::Down : ButtonPressKind::Up;
+      const ButtonPress event{kind};
+      xQueueSend(queue_, &event, 0);
+    }
+  }
+
+  InputManager input_;
+  QueueHandle_t queue_ = nullptr;
+};
+
+X4ProPollingPressSource x4ProInput;
+#else
 X4ProInterruptPressSource x4ProInput;
+#endif
 
 }  // namespace
 
@@ -224,4 +311,28 @@ bool consumeInputEvents(ButtonPress& press, TickType_t timeoutTicks) {
   recordButtonPress(press.kind);
   logPrintf("Button pressed: %s\n", buttonPressName(press.kind));
   return true;
+}
+
+uint32_t inputTouchInterruptCount() {
+#if FREEINK_X4PRO_POLLING_INPUT
+  return 0;
+#else
+  return x4ProInput.touchIrqCount();
+#endif
+}
+
+uint32_t inputButtonInterruptCount() {
+#if FREEINK_X4PRO_POLLING_INPUT
+  return 0;
+#else
+  return x4ProInput.buttonIrqCount();
+#endif
+}
+
+const char* inputBackendName() {
+#if FREEINK_X4PRO_POLLING_INPUT
+  return "polling (no GPIO input IRQs)";
+#else
+  return "interrupt-backed GPIO/GT911";
+#endif
 }

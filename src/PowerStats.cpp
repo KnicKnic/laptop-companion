@@ -33,7 +33,7 @@ constexpr size_t kTimerNameLen = 21;
 constexpr uint8_t kTaskTopCount = 10;
 constexpr uint8_t kTaskMaxRows = 48;
 constexpr size_t kTaskNameLen = 17;
-constexpr uint8_t kPmLockTopCount = 5;
+constexpr uint8_t kPmLockTopCount = 7;
 constexpr uint8_t kPmLockMaxRows = 24;
 constexpr size_t kBtLockMaxRows = 8;
 constexpr uint64_t kBtLockLongHoldUs = 30ULL * 1000ULL;
@@ -318,8 +318,14 @@ void copyLightSleepStats(PowerStatsSnapshot& snapshot) {
 void parseModeStatsLine(PowerStatsSnapshot& snapshot, const char* line) {
   char mode[16] = {};
   unsigned long freqMhz = 0;
+  char frequencyUnit = '\0';
   unsigned long long timeUs = 0;
-  if (std::sscanf(line, " %15s %luM %llu", mode, &freqMhz, &timeUs) != 3) return;
+  // ESP-IDF formats CPU_MAX as "240M" but may format lower modes as
+  // "10 M"/"80 M".  Whitespace before %c accepts both spellings.
+  if (std::sscanf(line, " %15s %lu %c %llu", mode, &freqMhz, &frequencyUnit, &timeUs) != 4 ||
+      frequencyUnit != 'M') {
+    return;
+  }
   if (std::strcmp(mode, "SLEEP") == 0) {
     // PM profiling measures only time that ESP-IDF actually spent asleep.
     snapshot.lightSleepUs = timeUs;
@@ -830,6 +836,8 @@ bool beginPowerStats() {
 
 PowerStatsSnapshot copyPowerStats() {
   PowerStatsSnapshot snapshot = stats;
+  const int64_t nowUs = esp_timer_get_time();
+  snapshot.wallUptimeUs = nowUs > startedAtUs ? static_cast<uint64_t>(nowUs - startedAtUs) : 0;
   const PowerManagementState pm = copyPowerManagementState();
   snapshot.pmEnabledBySettings = pm.enabledBySettings;
   snapshot.pmConfigured = pm.configured;
@@ -840,8 +848,7 @@ PowerStatsSnapshot copyPowerStats() {
   snapshot.renderRequests = renderRequestCount();
   copyLightSleepStats(snapshot);
   if (!loadPmProfilingStats(snapshot)) {
-    const int64_t nowUs = esp_timer_get_time();
-    snapshot.uptimeUs = nowUs > startedAtUs ? static_cast<uint64_t>(nowUs - startedAtUs) : 0;
+    snapshot.uptimeUs = snapshot.wallUptimeUs;
   }
   return snapshot;
 }
@@ -850,11 +857,11 @@ std::string formatPowerStatsTotalLine(const PowerStatsSnapshot& power) {
   char slept[16];
   char uptime[16];
   formatDurationUsShort(power.lightSleepUs, slept, sizeof(slept));
-  formatDurationUsShort(power.uptimeUs, uptime, sizeof(uptime));
-  const uint64_t percentTenths = power.uptimeUs > 0 ? (power.lightSleepUs * 1000ULL) / power.uptimeUs : 0;
+  formatDurationUsShort(power.wallUptimeUs, uptime, sizeof(uptime));
+  const uint64_t percentTenths = power.wallUptimeUs > 0 ? (power.lightSleepUs * 1000ULL) / power.wallUptimeUs : 0;
 
   char line[112];
-  snprintf(line, sizeof(line), "Sleep: %llu ok / %llu candidates, %s / %s (%llu.%01llu%%)",
+  snprintf(line, sizeof(line), "Sleep: %llu ok / %llu candidates, %s / %s wall (%llu.%01llu%%)",
            static_cast<unsigned long long>(power.lightSleepEntries),
            static_cast<unsigned long long>(power.lightSleepAttempts), slept, uptime,
            static_cast<unsigned long long>(percentTenths / 10ULL),
@@ -871,7 +878,8 @@ std::string formatPowerStatsDeltaLine(const PowerStatsSnapshot& power) {
                                                       : 0;
   const uint64_t sleptDelta = hasPreviousPowerStats ? counterDelta(power.lightSleepUs, previousPowerStats.lightSleepUs)
                                                     : 0;
-  const uint64_t elapsedDelta = hasPreviousPowerStats ? counterDelta(power.uptimeUs, previousPowerStats.uptimeUs) : 0;
+  const uint64_t elapsedDelta =
+      hasPreviousPowerStats ? counterDelta(power.wallUptimeUs, previousPowerStats.wallUptimeUs) : 0;
   const uint64_t percentTenths = elapsedDelta > 0 ? (sleptDelta * 1000ULL) / elapsedDelta : 0;
 
   char slept[16];
@@ -880,11 +888,46 @@ std::string formatPowerStatsDeltaLine(const PowerStatsSnapshot& power) {
   formatDurationUsShort(elapsedDelta, elapsed, sizeof(elapsed));
 
   char line[112];
-  snprintf(line, sizeof(line), "Sleep delta: +%llu ok / +%llu candidates, %s / %s (%llu.%01llu%%)",
+  snprintf(line, sizeof(line), "Sleep delta: +%llu ok / +%llu candidates, %s / %s wall (%llu.%01llu%%)",
            static_cast<unsigned long long>(enterDelta), static_cast<unsigned long long>(attemptDelta), slept, elapsed,
            static_cast<unsigned long long>(percentTenths / 10ULL),
            static_cast<unsigned long long>(percentTenths % 10ULL));
   return line;
+}
+
+void formatPowerStatsFrequencyLines(const PowerStatsSnapshot& power, std::string& cpuMaxLine,
+                                    std::string& apbMaxLine, std::string& dfsLine) {
+  const uint64_t cpuDeltaUs = hasPreviousPowerStats ? counterDelta(power.cpuMaxUs, previousPowerStats.cpuMaxUs) : 0;
+  const uint64_t apbDeltaUs = hasPreviousPowerStats ? counterDelta(power.apbMaxUs, previousPowerStats.apbMaxUs) : 0;
+  const uint64_t dfsDeltaUs = hasPreviousPowerStats ? counterDelta(power.dfsAwakeUs, previousPowerStats.dfsAwakeUs) : 0;
+
+  char cpuTotal[16], cpuDelta[16];
+  char apbTotal[16], apbDelta[16];
+  char dfsTotal[16], dfsDelta[16];
+  formatDurationUsShort(power.cpuMaxUs, cpuTotal, sizeof(cpuTotal));
+  formatDurationUsShort(cpuDeltaUs, cpuDelta, sizeof(cpuDelta));
+  formatDurationUsShort(power.apbMaxUs, apbTotal, sizeof(apbTotal));
+  formatDurationUsShort(apbDeltaUs, apbDelta, sizeof(apbDelta));
+  formatDurationUsShort(power.dfsAwakeUs, dfsTotal, sizeof(dfsTotal));
+  formatDurationUsShort(dfsDeltaUs, dfsDelta, sizeof(dfsDelta));
+  const uint64_t uptimeDeltaUs = hasPreviousPowerStats ? counterDelta(power.uptimeUs, previousPowerStats.uptimeUs) : 0;
+  const auto totalPercent = [&power](uint64_t value) -> unsigned long {
+    return power.uptimeUs > 0 ? static_cast<unsigned long>((value * 100ULL) / power.uptimeUs) : 0UL;
+  };
+  const auto deltaPercent = [uptimeDeltaUs](uint64_t value) -> unsigned long {
+    return uptimeDeltaUs > 0 ? static_cast<unsigned long>((value * 100ULL) / uptimeDeltaUs) : 0UL;
+  };
+
+  char line[128];
+  snprintf(line, sizeof(line), "CPU max %d MHz: total %s %lu%% delta +%s %lu%%", power.maxFreqMhz, cpuTotal,
+           totalPercent(power.cpuMaxUs), cpuDelta, deltaPercent(cpuDeltaUs));
+  cpuMaxLine = line;
+  snprintf(line, sizeof(line), "APB max 80 MHz: total %s %lu%% delta +%s %lu%%", apbTotal,
+           totalPercent(power.apbMaxUs), apbDelta, deltaPercent(apbDeltaUs));
+  apbMaxLine = line;
+  snprintf(line, sizeof(line), "DFS awake %d MHz: total %s %lu%% delta +%s %lu%%", power.minFreqMhz, dfsTotal,
+           totalPercent(power.dfsAwakeUs), dfsDelta, deltaPercent(dfsDeltaUs));
+  dfsLine = line;
 }
 
 std::string formatPowerStatsAccountingLine(const PowerStatsSnapshot& power) {
@@ -1100,7 +1143,7 @@ uint8_t formatTaskActivity(std::string* lines, uint8_t maxLines) {
 }
 
 void formatPmLockActivity(std::string& line1, std::string& line2, std::string& line3, std::string& line4,
-                          std::string& line5) {
+                          std::string& line5, std::string& line6, std::string& line7) {
 #if CONFIG_PM_PROFILING
   char* dump = nullptr;
   size_t dumpSize = 0;
@@ -1110,6 +1153,8 @@ void formatPmLockActivity(std::string& line1, std::string& line2, std::string& l
     line3 = "PM3: unavailable";
     line4 = "PM4: unavailable";
     line5 = "PM5: unavailable";
+    line6 = "PM6: unavailable";
+    line7 = "PM7: unavailable";
     return;
   }
 
@@ -1139,6 +1184,8 @@ void formatPmLockActivity(std::string& line1, std::string& line2, std::string& l
     line3 = "PM3: none";
     line4 = "PM4: none";
     line5 = "PM5: none";
+    line6 = "PM6: none";
+    line7 = "PM7: none";
     return;
   }
 
@@ -1180,12 +1227,16 @@ void formatPmLockActivity(std::string& line1, std::string& line2, std::string& l
   line3 = formatRow("PM3:", top[2]);
   line4 = formatRow("PM4:", top[3]);
   line5 = formatRow("PM5:", top[4]);
+  line6 = formatRow("PM6:", top[5]);
+  line7 = formatRow("PM7:", top[6]);
 #else
   line1 = "PM1: profiling off";
   line2 = "PM2: profiling off";
   line3 = "PM3: profiling off";
   line4 = "PM4: profiling off";
   line5 = "PM5: profiling off";
+  line6 = "PM6: profiling off";
+  line7 = "PM7: profiling off";
 #endif
 }
 

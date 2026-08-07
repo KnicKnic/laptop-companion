@@ -6,11 +6,21 @@
 #include <SDCardManager.h>
 #include <XteinkDetect.h>
 
+#include <esp_intr_alloc.h>
+#include <esp_pm.h>
+#include <esp_private/pm_impl.h>
+#include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
+#include <cstdio>
+
 #include "AppLog.h"
 #include "AppSdBus.h"
 #include "AppState.h"
 #include "DisplayWorker.h"
 #include "IsrInput.h"
+#include "InterruptStats.h"
 #include "LinkerQuirks.h"
 #include "PageManager.h"
 #include "PowerManagement.h"
@@ -24,6 +34,76 @@ EInkDisplay* display = nullptr;
 constexpr uint32_t kMissingSettingsDelayMs = 20000;
 constexpr uint32_t kBootMaxPowerMs = 10000;
 constexpr uint32_t kButtonMaxPowerMs = 1000;
+constexpr uint32_t kPmStatsDumpPeriodMs = 15000;
+
+#if CONFIG_PM_PROFILING
+void pmStatsDumpTask(void*) {
+  InterruptStatsSnapshot previousInterruptStats;
+  uint32_t previousTouchIrqCount = 0;
+  uint32_t previousButtonIrqCount = 0;
+  uint32_t previousEpdBusyIrqCount = 0;
+  bool havePreviousInterruptStats = false;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(kPmStatsDumpPeriodMs));
+    const InterruptStatsSnapshot interruptStats = copyInterruptStats();
+    const uint32_t touchIrqCount = inputTouchInterruptCount();
+    const uint32_t buttonIrqCount = inputButtonInterruptCount();
+    const uint32_t epdBusyIrqCount = freeink::epdBusyInterruptCount();
+    Serial.println("--- interrupt counters ---");
+    Serial.printf("Input backend: %s\n", inputBackendName());
+    Serial.printf("FreeRTOS tick CPU0 total %lu delta +%lu; CPU1 total %lu delta +%lu\n",
+                  static_cast<unsigned long>(interruptStats.freertosTickCpu0),
+                  static_cast<unsigned long>(havePreviousInterruptStats
+                                                 ? interruptStats.freertosTickCpu0 - previousInterruptStats.freertosTickCpu0
+                                                 : 0),
+                  static_cast<unsigned long>(interruptStats.freertosTickCpu1),
+                  static_cast<unsigned long>(havePreviousInterruptStats
+                                                 ? interruptStats.freertosTickCpu1 - previousInterruptStats.freertosTickCpu1
+                                                 : 0));
+    Serial.printf("X4 touch GPIO IRQ total %lu delta +%lu; button GPIO IRQ total %lu delta +%lu\n",
+                  static_cast<unsigned long>(touchIrqCount),
+                  static_cast<unsigned long>(havePreviousInterruptStats ? touchIrqCount - previousTouchIrqCount : 0),
+                  static_cast<unsigned long>(buttonIrqCount),
+                  static_cast<unsigned long>(havePreviousInterruptStats ? buttonIrqCount - previousButtonIrqCount : 0));
+    Serial.printf("EPD BUSY GPIO IRQ total %lu delta +%lu\n", static_cast<unsigned long>(epdBusyIrqCount),
+                  static_cast<unsigned long>(havePreviousInterruptStats ? epdBusyIrqCount - previousEpdBusyIrqCount : 0));
+    previousInterruptStats = interruptStats;
+    previousTouchIrqCount = touchIrqCount;
+    previousButtonIrqCount = buttonIrqCount;
+    previousEpdBusyIrqCount = epdBusyIrqCount;
+    havePreviousInterruptStats = true;
+    Serial.println("\n--- esp_pm_impl_dump_stats ---");
+    esp_pm_impl_dump_stats(stdout);
+    fflush(stdout);
+    Serial.println("--- esp_pm_dump_locks ---");
+    const esp_err_t lockDumpResult = esp_pm_dump_locks(stdout);
+    if (lockDumpResult != ESP_OK) {
+      Serial.printf("esp_pm_dump_locks failed: %s\n", esp_err_to_name(lockDumpResult));
+    }
+    fflush(stdout);
+    /*Serial.println("--- esp_intr_dump ---");
+    const esp_err_t intrDumpResult = esp_intr_dump(stdout);
+    if (intrDumpResult != ESP_OK) {
+      Serial.printf("esp_intr_dump failed: %s\n", esp_err_to_name(intrDumpResult));
+    }
+    fflush(stdout);*/
+    Serial.println("--- esp_timer_dump ---");
+    const esp_err_t timerDumpResult = esp_timer_dump(stdout);
+    if (timerDumpResult != ESP_OK) {
+      Serial.printf("esp_timer_dump failed: %s\n", esp_err_to_name(timerDumpResult));
+    }
+    fflush(stdout);
+    Serial.println("--- end PM stats ---");
+  }
+}
+
+void startPmStatsDumpTask() {
+  const BaseType_t result = xTaskCreate(pmStatsDumpTask, "pm-stats", 4096, nullptr, 1, nullptr);
+  if (result != pdPASS) Serial.println("Failed to start PM stats dump task");
+}
+#else
+void startPmStatsDumpTask() {}
+#endif
 
 PageId startupPageFromSettings(const CompanionSettings& settings) {
   const String& startup = settings.system.page.startup;
@@ -122,6 +202,7 @@ void setup() {
   configurePowerManagementFromSettings();
   armMaxPowerIfConfigured(kBootMaxPowerMs);
   beginPowerStats();
+  startPmStatsDumpTask();
 
   display = new EInkDisplay(BoardConfig::ACTIVE.display.sclk, BoardConfig::ACTIVE.display.mosi,
                             BoardConfig::ACTIVE.display.cs, BoardConfig::ACTIVE.display.dc,

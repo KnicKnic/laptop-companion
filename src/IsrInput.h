@@ -27,3 +27,8 @@ bool beginInput();
 bool powerButtonPressed();
 bool getNextButtonPress(ButtonPress& press, TickType_t timeoutTicks);
 bool consumeInputEvents(ButtonPress& press, TickType_t timeoutTicks = portMAX_DELAY);
+
+// These are nonzero only for the interrupt-backed X4 Pro input backend.
+uint32_t inputTouchInterruptCount();
+uint32_t inputButtonInterruptCount();
+const char* inputBackendName();
