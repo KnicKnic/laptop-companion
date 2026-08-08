@@ -12,6 +12,10 @@ bool Page::handleButton(ButtonPressKind) {
   return false;
 }
 
+bool Page::handleTouch(freeink::ui::DisplayTarget&, int16_t, int16_t) {
+  return false;
+}
+
 void Page::onLeave() {}
 
 void Page::preRender(freeink::ui::DisplayTarget&, EInkDisplay::RefreshMode, bool) {}

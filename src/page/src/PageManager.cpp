@@ -583,10 +583,12 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
 PageButtonResult handlePageTouch(float panelX, float panelY) {
   if (pageTarget == nullptr) return PageButtonResult{activePage(), false, false};
 
-  // InputManager normalizes GT911 contacts in the panel's native 800x480 frame.
-  // PageTarget renders portrait, so invert its 90-degree clockwise transform.
-  const int16_t x = static_cast<int16_t>((1.0f - panelY) * pageTarget->logicalWidth());
-  const int16_t y = static_cast<int16_t>(panelX * pageTarget->logicalHeight());
+  // InputManager reports normalized panel-native coordinates.  Use the same
+  // orientation mapping as FreeInkUI's snapshotFrom(InputManager, device)
+  // adapter, rather than maintaining a page-local inverse transform.
+  const freeink::ui::Point touch = freeink::ui::touchToLogical(pageTarget->deviceContext(), panelX, panelY);
+  const int16_t x = touch.x;
+  const int16_t y = touch.y;
 
   xSemaphoreTake(pageMutex, portMAX_DELAY);
   const bool overlayOpen = directoryOpen;
@@ -604,13 +606,8 @@ PageButtonResult handlePageTouch(float panelX, float panelY) {
   }
   xSemaphoreGive(pageMutex);
 
-  // Three semantic touch bands replace the old footer buttons without reserving
-  // a bottom strip. They map to each page's existing left/confirm/right actions.
-  const int16_t width = pageTarget->logicalWidth();
-  const ButtonPressKind action = x < width / 3 ? ButtonPressKind::Left
-                                      : x < (width * 2) / 3 ? ButtonPressKind::Confirm
-                                                              : ButtonPressKind::Right;
-  return handlePageButton(action);
+  const PageId page = activePage();
+  return PageButtonResult{page, pageFor(page).handleTouch(*pageTarget, x, y), false};
 }
 
 const char* pageName(PageId page) {
@@ -619,15 +616,6 @@ const char* pageName(PageId page) {
 
 void drawPageChrome(freeink::ui::DisplayTarget& target) {
   const int16_t width = target.logicalWidth();
-  const int16_t height = target.logicalHeight();
-
-  freeink::ui::TextStyle left;
-  left.align = freeink::ui::TextAlign::Left;
-  left.maxLines = 1;
-
-  freeink::ui::TextStyle right;
-  right.align = freeink::ui::TextAlign::Right;
-  right.maxLines = 1;
 
   char battery[20];
   if (batteryCached && batteryKnown) {
@@ -636,17 +624,22 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
     snprintf(battery, sizeof(battery), "--%%");
   }
 
-  target.fill(freeink::ui::Rect{0, 0, width, 38}, freeink::ui::Paint::solid(freeink::ui::Color::White));
-  freeink::ui::drawText(target, freeink::ui::Rect{10, 2, static_cast<int16_t>(width - 130), 32},
-                        "Nicholas.Maliwack@gmail.com", left);
-
   freeink::ui::InputSnapshot input;
   freeink::ui::InteractionBuffer<1> interactions;
   freeink::ui::Frame<1> frame(target, target.deviceContext(), input, interactions);
+  freeink::ui::StatusBarProps status;
+  status.leading = "Nicholas.Maliwack@gmail.com";
+  status.trailing = battery;
+  status.fillBackground = true;
+  status.text.maxLines = 1;
+  status.trailingSecondary = nullptr;
+  freeink::ui::statusBar(frame, freeink::ui::Rect{0, 0, width, 38}, status);
+
   freeink::ui::BatteryIndicatorProps batteryProps;
   batteryProps.percent = batteryKnown ? static_cast<uint8_t>(batteryPercent) : 0;
   batteryProps.label = battery;
-  batteryProps.text = right;
+  batteryProps.text.align = freeink::ui::TextAlign::Right;
+  batteryProps.text.maxLines = 1;
   batteryProps.glyphWidth = 28;
   batteryProps.glyphHeight = 14;
   batteryProps.gap = 6;

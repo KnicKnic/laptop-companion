@@ -191,6 +191,25 @@ bool CompanionPage::handleButton(ButtonPressKind kind) {
   }
 }
 
+bool CompanionPage::handleTouch(freeink::ui::DisplayTarget& target, int16_t x, int16_t y) {
+  const freeink::ui::Rect content = pageMainPanel(target).inset(freeink::ui::Insets{12, 8, 24, 18});
+  constexpr int16_t gap = 12;
+  const int16_t tileW = static_cast<int16_t>((content.width - gap) / 2);
+  const int16_t mediaTileY = static_cast<int16_t>(content.y + 188);
+
+  // These are the visible action tiles: microphone, camera, then hand.
+  if (freeink::ui::Rect{content.x, mediaTileY, tileW, 100}.contains(x, y)) {
+    return handleButton(ButtonPressKind::Left);
+  }
+  if (freeink::ui::Rect{static_cast<int16_t>(content.x + tileW + gap), mediaTileY, tileW, 100}.contains(x, y)) {
+    return handleButton(ButtonPressKind::Confirm);
+  }
+  if (freeink::ui::Rect{content.x, static_cast<int16_t>(mediaTileY + 124), content.width, 88}.contains(x, y)) {
+    return handleButton(ButtonPressKind::Right);
+  }
+  return false;
+}
+
 void CompanionPage::onLeave() {
   CompanionBleService& service = CompanionBleService::getInstance();
   service.setStatusChangedCallback(nullptr);

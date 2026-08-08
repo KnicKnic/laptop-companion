@@ -12,6 +12,7 @@ class CompanionPage final : public Page {
   const char* name() const override;
   void onEnter() override;
   bool handleButton(ButtonPressKind kind) override;
+  bool handleTouch(freeink::ui::DisplayTarget& target, int16_t x, int16_t y) override;
   void onLeave() override;
   std::unique_ptr<RenderTransaction> render(freeink::ui::DisplayTarget& target,
                                             EInkDisplay::RefreshMode mode, bool forceDraw) override;

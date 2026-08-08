@@ -35,6 +35,36 @@ bool SettingsPage::handleButton(ButtonPressKind kind) {
   }
 }
 
+bool SettingsPage::handleTouch(freeink::ui::DisplayTarget& target, int16_t x, int16_t y) {
+  // Keep the tap geometry identical to the six rendered setting rows. A tap
+  // changes that setting immediately; it no longer acts through a page-wide
+  // left/middle/right zone.
+  const freeink::ui::Rect content = pageMainPanel(target).inset(freeink::ui::Insets{12, 8, 24, 18});
+  const int16_t rowX = static_cast<int16_t>(content.x + 20);
+  const int16_t rowW = static_cast<int16_t>(content.width - 40);
+  constexpr int16_t rowH = 44;
+  constexpr int16_t rowStep = 50;
+  const int16_t firstRowY = static_cast<int16_t>(content.y + 96);
+
+  freeink::ui::InputSnapshot input;
+  input.touchReleased = true;
+  input.touchX = x;
+  input.touchY = y;
+  freeink::ui::InteractionBuffer<kEditableRows> interactions;
+  freeink::ui::Frame<kEditableRows> frame(target, target.deviceContext(), input, interactions);
+  constexpr freeink::ui::ActionId kActionChangeSetting = 1;
+  for (uint8_t row = 0; row < kEditableRows; ++row) {
+    frame.hit(freeink::ui::Rect{rowX, static_cast<int16_t>(firstRowY + row * rowStep), rowW, rowH},
+              kActionChangeSetting, row, freeink::ui::InputTouch);
+  }
+  const freeink::ui::ActionEvent event = frame.finish();
+  if (event.action != kActionChangeSetting) return false;
+
+  selectedRow_ = static_cast<uint8_t>(event.value);
+  toggleSelectedSetting();
+  return true;
+}
+
 void SettingsPage::onLeave() {
   if (!dirty_) return;
   if (saveSettingsToSd()) {
