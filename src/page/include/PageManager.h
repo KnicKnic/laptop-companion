@@ -11,6 +11,9 @@ struct PageButtonResult {
   PageId page = PageId::Main;
   bool renderRequired = true;
   bool overlayOnly = false;
+  // Used when an overlay has been removed. A full refresh eliminates its
+  // pixels and any partial-refresh ghosting from the panel.
+  bool fullRefresh = false;
 };
 
 bool beginPageManager(EInkDisplay& display, PageId initialPage = PageId::Companion);

@@ -1,6 +1,7 @@
 #include "CompanionStatsPage.h"
 
 #include "DisplayWorker.h"
+#include "IsrInput.h"
 #include "PageDrawing.h"
 #include "PageManager.h"
 #include "PowerStats.h"
@@ -121,8 +122,6 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   std::string pmLock6;
   std::string pmLock7;
   formatPmLockActivity(pmLock1, pmLock2, pmLock3, pmLock4, pmLock5, pmLock6, pmLock7);
-  std::string taskLines[10];
-  const uint8_t taskLineCount = formatTaskActivity(taskLines, 10);
 
   const freeink::ui::Rect panel = pageMainPanel(target);
   const freeink::ui::Rect content = panel.inset(freeink::ui::Insets{24, 8, 24, 18});
@@ -161,6 +160,10 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   char renderLine[112];
   snprintf(renderLine, sizeof(renderLine), "renders: %lu session: %lu",
            static_cast<unsigned long>(totalRenderRequests), static_cast<unsigned long>(sessionRenderRequests));
+  char inputIrqLine[96];
+  snprintf(inputIrqLine, sizeof(inputIrqLine), "Input IRQ handlers: touch:%lu button:%lu",
+           static_cast<unsigned long>(inputTouchInterruptCount()),
+           static_cast<unsigned long>(inputButtonInterruptCount()));
   char meetingLine[128];
   snprintf(meetingLine, sizeof(meetingLine), "Meeting:%s  Name:%s", host.meetingDetected ? "active" : "none",
            host.meetingName.empty() ? "--" : host.meetingName.c_str());
@@ -194,6 +197,7 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   addRow(hostLine);
   addRow(workerLine);
   addRow(renderLine);
+  addRow(inputIrqLine);
   addRow(timingA.c_str());
   addRow(timingB.c_str());
   addRow(activity.c_str());
@@ -216,7 +220,6 @@ std::unique_ptr<RenderTransaction> CompanionStatsPage::render(freeink::ui::Displ
   addRow(pmLock5.c_str());
   addRow(pmLock6.c_str());
   addRow(pmLock7.c_str());
-  for (uint8_t i = 0; i < taskLineCount; i++) addRow(taskLines[i].c_str());
   clampScroll(scrollOffset_, rowCount);
 
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, content.y, content.width, 34}, "Companion Stats", title);

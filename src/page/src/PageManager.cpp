@@ -5,6 +5,7 @@
 #include "CompanionSettingsWarningPage.h"
 #include "CompanionPage.h"
 #include "CompanionStatsPage.h"
+#include "InputDiagnosticsPage.h"
 #include "MainPage.h"
 #include "OtherTestPage.h"
 #include "Page.h"
@@ -35,10 +36,12 @@ SettingsPage* settingsPage = nullptr;
 OtherTestPage* otherTestPage = nullptr;
 PowerStatsPage* powerStatsPage = nullptr;
 CompanionSettingsWarningPage* companionSettingsWarningPage = nullptr;
+InputDiagnosticsPage* inputDiagnosticsPage = nullptr;
 EInkDisplay* pageDisplay = nullptr;
 freeink::ui::DisplayTarget* pageTarget = nullptr;
 
 Page* pages[] = {
+    nullptr,
     nullptr,
     nullptr,
     nullptr,
@@ -56,11 +59,13 @@ constexpr Route routes[] = {
     {PageId::OtherTest, PageId::Main, "/other/test", "test", false},
     {PageId::PowerStats, PageId::Main, "/other/power-stats", "power-stats", false},
     {PageId::CompanionSettingsWarning, PageId::Main, "/other/error", "error", false},
+    {PageId::InputDiagnostics, PageId::Main, "/diagnostics/input", "input diagnostics", false},
 };
 
 constexpr PageId kOtherTestRoute = PageId::OtherTest;
 constexpr PageId kOtherPowerStatsRoute = PageId::PowerStats;
 constexpr PageId kOtherErrorRoute = PageId::CompanionSettingsWarning;
+constexpr PageId kInputDiagnosticsRoute = PageId::InputDiagnostics;
 
 SemaphoreHandle_t pageMutex = nullptr;
 PageId currentPage = PageId::Companion;
@@ -68,6 +73,7 @@ uint8_t rootNavIndex = 0;
 uint8_t companionNavIndex = 0;
 uint8_t otherNavIndex = 0;
 bool directoryOpen = false;
+bool directoryOpenedByHomeKey = false;
 uint8_t directoryIndex = 1;
 
 bool batteryCached = false;
@@ -161,36 +167,41 @@ const char* companionNavLabel(uint8_t) {
 }
 
 PageId otherNavPage(uint8_t index) {
-  switch (index % 3) {
+  switch (index % 4) {
     case 0:
       return kOtherTestRoute;
     case 1:
       return kOtherPowerStatsRoute;
-    default:
+    case 2:
       return kOtherErrorRoute;
+    default:
+      return kInputDiagnosticsRoute;
   }
 }
 
 const char* otherNavLabel(uint8_t index) {
-  switch (index % 3) {
+  switch (index % 4) {
     case 0:
       return "test";
     case 1:
       return "power-stats";
-    default:
+    case 2:
       return "error";
+    default:
+      return "input diag";
   }
 }
 
 bool routeInOther(PageId page) {
-  return page == kOtherTestRoute || page == kOtherPowerStatsRoute || page == kOtherErrorRoute;
+  return page == kOtherTestRoute || page == kOtherPowerStatsRoute || page == kOtherErrorRoute ||
+         page == kInputDiagnosticsRoute;
 }
 
 uint8_t navItemCountFor(PageId page) {
   if (page == PageId::Main) return 3;
   if (page == PageId::Companion) return 1;
   if (page == PageId::CompanionStats) return 1;
-  if (routeInOther(page)) return 3;
+  if (routeInOther(page)) return 4;
   return 3;
 }
 
@@ -226,7 +237,8 @@ void syncNavSelection(PageId page) {
     rootNavIndex = 2;
     if (page == kOtherTestRoute) otherNavIndex = 0;
     else if (page == kOtherPowerStatsRoute) otherNavIndex = 1;
-    else otherNavIndex = 2;
+    else if (page == kOtherErrorRoute) otherNavIndex = 2;
+    else otherNavIndex = 3;
   }
 }
 
@@ -304,7 +316,12 @@ void drawDirectoryRow(freeink::ui::DisplayTarget& target, const freeink::ui::Rec
 freeink::ui::Rect directoryPopupRect(freeink::ui::DisplayTarget& target) {
   const int16_t width = target.logicalWidth();
   const int16_t height = target.logicalHeight();
-  return freeink::ui::Rect{24, static_cast<int16_t>((height - 430) / 2), static_cast<int16_t>(width - 48), 430};
+  constexpr int16_t kHeaderHeight = 78;
+  constexpr int16_t kRowHeightWithGap = 46;
+  constexpr int16_t kFooterHeight = 42;
+  const int16_t popupHeight = static_cast<int16_t>(kHeaderHeight + routeCount() * kRowHeightWithGap + kFooterHeight);
+  return freeink::ui::Rect{24, static_cast<int16_t>((height - popupHeight) / 2), static_cast<int16_t>(width - 48),
+                           popupHeight};
 }
 
 freeink::ui::Rect directoryRowRect(freeink::ui::DisplayTarget& target, uint8_t index) {
@@ -411,7 +428,8 @@ void drawDirectoryOverlay(freeink::ui::DisplayTarget& target) {
   freeink::ui::TextStyle title;
   title.align = freeink::ui::TextAlign::Left;
   title.maxLines = 1;
-  freeink::ui::drawText(target, popup.inset(freeink::ui::Insets{16, 12, 16, 0}), "Directory", title);
+  freeink::ui::drawText(target, popup.inset(freeink::ui::Insets{16, 12, 16, 0}),
+                        directoryOpenedByHomeKey ? "Directory (Home key released)" : "Directory", title);
 
   freeink::ui::TextStyle body = title;
   body.maxLines = 1;
@@ -460,6 +478,7 @@ bool beginPageManager(EInkDisplay& display, PageId initialPage) {
     otherTestPage = new OtherTestPage(display);
     powerStatsPage = new PowerStatsPage(display);
     companionSettingsWarningPage = new CompanionSettingsWarningPage(display);
+    inputDiagnosticsPage = new InputDiagnosticsPage(display);
 
     pages[0] = mainPage;
     pages[1] = companionPage;
@@ -468,6 +487,7 @@ bool beginPageManager(EInkDisplay& display, PageId initialPage) {
     pages[4] = otherTestPage;
     pages[5] = powerStatsPage;
     pages[6] = companionSettingsWarningPage;
+    pages[7] = inputDiagnosticsPage;
   }
 
   currentPage = pageFor(initialPage).id();
@@ -511,10 +531,12 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
   if (overlayOpen) {
     switch (kind) {
       case ButtonPressKind::Back:
+      case ButtonPressKind::Directory:
         xSemaphoreTake(pageMutex, portMAX_DELAY);
         directoryOpen = false;
+        directoryOpenedByHomeKey = false;
         xSemaphoreGive(pageMutex);
-        return PageButtonResult{activePage(), true, false};
+        return PageButtonResult{activePage(), true, false, true};
       case ButtonPressKind::Left:
         xSemaphoreTake(pageMutex, portMAX_DELAY);
         moveDirectorySelection(-1);
@@ -529,6 +551,7 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
         xSemaphoreTake(pageMutex, portMAX_DELAY);
         const PageId selected = routes[directoryIndex].id;
         directoryOpen = false;
+        directoryOpenedByHomeKey = false;
         xSemaphoreGive(pageMutex);
         logPrintf("Directory selected: %s\n", routeFor(selected).path);
         return PageButtonResult{setCurrentPage(selected), true, false};
@@ -547,16 +570,18 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
       case ButtonPressKind::Gpio2:
       case ButtonPressKind::Power:
       case ButtonPressKind::Touch:
-      case ButtonPressKind::Directory:
+      case ButtonPressKind::HomeKeyDown:
         return PageButtonResult{activePage(), false, false};
     }
   }
 
   switch (kind) {
     case ButtonPressKind::Back:
+    case ButtonPressKind::Directory:
       xSemaphoreTake(pageMutex, portMAX_DELAY);
       syncDirectorySelection(page);
       directoryOpen = true;
+      directoryOpenedByHomeKey = kind == ButtonPressKind::Directory;
       xSemaphoreGive(pageMutex);
       return PageButtonResult{page, true, true};
     case ButtonPressKind::Up:
@@ -574,8 +599,9 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
     case ButtonPressKind::Gpio2:
     case ButtonPressKind::Power:
     case ButtonPressKind::Touch:
-    case ButtonPressKind::Directory:
       return PageButtonResult{activePage(), false, false};
+    case ButtonPressKind::HomeKeyDown:
+      return PageButtonResult{activePage(), pageFor(page).handleButton(kind), false};
   }
   return PageButtonResult{activePage(), false, false};
 }
@@ -602,7 +628,7 @@ PageButtonResult handlePageTouch(float panelX, float panelY) {
     }
     directoryOpen = false;
     xSemaphoreGive(pageMutex);
-    return PageButtonResult{activePage(), true, false};
+    return PageButtonResult{activePage(), true, false, true};
   }
   xSemaphoreGive(pageMutex);
 

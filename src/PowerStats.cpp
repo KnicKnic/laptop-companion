@@ -30,9 +30,6 @@ namespace {
 constexpr uint8_t kTimerTopCount = 5;
 constexpr uint8_t kTimerMaxRows = 48;
 constexpr size_t kTimerNameLen = 21;
-constexpr uint8_t kTaskTopCount = 10;
-constexpr uint8_t kTaskMaxRows = 48;
-constexpr size_t kTaskNameLen = 17;
 constexpr uint8_t kPmLockTopCount = 7;
 constexpr uint8_t kPmLockMaxRows = 24;
 constexpr size_t kBtLockMaxRows = 8;
@@ -66,18 +63,6 @@ struct TimerAlarmRow {
   char name[kTimerNameLen] = {};
   uint64_t dueUs = 0;
   uint64_t periodUs = 0;
-  bool valid = false;
-};
-
-struct TaskActivitySnapshot {
-  char name[kTaskNameLen] = {};
-  uint32_t taskNumber = 0;
-  uint64_t runtime = 0;
-};
-
-struct TaskActivityDelta {
-  char name[kTaskNameLen] = {};
-  uint64_t runtimeDelta = 0;
   bool valid = false;
 };
 
@@ -132,10 +117,6 @@ bool lightSleepCallbacksRegistered = false;
 TimerActivitySnapshot previousTimerActivity[kTimerMaxRows];
 uint8_t previousTimerActivityCount = 0;
 bool hasPreviousTimerActivity = false;
-TaskActivitySnapshot previousTaskActivity[kTaskMaxRows];
-uint8_t previousTaskActivityCount = 0;
-uint64_t previousTaskTotalRuntime = 0;
-bool hasPreviousTaskActivity = false;
 PmLockActivityRow previousPmLockActivity[kPmLockMaxRows];
 uint8_t previousPmLockActivityCount = 0;
 uint64_t previousPmLockActivityTimeUs = 0;
@@ -523,48 +504,6 @@ void storeTimerActivitySnapshot(const TimerActivitySnapshot* timers, uint8_t cou
   previousTimerActivityCount = std::min(count, static_cast<uint8_t>(kTimerMaxRows));
   for (uint8_t i = 0; i < previousTimerActivityCount; i++) previousTimerActivity[i] = timers[i];
   hasPreviousTimerActivity = true;
-}
-
-const TaskActivitySnapshot* findPreviousTaskActivity(uint32_t taskNumber, const char* name) {
-  for (uint8_t i = 0; i < previousTaskActivityCount; i++) {
-    if (previousTaskActivity[i].taskNumber == taskNumber) return &previousTaskActivity[i];
-  }
-  for (uint8_t i = 0; i < previousTaskActivityCount; i++) {
-    if (strncmp(previousTaskActivity[i].name, name, kTaskNameLen) == 0) return &previousTaskActivity[i];
-  }
-  return nullptr;
-}
-
-void storeTaskActivitySnapshot(const TaskStatus_t* tasks, uint8_t count, uint64_t totalRuntime) {
-  previousTaskActivityCount = std::min(count, static_cast<uint8_t>(kTaskMaxRows));
-  for (uint8_t i = 0; i < previousTaskActivityCount; i++) {
-    snprintf(previousTaskActivity[i].name, sizeof(previousTaskActivity[i].name), "%s",
-             tasks[i].pcTaskName ? tasks[i].pcTaskName : "?");
-    previousTaskActivity[i].taskNumber = tasks[i].xTaskNumber;
-    previousTaskActivity[i].runtime = tasks[i].ulRunTimeCounter;
-  }
-  previousTaskTotalRuntime = totalRuntime;
-  hasPreviousTaskActivity = true;
-}
-
-bool taskDeltaRanksAbove(const TaskActivityDelta& candidate, const TaskActivityDelta& existing) {
-  if (!existing.valid) return true;
-  if (candidate.runtimeDelta != existing.runtimeDelta) return candidate.runtimeDelta > existing.runtimeDelta;
-  return strcmp(candidate.name, existing.name) < 0;
-}
-
-void insertTaskDelta(TaskActivityDelta top[kTaskTopCount], const TaskStatus_t& task, uint64_t runtimeDelta) {
-  if (runtimeDelta == 0) return;
-  TaskActivityDelta candidate;
-  snprintf(candidate.name, sizeof(candidate.name), "%s", task.pcTaskName ? task.pcTaskName : "?");
-  candidate.runtimeDelta = runtimeDelta;
-  candidate.valid = true;
-  for (uint8_t i = 0; i < kTaskTopCount; i++) {
-    if (!taskDeltaRanksAbove(candidate, top[i])) continue;
-    for (uint8_t j = kTaskTopCount - 1; j > i; j--) top[j] = top[j - 1];
-    top[i] = candidate;
-    return;
-  }
 }
 
 bool capturePmLockDump(char** dump, size_t* dumpSize) {
@@ -1074,71 +1013,6 @@ std::string formatEspTimerAlarmLine() {
   return line;
 #else
   return "Alarm: profiling off";
-#endif
-}
-
-uint8_t formatTaskActivity(std::string* lines, uint8_t maxLines) {
-  if (!lines || maxLines == 0) return 0;
-
-#if configUSE_TRACE_FACILITY && configGENERATE_RUN_TIME_STATS
-  static TaskStatus_t tasks[kTaskMaxRows];
-  static TaskActivityDelta top[kTaskTopCount];
-  memset(tasks, 0, sizeof(tasks));
-  memset(top, 0, sizeof(top));
-  configRUN_TIME_COUNTER_TYPE totalRuntimeRaw = 0;
-  const UBaseType_t captured = uxTaskGetSystemState(tasks, kTaskMaxRows, &totalRuntimeRaw);
-  const uint8_t taskCount = static_cast<uint8_t>(std::min<UBaseType_t>(captured, kTaskMaxRows));
-  const uint64_t totalRuntime = static_cast<uint64_t>(totalRuntimeRaw);
-  if (taskCount == 0) {
-    lines[0] = "Task01: unavailable";
-    return 1;
-  }
-
-  if (!hasPreviousTaskActivity || totalRuntime <= previousTaskTotalRuntime) {
-    storeTaskActivitySnapshot(tasks, taskCount, totalRuntime);
-    lines[0] = "Task01: baseline";
-    return 1;
-  }
-
-  uint64_t summedTaskDelta = 0;
-  for (uint8_t i = 0; i < taskCount; i++) {
-    const TaskActivitySnapshot* previous = findPreviousTaskActivity(tasks[i].xTaskNumber, tasks[i].pcTaskName);
-    const uint64_t currentRuntime = static_cast<uint64_t>(tasks[i].ulRunTimeCounter);
-    const uint64_t runtimeDelta = previous ? counterDelta(currentRuntime, previous->runtime) : currentRuntime;
-    summedTaskDelta += runtimeDelta;
-    insertTaskDelta(top, tasks[i], runtimeDelta);
-  }
-
-  const uint64_t totalDelta = counterDelta(totalRuntime, previousTaskTotalRuntime);
-  const uint64_t denominator = totalDelta > 0 ? totalDelta : summedTaskDelta;
-  storeTaskActivitySnapshot(tasks, taskCount, totalRuntime);
-
-  uint8_t emitted = 0;
-  const uint8_t limit = std::min<uint8_t>(std::min<uint8_t>(maxLines, kTaskTopCount), taskCount);
-  for (uint8_t i = 0; i < limit; i++) {
-    if (!top[i].valid) break;
-
-    char name[12];
-    shortenName(top[i].name, name, sizeof(name));
-    char runtime[16];
-    formatDurationUsShort(top[i].runtimeDelta, runtime, sizeof(runtime));
-    const uint64_t percentTenths = denominator > 0 ? (top[i].runtimeDelta * 1000ULL) / denominator : 0;
-
-    char line[96];
-    snprintf(line, sizeof(line), "Task%02u: %s %llu.%01llu%% %s", static_cast<unsigned>(i + 1), name,
-             static_cast<unsigned long long>(percentTenths / 10ULL),
-             static_cast<unsigned long long>(percentTenths % 10ULL), runtime);
-    lines[emitted++] = line;
-  }
-
-  if (emitted == 0) {
-    lines[0] = "Task01: none";
-    return 1;
-  }
-  return emitted;
-#else
-  lines[0] = "Task01: profiling off";
-  return 1;
 #endif
 }
 

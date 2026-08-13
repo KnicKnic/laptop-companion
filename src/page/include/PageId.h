@@ -10,4 +10,5 @@ enum class PageId : uint8_t {
   OtherTest,
   PowerStats,
   CompanionSettingsWarning,
+  InputDiagnostics,
 };

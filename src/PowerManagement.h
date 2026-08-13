@@ -23,6 +23,7 @@ class TimedPowerManagementLock {
   TimedPowerManagementLock& operator=(const TimedPowerManagementLock&) = delete;
 
   bool ensureArmed(uint32_t milliseconds);
+  bool release();
   bool releaseIfExpired();
   uint32_t millisecondsLeft();
   bool armed() const { return acquired_; }

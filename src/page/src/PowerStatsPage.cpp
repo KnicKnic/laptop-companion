@@ -2,6 +2,7 @@
 
 #include "PageDrawing.h"
 #include "PageManager.h"
+#include "IsrInput.h"
 #include "PowerStats.h"
 #include "Settings.h"
 
@@ -120,8 +121,6 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   std::string pmLock6;
   std::string pmLock7;
   formatPmLockActivity(pmLock1, pmLock2, pmLock3, pmLock4, pmLock5, pmLock6, pmLock7);
-  std::string taskLines[10];
-  const uint8_t taskLineCount = formatTaskActivity(taskLines, 10);
 
   const freeink::ui::Rect content = getPagePanel(target);
 
@@ -154,6 +153,10 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   snprintf(rangeLine, sizeof(rangeLine), "DFS range: %d -> %d MHz", power.maxFreqMhz, power.minFreqMhz);
   char renderLine[96];
   snprintf(renderLine, sizeof(renderLine), "Render requests:%lu", static_cast<unsigned long>(power.renderRequests));
+  char inputIrqLine[96];
+  snprintf(inputIrqLine, sizeof(inputIrqLine), "Input IRQ handlers: touch:%lu button:%lu",
+           static_cast<unsigned long>(inputTouchInterruptCount()),
+           static_cast<unsigned long>(inputButtonInterruptCount()));
   char rejectLine[96];
   snprintf(rejectLine, sizeof(rejectLine), "Light sleep rejects:%llu",
            static_cast<unsigned long long>(power.lightSleepRejects));
@@ -186,6 +189,7 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   addRow(apbMaxLine.c_str());
   addRow(dfsLine.c_str());
   addRow(renderLine);
+  addRow(inputIrqLine);
   addRow(timerLine.c_str());
   addRow(alarmLine.c_str());
   addRow(pmLock1.c_str());
@@ -195,7 +199,6 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   addRow(pmLock5.c_str());
   addRow(pmLock6.c_str());
   addRow(pmLock7.c_str());
-  for (uint8_t i = 0; i < taskLineCount; i++) addRow(taskLines[i].c_str());
   clampScroll(scrollOffset_, rowCount);
 
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 8), content.width, 34},

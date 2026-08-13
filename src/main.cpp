@@ -114,6 +114,7 @@ PageId startupPageFromSettings(const CompanionSettings& settings) {
   if (startup == "/other/test") return PageId::OtherTest;
   if (startup == "/other/power-stats" || startup == "power_stats") return PageId::PowerStats;
   if (startup == "/other/error") return PageId::CompanionSettingsWarning;
+  if (startup == "/diagnostics/input" || startup == "input_diagnostics") return PageId::InputDiagnostics;
   return PageId::Companion;
 }
 
@@ -248,9 +249,7 @@ void loop() {
 
   const PageButtonResult result = press.kind == ButtonPressKind::Touch
                                       ? handlePageTouch(press.touchX, press.touchY)
-                                      : handlePageButton(press.kind == ButtonPressKind::Directory
-                                                             ? ButtonPressKind::Back
-                                                             : press.kind);
+                                      : handlePageButton(press.kind);
   logPrintf("Selected page: %s\n", pageName(result.page));
 
   if (!result.renderRequired) {
@@ -259,7 +258,18 @@ void loop() {
   }
 
   const RenderKind renderKind = result.overlayOnly ? RenderKind::DirectoryOverlay : RenderKind::ActivePage;
-  const uint32_t seq = requestRender(renderKind, refreshModeFromSettings(copySettings()));
+  const EInkDisplay::RefreshMode refreshMode =
+      result.fullRefresh ? EInkDisplay::FULL_REFRESH : refreshModeFromSettings(copySettings());
+  const uint32_t seq = requestRender(renderKind, refreshMode);
   logPrintf("Queued %s render request %lu\n", result.overlayOnly ? "directory overlay" : "active page",
             static_cast<unsigned long>(seq));
+
+  // Render signals normally coalesce, which is ideal for routine navigation
+  // but would erase a brief faulty Home-key DOWN before it can be filmed.  On
+  // the diagnostic page this is the one intentional synchronous frame: the
+  // pending release remains latched by the input task and opens Directory
+  // only after the DOWN evidence has reached the panel.
+  if (press.kind == ButtonPressKind::HomeKeyDown && result.renderRequired) {
+    waitForRender(seq, portMAX_DELAY);
+  }
 }

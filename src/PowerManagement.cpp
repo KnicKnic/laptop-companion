@@ -54,6 +54,12 @@ bool TimedPowerManagementLock::releaseIfExpired() {
   if (!acquired_) return false;
   if (nowMs() < deadlineMs_) return false;
 
+  return release();
+}
+
+bool TimedPowerManagementLock::release() {
+  if (!acquired_) return false;
+
   const esp_err_t err = esp_pm_lock_release(handle_);
   if (err != ESP_OK) {
     logPrintf("Power lock %s release failed: %s\n", name_, esp_err_to_name(err));

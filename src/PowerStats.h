@@ -64,7 +64,6 @@ void formatPowerStatsFrequencyLines(const PowerStatsSnapshot& power, std::string
 uint8_t formatPowerStatsWakeDeltaLines(const PowerStatsSnapshot& power, std::string* lines, uint8_t maxLines);
 std::string formatEspTimerActivity();
 std::string formatEspTimerAlarmLine();
-uint8_t formatTaskActivity(std::string* lines, uint8_t maxLines);
 void formatPmLockActivity(std::string& line1, std::string& line2, std::string& line3, std::string& line4,
                           std::string& line5, std::string& line6, std::string& line7);
 void setBtLockTraceConnectionParams(uint16_t intervalUnits, uint16_t latency);
