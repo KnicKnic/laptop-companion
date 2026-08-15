@@ -45,6 +45,7 @@ enum class HostStateField : uint8_t {
   Camera,
   Hand,
   Message,
+  Desktops,
 };
 
 CompanionBleService* g_service = nullptr;
@@ -120,6 +121,80 @@ void setEncodedStateValue(NimBLECharacteristic* characteristic, bool on, uint16_
   characteristic->setValue(payload, sizeof(payload));
 }
 
+// Decodes [version][count][activeIndex][ackSeqLo][ackSeqHi] followed by [flags][nameLen][name]
+// per desktop.
+bool decodeDesktopState(const std::string& value, CompanionBleService::DesktopStatus* out,
+                        uint16_t* ackSequence) {
+  if (!out || value.size() < CompanionProtocol::DESKTOP_STATE_HEADER_LEN) return false;
+  if (static_cast<uint8_t>(value[0]) != CompanionProtocol::PROTOCOL_VERSION) return false;
+
+  const uint8_t count = static_cast<uint8_t>(value[1]);
+  if (count > CompanionProtocol::DESKTOP_MAX_COUNT) return false;
+
+  CompanionBleService::DesktopStatus next;
+  next.valid = true;
+  next.count = count;
+  next.activeIndex = static_cast<uint8_t>(value[2]);
+  if (next.activeIndex != CompanionProtocol::DESKTOP_INDEX_UNKNOWN && next.activeIndex >= count) {
+    next.activeIndex = CompanionProtocol::DESKTOP_INDEX_UNKNOWN;
+  }
+  if (ackSequence) {
+    *ackSequence = static_cast<uint16_t>(static_cast<uint8_t>(value[3])) |
+                   static_cast<uint16_t>(static_cast<uint8_t>(value[4]) << 8);
+  }
+
+  size_t offset = CompanionProtocol::DESKTOP_STATE_HEADER_LEN;
+  for (uint8_t i = 0; i < count; ++i) {
+    if (offset + 2 > value.size()) return false;
+    const uint8_t flags = static_cast<uint8_t>(value[offset]);
+    const uint8_t nameLen = static_cast<uint8_t>(value[offset + 1]);
+    offset += 2;
+    if (nameLen > CompanionProtocol::DESKTOP_NAME_MAX_LEN || offset + nameLen > value.size()) return false;
+    next.desktops[i].remote = (flags & CompanionProtocol::DESKTOP_FLAG_REMOTE) != 0;
+    next.desktops[i].disconnected = (flags & CompanionProtocol::DESKTOP_FLAG_DISCONNECTED) != 0;
+    next.desktops[i].name.assign(value, offset, nameLen);
+    offset += nameLen;
+  }
+
+  *out = next;
+  return true;
+}
+
+bool desktopStatusEquals(const CompanionBleService::DesktopStatus& a, const CompanionBleService::DesktopStatus& b) {
+  if (a.valid != b.valid || a.count != b.count || a.activeIndex != b.activeIndex) return false;
+  for (uint8_t i = 0; i < a.count; ++i) {
+    if (a.desktops[i].remote != b.desktops[i].remote || a.desktops[i].name != b.desktops[i].name ||
+        a.desktops[i].disconnected != b.desktops[i].disconnected) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string encodeDesktopState(const CompanionBleService::DesktopStatus& status) {
+  std::string payload;
+  payload.reserve(CompanionProtocol::DESKTOP_STATE_MAX_LEN);
+  payload.push_back(static_cast<char>(CompanionProtocol::PROTOCOL_VERSION));
+  payload.push_back(static_cast<char>(status.valid ? status.count : 0));
+  payload.push_back(static_cast<char>(status.valid ? status.activeIndex : CompanionProtocol::DESKTOP_INDEX_UNKNOWN));
+  payload.push_back(static_cast<char>(CompanionProtocol::DESKTOP_ACK_NONE & 0xFF));
+  payload.push_back(static_cast<char>((CompanionProtocol::DESKTOP_ACK_NONE >> 8) & 0xFF));
+  if (!status.valid) return payload;
+
+  for (uint8_t i = 0; i < status.count; ++i) {
+    const std::string& name = status.desktops[i].name;
+    const uint8_t nameLen = static_cast<uint8_t>(
+        name.size() > CompanionProtocol::DESKTOP_NAME_MAX_LEN ? CompanionProtocol::DESKTOP_NAME_MAX_LEN : name.size());
+    const uint8_t flags = static_cast<uint8_t>(
+        (status.desktops[i].remote ? CompanionProtocol::DESKTOP_FLAG_REMOTE : 0) |
+        (status.desktops[i].disconnected ? CompanionProtocol::DESKTOP_FLAG_DISCONNECTED : 0));
+    payload.push_back(static_cast<char>(flags));
+    payload.push_back(static_cast<char>(nameLen));
+    payload.append(name, 0, nameLen);
+  }
+  return payload;
+}
+
 class CompanionServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo& connInfo) override {
     logPrintf("Companion host connected handle=%u\n", static_cast<unsigned>(connInfo.getConnHandle()));
@@ -173,6 +248,9 @@ class HostStateCallbacks : public NimBLECharacteristicCallbacks {
       case HostStateField::Message:
         g_service->onHostStatusMessageWritten(characteristic);
         break;
+      case HostStateField::Desktops:
+        g_service->onHostDesktopStateWritten(characteristic);
+        break;
     }
   }
 
@@ -203,6 +281,7 @@ HostStateCallbacks microphoneStateCallbacks(HostStateField::Microphone);
 HostStateCallbacks cameraStateCallbacks(HostStateField::Camera);
 HostStateCallbacks handStateCallbacks(HostStateField::Hand);
 HostStateCallbacks statusMessageCallbacks(HostStateField::Message);
+HostStateCallbacks desktopStateCallbacks(HostStateField::Desktops);
 ButtonEventCallbacks buttonEventCallbacks;
 ParticipationCallbacks participationCallbacks;
 }  // namespace
@@ -268,9 +347,12 @@ bool CompanionBleService::begin() {
       service->createCharacteristic(CompanionProtocol::HOST_HAND_STATE_UUID, stateProperties, kEncodedStateLen);
   hostStatusMessageCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::HOST_STATUS_MESSAGE_UUID, stateProperties, kStatusMessageMaxLen);
+  hostDesktopStateCharacteristic_ = service->createCharacteristic(
+      CompanionProtocol::HOST_DESKTOP_STATE_UUID, stateProperties, CompanionProtocol::DESKTOP_STATE_MAX_LEN);
   buttonEventCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::BUTTON_EVENT_UUID,
-                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY, 9);
+                                    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY,
+                                    CompanionProtocol::BUTTON_EVENT_PAYLOAD_LEN);
   participationCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::CONNECTION_PARTICIPATION_UUID,
                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY, 5);
@@ -280,7 +362,7 @@ bool CompanionBleService::begin() {
   if (!hostTeamsStateCharacteristic_ || !hostMeetingStateCharacteristic_ || !hostMeetingNameCharacteristic_ ||
       !hostMicrophoneStateCharacteristic_ || !hostCameraStateCharacteristic_ || !hostHandStateCharacteristic_ ||
       !hostStatusMessageCharacteristic_ || !buttonEventCharacteristic_ || !participationCharacteristic_ ||
-      !deviceInfoCharacteristic_) {
+      !deviceInfoCharacteristic_ || !hostDesktopStateCharacteristic_) {
     logPrintf("Companion BLE: failed to create characteristics\n");
     end();
     return false;
@@ -293,6 +375,7 @@ bool CompanionBleService::begin() {
   hostCameraStateCharacteristic_->setCallbacks(&cameraStateCallbacks);
   hostHandStateCharacteristic_->setCallbacks(&handStateCallbacks);
   hostStatusMessageCharacteristic_->setCallbacks(&statusMessageCallbacks);
+  hostDesktopStateCharacteristic_->setCallbacks(&desktopStateCallbacks);
   buttonEventCharacteristic_->setCallbacks(&buttonEventCallbacks);
   participationCharacteristic_->setCallbacks(&participationCallbacks);
 
@@ -359,6 +442,7 @@ void CompanionBleService::end() {
   hostCameraStateCharacteristic_ = nullptr;
   hostHandStateCharacteristic_ = nullptr;
   hostStatusMessageCharacteristic_ = nullptr;
+  hostDesktopStateCharacteristic_ = nullptr;
   buttonEventCharacteristic_ = nullptr;
   participationCharacteristic_ = nullptr;
   deviceInfoCharacteristic_ = nullptr;
@@ -408,6 +492,13 @@ CompanionBleService::HostStatus CompanionBleService::getHostStatus() const {
   return status;
 }
 
+CompanionBleService::DesktopStatus CompanionBleService::getDesktopStatus() const {
+  lockState();
+  const DesktopStatus status = desktopStatus_;
+  unlockState();
+  return status;
+}
+
 CompanionBleService::PendingButtonStatus CompanionBleService::getPendingButtonStatus() const {
   lockState();
   const PendingButtonStatus status = pendingButtons_;
@@ -443,7 +534,7 @@ bool CompanionBleService::notifyToggleMuteReleased(uint16_t* counter) {
   }
 
   return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleMute),
-                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), counter);
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), 0, counter);
 }
 
 bool CompanionBleService::notifyToggleHandReleased(uint16_t* counter) {
@@ -457,7 +548,7 @@ bool CompanionBleService::notifyToggleHandReleased(uint16_t* counter) {
   }
 
   return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleHand),
-                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), counter);
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), 0, counter);
 }
 
 bool CompanionBleService::notifyToggleCameraReleased(uint16_t* counter) {
@@ -471,7 +562,42 @@ bool CompanionBleService::notifyToggleCameraReleased(uint16_t* counter) {
   }
 
   return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::ToggleCamera),
-                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), counter);
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), 0, counter);
+}
+
+bool CompanionBleService::notifyReactionReleased(CompanionProtocol::ButtonId reaction, uint16_t* counter) {
+  if (!CompanionProtocol::isReactionButton(static_cast<uint8_t>(reaction))) return false;
+
+  lockState();
+  const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
+  unlockState();
+  if (!ready) {
+    logPrintf("Companion BLE: reaction event skipped id=%u\n", static_cast<unsigned>(reaction));
+    return false;
+  }
+
+  return publishButtonEvent(static_cast<uint8_t>(reaction),
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), 0, counter);
+}
+
+bool CompanionBleService::notifySwitchDesktopReleased(uint8_t desktopIndex, uint16_t* counter) {
+  lockState();
+  const bool ready = running_ && hostConnected_ && buttonEventCharacteristic_ && buttonEventSubscribed_;
+  const bool knownDesktop = desktopStatus_.valid && desktopIndex < desktopStatus_.count;
+  const bool alreadyActive = knownDesktop && desktopStatus_.activeIndex == desktopIndex;
+  unlockState();
+  if (!ready || !knownDesktop) {
+    logPrintf("Companion BLE: desktop switch skipped index=%u ready=%d known=%d\n",
+              static_cast<unsigned>(desktopIndex), ready ? 1 : 0, knownDesktop ? 1 : 0);
+    return false;
+  }
+  if (alreadyActive) {
+    logPrintf("Companion BLE: desktop switch skipped; index=%u already active\n", static_cast<unsigned>(desktopIndex));
+    return false;
+  }
+
+  return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::SwitchDesktop),
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), desktopIndex, counter);
 }
 
 void CompanionBleService::onHostConnected(uint16_t connHandle) {
@@ -789,6 +915,53 @@ void CompanionBleService::onHostStatusMessageWritten(NimBLECharacteristic* chara
   requestIdleConnectionParamsIfReady("message_state");
 }
 
+void CompanionBleService::onHostDesktopStateWritten(NimBLECharacteristic* characteristic) {
+  lockState();
+  StatusChangedCallback callback = nullptr;
+  activityStats_.hostWrites++;
+  if (!characteristic) {
+    unlockState();
+    return;
+  }
+
+  const std::string value = characteristic->getValue();
+  DesktopStatus next;
+  uint16_t ackSequence = CompanionProtocol::DESKTOP_ACK_NONE;
+  if (!decodeDesktopState(value, &next, &ackSequence)) {
+    unlockState();
+    return;
+  }
+
+  // The host echoes the sequence of the switch it finished handling, so a request settles here
+  // whether or not it actually landed on the requested desktop.
+  const bool acknowledged = pendingButtons_.desktopPending &&
+                            ackSequence != CompanionProtocol::DESKTOP_ACK_NONE &&
+                            ackSequence == pendingButtons_.desktopCounter;
+  const bool changed = !desktopStatusEquals(desktopStatus_, next) || acknowledged;
+  const bool firstStateWrite = !hostStateReceived_;
+  desktopStatus_ = next;
+  if (acknowledged) {
+    const uint32_t latencyMs = millis() - pendingButtons_.desktopPressedAtMs;
+    const bool landed = next.activeIndex == pendingButtons_.desktopTargetIndex;
+    pendingButtons_.desktopPending = false;
+    pendingButtons_.lastAcknowledgedValid = true;
+    pendingButtons_.lastAcknowledgedButtonId = static_cast<uint8_t>(CompanionProtocol::ButtonId::SwitchDesktop);
+    pendingButtons_.lastAcknowledgedCounter = pendingButtons_.desktopCounter;
+    pendingButtons_.lastAcknowledgedLatencyMs = latencyMs;
+    logPrintf("Companion BLE: desktop switch seq=%u acknowledged landed=%d roundtripMs=%lu\n",
+              static_cast<unsigned>(pendingButtons_.desktopCounter), landed ? 1 : 0,
+              static_cast<unsigned long>(latencyMs));
+  }
+  hostStateReceived_ = true;
+  if (changed || firstStateWrite) {
+    activityStats_.hostStateChanges++;
+    callback = markStatusChangedLocked();
+  }
+  unlockState();
+  notifyStatusChanged(callback);
+  requestIdleConnectionParamsIfReady("desktop_state");
+}
+
 void CompanionBleService::onButtonEventSubscribed(bool subscribed) {
   lockState();
   buttonEventSubscribed_ = subscribed;
@@ -808,6 +981,38 @@ void CompanionBleService::onParticipationSubscribed(bool subscribed) {
   notifyStatusChanged(callback);
 }
 
+CompanionBleService::StatusChangedCallback CompanionBleService::settlePendingButtonsLocked(unsigned long now) {
+  bool settled = false;
+  if (pendingButtons_.mutePending &&
+      now - pendingButtons_.mutePressedAtMs > CompanionProtocol::STATE_PENDING_TIMEOUT_MS) {
+    pendingButtons_.mutePending = false;
+    settled = true;
+  }
+  if (pendingButtons_.cameraPending &&
+      now - pendingButtons_.cameraPressedAtMs > CompanionProtocol::STATE_PENDING_TIMEOUT_MS) {
+    pendingButtons_.cameraPending = false;
+    settled = true;
+  }
+  if (pendingButtons_.handPending &&
+      now - pendingButtons_.handPressedAtMs > CompanionProtocol::STATE_PENDING_TIMEOUT_MS) {
+    pendingButtons_.handPending = false;
+    settled = true;
+  }
+  // Reactions have no state coming back, so they are held for a minimum time to stay
+  // visible, then cleared once transmitted. The timeout is the fallback if the handover
+  // never confirms.
+  if (pendingButtons_.reactionPending) {
+    const uint32_t heldMs = static_cast<uint32_t>(now - pendingButtons_.reactionPressedAtMs);
+    const bool minimumShown = heldMs >= CompanionProtocol::REACTION_MIN_PRESSED_MS;
+    const bool timedOut = heldMs > CompanionProtocol::STATE_PENDING_TIMEOUT_MS;
+    if ((pendingButtons_.reactionTransmitted && minimumShown) || timedOut) {
+      pendingButtons_.reactionPending = false;
+      settled = true;
+    }
+  }
+  return settled ? markStatusChangedLocked() : nullptr;
+}
+
 void CompanionBleService::update() {
   lockState();
   if (!running_) {
@@ -817,7 +1022,12 @@ void CompanionBleService::update() {
 
   activityStats_.updateCalls++;
   const bool shouldCheckParticipation = hostConnected_ && participationSubscribed_ && participationUntilMs_ != 0;
+  // Pressed styling has to settle on its own schedule, so it is checked every tick rather
+  // than on the much slower maintenance interval.
+  const StatusChangedCallback settleCallback = settlePendingButtonsLocked(millis());
   unlockState();
+
+  notifyStatusChanged(settleCallback);
 
   if (shouldCheckParticipation) {
     publishParticipationEventIfDue();
@@ -839,11 +1049,26 @@ void CompanionBleService::update() {
   activityStats_.maintenanceRuns++;
   const bool connected = hostConnected_;
   const bool responsiveDue = responsiveUntilMs_ != 0 && static_cast<long>(now - responsiveUntilMs_) >= 0;
+  // A host that never answers a switch request must not leave the page stuck on "pressed".
+  bool desktopSwitchTimedOut = false;
+  if (pendingButtons_.desktopPending &&
+      now - pendingButtons_.desktopPressedAtMs > CompanionProtocol::DESKTOP_SWITCH_TIMEOUT_MS) {
+    pendingButtons_.desktopPending = false;
+    desktopSwitchTimedOut = true;
+  }
+  // A toggle whose new state is never echoed back must still settle; that is handled every
+  // tick by settlePendingButtonsLocked().
   const bool hostSubscribed = buttonEventSubscribed_ || participationSubscribed_;
   const bool staleHandshake = hostConnectedAtMs_ != 0 && !hostStateReceived_ && !hostSubscribed &&
                               now - hostConnectedAtMs_ > kHandshakeTimeoutMs && server_;
   const uint16_t staleHandle = hostConnHandle_;
+  const StatusChangedCallback timeoutCallback = desktopSwitchTimedOut ? markStatusChangedLocked() : nullptr;
   unlockState();
+
+  if (desktopSwitchTimedOut) {
+    logPrintf("Companion BLE: desktop switch request timed out\n");
+    notifyStatusChanged(timeoutCallback);
+  }
 
   if (!connected) {
     NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
@@ -890,6 +1115,7 @@ void CompanionBleService::resetSessionState() {
   hasNegotiatedConnParams_ = false;
   bluetoothSessionRenderBaseline_ = 0;
   hostStatus_ = HostStatus{};
+  desktopStatus_ = DesktopStatus{};
   pendingButtons_ = PendingButtonStatus{};
   unlockState();
 }
@@ -982,6 +1208,7 @@ void CompanionBleService::publishHostStateValues() {
                        hostStatus_.hand == static_cast<uint8_t>(CompanionProtocol::TriState::On),
                        hostStatus_.handCounter, hostStatus_.handLocked);
   if (hostStatusMessageCharacteristic_) hostStatusMessageCharacteristic_->setValue(hostStatus_.message);
+  if (hostDesktopStateCharacteristic_) hostDesktopStateCharacteristic_->setValue(encodeDesktopState(desktopStatus_));
   unlockState();
 }
 
@@ -995,7 +1222,7 @@ void CompanionBleService::publishDeviceInfo() {
   deviceInfoCharacteristic_->setValue(payload, sizeof(payload));
 }
 
-bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, uint16_t* counter) {
+bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, uint8_t argument, uint16_t* counter) {
   if (!buttonEventCharacteristic_) return false;
 
   lockState();
@@ -1017,6 +1244,16 @@ bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, u
     pendingButtons_.cameraPending = true;
     pendingButtons_.cameraCounter = sequence;
     pendingButtons_.cameraPressedAtMs = now;
+  } else if (buttonId == static_cast<uint8_t>(CompanionProtocol::ButtonId::SwitchDesktop)) {
+    pendingButtons_.desktopPending = true;
+    pendingButtons_.desktopCounter = sequence;
+    pendingButtons_.desktopPressedAtMs = now;
+    pendingButtons_.desktopTargetIndex = argument;
+  } else if (CompanionProtocol::isReactionButton(buttonId)) {
+    pendingButtons_.reactionPending = true;
+    pendingButtons_.reactionTransmitted = false;
+    pendingButtons_.reactionButtonId = buttonId;
+    pendingButtons_.reactionPressedAtMs = now;
   }
   const StatusChangedCallback pendingCallback = markStatusChangedLocked();
   unlockState();
@@ -1034,19 +1271,31 @@ bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, u
       static_cast<uint8_t>((uptimeMs >> 8) & 0xFF),
       static_cast<uint8_t>((uptimeMs >> 16) & 0xFF),
       static_cast<uint8_t>((uptimeMs >> 24) & 0xFF),
+      argument,
   };
-  logPrintf("Companion BLE: publishing button event id=%u action=%u seq=%u uptimeMs=%lu\n",
+  static_assert(sizeof(payload) == CompanionProtocol::BUTTON_EVENT_PAYLOAD_LEN, "button event payload size mismatch");
+  logPrintf("Companion BLE: publishing button event id=%u action=%u seq=%u arg=%u uptimeMs=%lu\n",
             static_cast<unsigned>(buttonId), static_cast<unsigned>(action), static_cast<unsigned>(sequence),
-            static_cast<unsigned long>(uptimeMs));
+            static_cast<unsigned>(argument), static_cast<unsigned long>(uptimeMs));
   buttonEventCharacteristic_->setValue(payload, sizeof(payload));
-  buttonEventCharacteristic_->notify();
+  const bool notified = buttonEventCharacteristic_->notify();
   if (counter) {
     *counter = sequence;
   }
   lockState();
   activityStats_.buttonNotifications++;
+  // A reaction has no state to come back, so the handover itself is the confirmation. The
+  // pressed styling is not dropped here: settlePendingButtonsLocked() holds it briefly so it
+  // does not vanish before the panel has drawn it.
+  if (pendingButtons_.reactionPending && pendingButtons_.reactionButtonId == buttonId && notified) {
+    pendingButtons_.reactionTransmitted = true;
+  }
   const StatusChangedCallback callback = markStatusChangedLocked();
   unlockState();
+  if (!notified) {
+    logPrintf("Companion BLE: button notify failed id=%u seq=%u\n", static_cast<unsigned>(buttonId),
+              static_cast<unsigned>(sequence));
+  }
   notifyStatusChanged(callback);
   publishParticipationEventIfDue();
   return true;

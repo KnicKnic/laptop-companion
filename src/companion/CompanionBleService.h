@@ -1,5 +1,7 @@
 #pragma once
 
+#include "CompanionProtocol.h"
+
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -37,6 +39,19 @@ class CompanionBleService {
     std::string message;
   };
 
+  struct DesktopInfo {
+    std::string name;
+    bool remote = false;
+    bool disconnected = false;
+  };
+
+  struct DesktopStatus {
+    bool valid = false;
+    uint8_t count = 0;
+    uint8_t activeIndex = CompanionProtocol::DESKTOP_INDEX_UNKNOWN;
+    DesktopInfo desktops[CompanionProtocol::DESKTOP_MAX_COUNT];
+  };
+
   struct PendingButtonStatus {
     bool mutePending = false;
     uint16_t muteCounter = 0;
@@ -47,6 +62,17 @@ class CompanionBleService {
     bool cameraPending = false;
     uint16_t cameraCounter = 0;
     uint32_t cameraPressedAtMs = 0;
+    bool desktopPending = false;
+    uint16_t desktopCounter = 0;
+    uint32_t desktopPressedAtMs = 0;
+    uint8_t desktopTargetIndex = CompanionProtocol::DESKTOP_INDEX_UNKNOWN;
+    // Reactions carry no state, so this only spans the BLE handover plus a short minimum
+    // hold: it is set as the press is published and cleared once the notification has gone
+    // out and the styling has been visible long enough to see.
+    bool reactionPending = false;
+    bool reactionTransmitted = false;
+    uint8_t reactionButtonId = 0;
+    uint32_t reactionPressedAtMs = 0;
     bool lastAcknowledgedValid = false;
     uint8_t lastAcknowledgedButtonId = 0;
     uint16_t lastAcknowledgedCounter = 0;
@@ -86,8 +112,11 @@ class CompanionBleService {
   bool notifyToggleMuteReleased(uint16_t* counter = nullptr);
   bool notifyToggleHandReleased(uint16_t* counter = nullptr);
   bool notifyToggleCameraReleased(uint16_t* counter = nullptr);
+  bool notifySwitchDesktopReleased(uint8_t desktopIndex, uint16_t* counter = nullptr);
+  bool notifyReactionReleased(CompanionProtocol::ButtonId reaction, uint16_t* counter = nullptr);
   std::string getStatusText() const;
   HostStatus getHostStatus() const;
+  DesktopStatus getDesktopStatus() const;
   PendingButtonStatus getPendingButtonStatus() const;
   ActivityStats getActivityStats() const;
   uint32_t getBluetoothSessionRenderRequests() const;
@@ -104,6 +133,7 @@ class CompanionBleService {
   void onHostCameraStateWritten(NimBLECharacteristic* characteristic);
   void onHostHandStateWritten(NimBLECharacteristic* characteristic);
   void onHostStatusMessageWritten(NimBLECharacteristic* characteristic);
+  void onHostDesktopStateWritten(NimBLECharacteristic* characteristic);
   void onButtonEventSubscribed(bool subscribed);
   void onParticipationSubscribed(bool subscribed);
 
@@ -113,11 +143,12 @@ class CompanionBleService {
   void resetSessionState();
   void publishHostStateValues();
   void publishDeviceInfo();
-  bool publishButtonEvent(uint8_t buttonId, uint8_t action, uint16_t* counter);
+  bool publishButtonEvent(uint8_t buttonId, uint8_t action, uint8_t argument, uint16_t* counter);
   void publishParticipationEventIfDue();
   void requestConnectionParams(ConnectionPowerProfile profile, const char* reason);
   void requestIdleConnectionParamsIfReady(const char* reason);
   bool restartAdvertising(const char* reason);
+  StatusChangedCallback settlePendingButtonsLocked(unsigned long now);
   StatusChangedCallback markStatusChangedLocked();
   void markStatusChanged();
   void notifyStatusChanged(StatusChangedCallback callback) const;
@@ -137,6 +168,7 @@ class CompanionBleService {
   NimBLECharacteristic* hostCameraStateCharacteristic_ = nullptr;
   NimBLECharacteristic* hostHandStateCharacteristic_ = nullptr;
   NimBLECharacteristic* hostStatusMessageCharacteristic_ = nullptr;
+  NimBLECharacteristic* hostDesktopStateCharacteristic_ = nullptr;
   NimBLECharacteristic* buttonEventCharacteristic_ = nullptr;
   NimBLECharacteristic* participationCharacteristic_ = nullptr;
   NimBLECharacteristic* deviceInfoCharacteristic_ = nullptr;
@@ -174,6 +206,7 @@ class CompanionBleService {
   uint32_t participationCounter_ = 0;
   uint32_t bluetoothSessionRenderBaseline_ = 0;
   HostStatus hostStatus_;
+  DesktopStatus desktopStatus_;
   PendingButtonStatus pendingButtons_;
   ActivityStats activityStats_;
   ActivityStats previousActivityStats_;

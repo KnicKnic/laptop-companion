@@ -13,7 +13,10 @@ namespace X3LaptopCompanion
         ToggleMute,
         ToggleSpeaker,
         ToggleHand,
-        ToggleVideo
+        ToggleVideo,
+        ReactLike,
+        ReactHeart,
+        ReactApplause
     }
 
     public sealed class TeamsMeetingSnapshot
@@ -52,6 +55,25 @@ namespace X3LaptopCompanion
         private static readonly string[] MicrophoneButtonNames = { "Mute mic", "Unmute mic" };
         private static readonly string[] CameraButtonNames = { "Turn camera on", "Turn camera off" };
         private static readonly string[] HandButtonNames = { "Raise your hand", "Lower your hand" };
+
+        // Teams replaced the stateful "Raise your hand" / "Lower your hand" pair with a single
+        // button that is always called "Raise" and exposes no state. When only that button is
+        // present the raised state cannot be read back, so it is tracked here and toggled on each
+        // press. The stateful path above is kept and is used automatically whenever Teams exposes
+        // it again, so nothing has to change here if the product reverts.
+        private const string SingleHandAutomationId = "raisehands-button";
+        private static readonly string[] SingleHandButtonNames = { "Raise" };
+
+        // Reactions live behind a flyout. Automation ids are matched first because they are stable
+        // across Teams' UI and language changes; the display names are only a fallback.
+        private const string ReactMenuAutomationId = "reaction-menu-button";
+        private static readonly string[] ReactButtonNames = { "React", "Reactions", "Show reactions" };
+        private const string LikeReactionAutomationId = "like-button";
+        private const string HeartReactionAutomationId = "heart-button";
+        private const string ApplauseReactionAutomationId = "applause-button";
+        private static readonly string[] LikeReactionNames = { "Like" };
+        private static readonly string[] HeartReactionNames = { "Love", "Heart" };
+        private static readonly string[] ApplauseReactionNames = { "Applause", "Applaud", "Clap" };
         private static readonly string[] MeetingButtonNames =
         {
             "Unmute mic",
@@ -59,12 +81,19 @@ namespace X3LaptopCompanion
             "Turn camera off",
             "Turn camera on",
             "Raise your hand",
-            "Lower your hand"
+            "Lower your hand",
+            "Raise"
         };
         private IntPtr cachedMeetingWindowHandle = IntPtr.Zero;
         private int cachedMeetingTargetProcessId;
         private string cachedMeetingTargetProcessName = string.Empty;
         private readonly object cachedMeetingWindowLock = new object();
+
+        // Faked hand state, used only while Teams exposes the stateless "Raise" button. Reset
+        // whenever the meeting changes so a new meeting starts with the hand down.
+        private readonly object trackedHandLock = new object();
+        private bool trackedHandRaised;
+        private bool trackedHandValid;
 
         // Last-known meeting state, held so the companion keeps showing the meeting (and cached camera/hand)
         // while a full-screen Remote Desktop session DWM-cloaks the local Teams window and its UIA tree.
@@ -120,12 +149,37 @@ namespace X3LaptopCompanion
         {
             lock (meetingStateCacheLock)
             {
+                // A different meeting starts with the hand down, so drop any faked state.
+                var name = meetingName ?? string.Empty;
+                if (haveCachedMeetingState &&
+                    !string.Equals(name, lastKnownMeetingName, StringComparison.Ordinal))
+                {
+                    ResetTrackedHand("meeting changed");
+                }
+
                 haveCachedMeetingState = true;
-                lastKnownMeetingName = meetingName ?? string.Empty;
+                lastKnownMeetingName = name;
                 lastKnownMicrophone = microphone;
                 lastKnownCamera = camera;
                 lastKnownHand = hand;
             }
+        }
+
+        /// <summary>Drops the faked hand state used with the stateless "Raise" button.</summary>
+        private void ResetTrackedHand(string reason)
+        {
+            lock (trackedHandLock)
+            {
+                if (!trackedHandValid && !trackedHandRaised)
+                {
+                    return;
+                }
+
+                trackedHandRaised = false;
+                trackedHandValid = false;
+            }
+
+            HostLog.Write("Teams tracked hand state reset. reason=" + reason);
         }
 
         private void ClearMeetingStateCache(string reason)
@@ -294,6 +348,11 @@ namespace X3LaptopCompanion
                 return false;
             }
 
+            if (IsReaction(command))
+            {
+                return TrySendReaction(command, audioProcessIds, explicitTargetProcessId, stopwatch);
+            }
+
             // Prefer the Windows shell mic indicator for mute: it works even while the Teams window is
             // DWM-cloaked by a full-screen Remote Desktop, and it is not a keystroke (so nothing is
             // forwarded to the remote machine). Fall back to the Teams UIA button if it is unavailable.
@@ -307,6 +366,13 @@ namespace X3LaptopCompanion
             if (!TryFindCommandButtonTarget(command, audioProcessIds, explicitTargetProcessId, out var context,
                     out var button))
             {
+                // The raise/lower pair is gone in newer Teams; fall back to the stateless button.
+                if (command == TeamsCommand.ToggleHand &&
+                    TryToggleHandViaSingleButton(audioProcessIds, explicitTargetProcessId, stopwatch))
+                {
+                    return true;
+                }
+
                 HostLog.Write("Teams command failed; no current UIA button was found. command=" +
                     CommandName(command) + " elapsedMs=" + stopwatch.ElapsedMilliseconds);
                 return false;
@@ -336,6 +402,307 @@ namespace X3LaptopCompanion
                 " buttonName=\"" + button.Name + "\" target=" + DescribeTarget(context.Target) +
                 " elapsedMs=" + stopwatch.ElapsedMilliseconds);
             return true;
+        }
+
+        public static bool IsReaction(TeamsCommand command)
+        {
+            return command == TeamsCommand.ReactLike || command == TeamsCommand.ReactHeart ||
+                command == TeamsCommand.ReactApplause;
+        }
+
+        private static IReadOnlyList<string> GetReactionNames(TeamsCommand command)
+        {
+            switch (command)
+            {
+                case TeamsCommand.ReactLike:
+                    return LikeReactionNames;
+                case TeamsCommand.ReactHeart:
+                    return HeartReactionNames;
+                case TeamsCommand.ReactApplause:
+                    return ApplauseReactionNames;
+                default:
+                    return Array.Empty<string>();
+            }
+        }
+
+        /// <summary>
+        /// Toggles the hand with the stateless "Raise" button that replaced the raise/lower pair,
+        /// flipping the locally tracked state so the companion still shows raised or lowered.
+        /// </summary>
+        private bool TryToggleHandViaSingleButton(IReadOnlyCollection<int> audioProcessIds,
+            int? explicitTargetProcessId, Stopwatch stopwatch)
+        {
+            if (!TryFindMeetingWindow(audioProcessIds, explicitTargetProcessId, out var context))
+            {
+                return false;
+            }
+
+            var button = FindButtonByAutomationId(context.Root, SingleHandAutomationId) ??
+                FindButtonByNames(context.Root, SingleHandButtonNames);
+            if (button == null)
+            {
+                return false;
+            }
+
+            if (!TryInvokeButton(button.Element, button.Name))
+            {
+                HostLog.Write("Teams hand toggle failed; stateless button did not invoke. buttonName=\"" +
+                    button.Name + "\"");
+                return false;
+            }
+
+            bool raised;
+            lock (trackedHandLock)
+            {
+                trackedHandRaised = !trackedHandRaised;
+                trackedHandValid = true;
+                raised = trackedHandRaised;
+            }
+
+            HostLog.Write("Teams hand toggled via stateless button. buttonName=\"" + button.Name +
+                "\" trackedRaised=" + raised + " elapsedMs=" + stopwatch.ElapsedMilliseconds);
+            return true;
+        }
+
+        private static string GetReactionAutomationId(TeamsCommand command)
+        {
+            switch (command)
+            {
+                case TeamsCommand.ReactLike:
+                    return LikeReactionAutomationId;
+                case TeamsCommand.ReactHeart:
+                    return HeartReactionAutomationId;
+                case TeamsCommand.ReactApplause:
+                    return ApplauseReactionAutomationId;
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>
+        /// Sends a meeting reaction, which needs two steps: open the React flyout, then pick the
+        /// reaction inside it. The React control is a menu button that only supports
+        /// ExpandCollapse, while the reactions themselves are ordinary invokable buttons.
+        /// </summary>
+        private bool TrySendReaction(TeamsCommand command, IReadOnlyCollection<int> audioProcessIds,
+            int? explicitTargetProcessId, Stopwatch stopwatch)
+        {
+            if (!TryFindMeetingWindow(audioProcessIds, explicitTargetProcessId, out var context))
+            {
+                HostLog.Write("Teams reaction failed; no meeting window. command=" + CommandName(command) +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                return false;
+            }
+
+            var reactButton = FindButtonByAutomationId(context.Root, ReactMenuAutomationId) ??
+                FindButtonByNames(context.Root, ReactButtonNames);
+            if (reactButton == null)
+            {
+                HostLog.Write("Teams reaction failed; no React button found. command=" + CommandName(command) +
+                    " elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                LogVisibleButtons(context.Root, "meeting window");
+                return false;
+            }
+
+            if (!TryOpenFlyout(reactButton))
+            {
+                HostLog.Write("Teams reaction failed; React menu would not open. command=" + CommandName(command) +
+                    " buttonName=\"" + reactButton.Name + "\"");
+                return false;
+            }
+
+            var automationId = GetReactionAutomationId(command);
+            var names = GetReactionNames(command);
+            for (var attempt = 0; attempt < 25; attempt++)
+            {
+                System.Threading.Thread.Sleep(80);
+
+                // The flyout is a popup, so it may not be a descendant of the meeting window.
+                var reaction = FindButtonByAutomationId(context.Root, automationId) ??
+                    FindButtonByAutomationId(AutomationElement.RootElement, automationId) ??
+                    FindButtonByNames(context.Root, names) ??
+                    FindButtonByNames(AutomationElement.RootElement, names);
+                if (reaction == null)
+                {
+                    continue;
+                }
+
+                var invoked = TryInvokeButton(reaction.Element, reaction.Name);
+                CloseFlyout(reactButton);
+                if (!invoked)
+                {
+                    HostLog.Write("Teams reaction failed; reaction did not invoke. command=" + CommandName(command) +
+                        " buttonName=\"" + reaction.Name + "\"");
+                    return false;
+                }
+
+                HostLog.Write("Teams reaction sent. command=" + CommandName(command) +
+                    " buttonName=\"" + reaction.Name + "\" elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                return true;
+            }
+
+            HostLog.Write("Teams reaction failed; reaction not found in flyout. command=" + CommandName(command) +
+                " automationId=" + automationId + " names=" + string.Join("|", names) +
+                " elapsedMs=" + stopwatch.ElapsedMilliseconds);
+            LogVisibleButtons(AutomationElement.RootElement, "reaction flyout");
+            CloseFlyout(reactButton);
+            return false;
+        }
+
+        private static bool TryOpenFlyout(ButtonInfo button)
+        {
+            try
+            {
+                if (button.Element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expandPattern))
+                {
+                    ((ExpandCollapsePattern)expandPattern).Expand();
+                    return true;
+                }
+
+                // Older builds exposed the React control as a plain button.
+                return TryInvokeButton(button.Element, button.Name);
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("Teams reaction flyout open failed. buttonName=\"" + button.Name + "\" error=" +
+                    ex.Message);
+                return false;
+            }
+        }
+
+        private static void CloseFlyout(ButtonInfo button)
+        {
+            try
+            {
+                if (button.Element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expandPattern))
+                {
+                    ((ExpandCollapsePattern)expandPattern).Collapse();
+                }
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("Teams reaction flyout close failed. error=" + ex.Message);
+            }
+        }
+
+        private static ButtonInfo FindButtonByAutomationId(AutomationElement root, string automationId)
+        {
+            if (root == null || string.IsNullOrEmpty(automationId))
+            {
+                return null;
+            }
+
+            try
+            {
+                var condition = new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, automationId));
+                var found = root.FindFirst(TreeScope.Descendants, condition);
+                if (found != null)
+                {
+                    return new ButtonInfo(found, SafeName(found), automationId);
+                }
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("Teams UIA id search failed. id=" + automationId + " error=" + ex.Message);
+            }
+
+            return null;
+        }
+
+        private static ButtonInfo FindButtonByNames(AutomationElement root, IReadOnlyList<string> names)
+        {
+            if (root == null || names == null || names.Count == 0)
+            {
+                return null;
+            }
+
+            foreach (var name in names)
+            {
+                try
+                {
+                    var condition = new AndCondition(
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+                        new PropertyCondition(AutomationElement.NameProperty, name));
+                    var found = root.FindFirst(TreeScope.Descendants, condition);
+                    if (found != null)
+                    {
+                        return new ButtonInfo(found, name, SafeAutomationId(found));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    HostLog.Write("Teams UIA button search failed. name=\"" + name + "\" error=" + ex.Message);
+                }
+            }
+
+            return null;
+        }
+
+        private static string SafeName(AutomationElement element)
+        {
+            try
+            {
+                return element.Current.Name;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static string SafeAutomationId(AutomationElement element)
+        {
+            try
+            {
+                return element.Current.AutomationId;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static void LogVisibleButtons(AutomationElement root, string where)
+        {
+            if (root == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var buttons = root.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button));
+                var names = new List<string>();
+                foreach (AutomationElement button in buttons)
+                {
+                    try
+                    {
+                        var name = button.Current.Name;
+                        if (!string.IsNullOrWhiteSpace(name))
+                        {
+                            names.Add(name);
+                        }
+                    }
+                    catch
+                    {
+                        // Element vanished mid-enumeration.
+                    }
+
+                    if (names.Count >= 80)
+                    {
+                        break;
+                    }
+                }
+
+                HostLog.Write("Teams UIA buttons in " + where + ": " + string.Join(" | ", names));
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("Teams UIA button dump failed for " + where + ".", ex);
+            }
         }
 
         public TeamsMeetingSnapshot GetMeetingSnapshot(IReadOnlyCollection<int> audioProcessIds,
@@ -410,6 +777,12 @@ namespace X3LaptopCompanion
                     return "Raise/lower hand";
                 case TeamsCommand.ToggleVideo:
                     return "Toggle video";
+                case TeamsCommand.ReactLike:
+                    return "React like";
+                case TeamsCommand.ReactHeart:
+                    return "React heart";
+                case TeamsCommand.ReactApplause:
+                    return "React applause";
                 default:
                     return command.ToString();
             }
@@ -435,14 +808,49 @@ namespace X3LaptopCompanion
             return controls.TurnCameraOnButton != null ? CompanionTriState.Off : CompanionTriState.Unknown;
         }
 
-        private static CompanionTriState GetHandState(MeetingControls controls)
+        private CompanionTriState GetHandState(MeetingControls controls)
         {
+            // Preferred path: Teams names the button after the action it will perform, so the
+            // pair tells us the current state directly.
             if (controls.LowerHandButton != null)
             {
+                lock (trackedHandLock)
+                {
+                    trackedHandRaised = true;
+                    trackedHandValid = true;
+                }
+
                 return CompanionTriState.On;
             }
 
-            return controls.RaiseHandButton != null ? CompanionTriState.Off : CompanionTriState.Unknown;
+            if (controls.RaiseHandButton != null)
+            {
+                lock (trackedHandLock)
+                {
+                    trackedHandRaised = false;
+                    trackedHandValid = true;
+                }
+
+                return CompanionTriState.Off;
+            }
+
+            // Fallback: only the stateless "Raise" button exists, so report what we last set. A
+            // meeting starts with the hand down, which is the seed used until something is pressed.
+            if (controls.SingleHandButton != null)
+            {
+                lock (trackedHandLock)
+                {
+                    if (!trackedHandValid)
+                    {
+                        trackedHandRaised = false;
+                        trackedHandValid = true;
+                    }
+
+                    return trackedHandRaised ? CompanionTriState.On : CompanionTriState.Off;
+                }
+            }
+
+            return CompanionTriState.Unknown;
         }
 
         private static string ExtractMeetingName(string windowName)
@@ -918,6 +1326,11 @@ namespace X3LaptopCompanion
             else if (NameEquals(button.Name, "Lower your hand"))
             {
                 controls.LowerHandButton = button;
+            }
+            else if (NameEquals(button.Name, "Raise"))
+            {
+                // Stateless replacement for the raise/lower pair.
+                controls.SingleHandButton = button;
             }
 
             if (string.IsNullOrEmpty(controls.AnchorButtonName))
@@ -1460,6 +1873,7 @@ namespace X3LaptopCompanion
             public ButtonInfo TurnCameraOffButton { get; set; }
             public ButtonInfo RaiseHandButton { get; set; }
             public ButtonInfo LowerHandButton { get; set; }
+            public ButtonInfo SingleHandButton { get; set; }
             public int NodesVisited { get; set; }
             public long FindMs { get; set; }
             public string AnchorButtonName { get; set; }
@@ -1474,7 +1888,8 @@ namespace X3LaptopCompanion
                         TurnCameraOnButton != null ||
                         TurnCameraOffButton != null ||
                         RaiseHandButton != null ||
-                        LowerHandButton != null;
+                        LowerHandButton != null ||
+                        SingleHandButton != null;
                 }
             }
 

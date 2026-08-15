@@ -26,6 +26,7 @@ namespace X3LaptopCompanion
         private GattCharacteristic hostMeetingStateCharacteristic;
         private GattCharacteristic hostHandStateCharacteristic;
         private GattCharacteristic hostMeetingNameCharacteristic;
+        private GattCharacteristic hostDesktopStateCharacteristic;
         private GattCharacteristic buttonEventCharacteristic;
         private GattCharacteristic participationCharacteristic;
         private GattCharacteristic deviceInfoCharacteristic;
@@ -264,8 +265,85 @@ namespace X3LaptopCompanion
             return status;
         }
 
-        private async void OnDeviceAdded(DeviceWatcher sender, DeviceInformation args)
+        public async Task<bool> SendDesktopStateAsync(CompanionDesktopState desktops)
         {
+            if (desktops == null)
+            {
+                return false;
+            }
+
+            if (!await hostStateWriteLock.WaitAsync(0))
+            {
+                HostLog.Write("Desktop state skipped; previous BLE write is still pending.");
+                return false;
+            }
+
+            try
+            {
+                var characteristic = hostDesktopStateCharacteristic;
+                if (characteristic == null)
+                {
+                    HostLog.Write("Desktop state skipped; characteristic is not available.");
+                    return false;
+                }
+
+                var payload = CompanionProtocol.EncodeDesktopState(desktops, MaxWritePayloadBytes());
+                var writer = new DataWriter
+                {
+                    ByteOrder = ByteOrder.LittleEndian
+                };
+                writer.WriteBytes(payload);
+                var buffer = writer.DetachBuffer();
+                var status = await characteristic.WriteValueAsync(buffer, GattWriteOption.WriteWithoutResponse);
+                HostLog.Write("Desktop state write status=" + status + " bytes=" + buffer.Length +
+                    " desktops=" + desktops.Describe());
+                if (status != GattCommunicationStatus.Success)
+                {
+                    ResetGattState();
+                    RestartAdvertisementWatcherIfNeeded("desktop state write failed");
+                    PublishStatus(false, "Desktop state write failed.");
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("Desktop state write failed with exception.", ex);
+                ResetGattState();
+                RestartAdvertisementWatcherIfNeeded("desktop state write exception");
+                PublishStatus(false, "Desktop state write exception: " + ex.Message);
+                return false;
+            }
+            finally
+            {
+                hostStateWriteLock.Release();
+            }
+        }
+
+        private int MaxWritePayloadBytes()
+        {
+            const int fallback = 20;
+            var session = gattSession;
+            if (session == null)
+            {
+                return fallback;
+            }
+
+            try
+            {
+                // WriteWithoutResponse can carry MaxPduSize minus the 3 byte ATT header.
+                var usable = session.MaxPduSize - 3;
+                return usable < fallback ? fallback : usable;
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("GATT MTU lookup failed; using conservative payload size.", ex);
+                return fallback;
+            }
+        }
+
+        private async void OnDeviceAdded(DeviceWatcher sender, DeviceInformation args)        {
             HostLog.Write("BLE device added. Name=" + args.Name + " IsPaired=" + args.Pairing.IsPaired + " Id=" + args.Id);
             if (IsConnected())
             {
@@ -573,6 +651,7 @@ namespace X3LaptopCompanion
             hostMeetingStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingStateUuid, "host meeting state");
             hostHandStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostHandStateUuid, "host hand state");
             hostMeetingNameCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingNameUuid, "host meeting name");
+            hostDesktopStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostDesktopStateUuid, "host desktop state");
             buttonEventCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.ButtonEventUuid, "button event");
             participationCharacteristic = await GetCharacteristicAsync(service,
                 CompanionProtocol.ConnectionParticipationUuid, "connection participation");
@@ -581,6 +660,7 @@ namespace X3LaptopCompanion
             if (hostTeamsStateCharacteristic == null || hostMicrophoneStateCharacteristic == null ||
                 hostCameraStateCharacteristic == null || hostStatusMessageCharacteristic == null ||
                 hostMeetingStateCharacteristic == null || hostMeetingNameCharacteristic == null ||
+                hostDesktopStateCharacteristic == null ||
                 hostHandStateCharacteristic == null || buttonEventCharacteristic == null ||
                 participationCharacteristic == null || deviceInfoCharacteristic == null)
             {
@@ -590,6 +670,7 @@ namespace X3LaptopCompanion
                     " message=" + (hostStatusMessageCharacteristic != null) +
                     " meeting=" + (hostMeetingStateCharacteristic != null) +
                     " meetingName=" + (hostMeetingNameCharacteristic != null) +
+                    " desktops=" + (hostDesktopStateCharacteristic != null) +
                     " hand=" + (hostHandStateCharacteristic != null) +
                     " button=" + (buttonEventCharacteristic != null) +
                     " participation=" + (participationCharacteristic != null) +
@@ -617,6 +698,7 @@ namespace X3LaptopCompanion
                 " message=" + hostStatusMessageCharacteristic.CharacteristicProperties +
                 " meeting=" + hostMeetingStateCharacteristic.CharacteristicProperties +
                 " meetingName=" + hostMeetingNameCharacteristic.CharacteristicProperties +
+                " desktops=" + hostDesktopStateCharacteristic.CharacteristicProperties +
                 " hand=" + hostHandStateCharacteristic.CharacteristicProperties +
                 " button=" + buttonEventCharacteristic.CharacteristicProperties +
                 " participation=" + participationCharacteristic.CharacteristicProperties +
@@ -754,6 +836,7 @@ namespace X3LaptopCompanion
             hostMeetingStateCharacteristic = null;
             hostHandStateCharacteristic = null;
             hostMeetingNameCharacteristic = null;
+            hostDesktopStateCharacteristic = null;
             companionService?.Dispose();
             companionService = null;
             if (gattSession != null)
@@ -848,7 +931,7 @@ namespace X3LaptopCompanion
         {
             var reader = DataReader.FromBuffer(args.CharacteristicValue);
             reader.ByteOrder = ByteOrder.LittleEndian;
-            if (reader.UnconsumedBufferLength < 9)
+            if (reader.UnconsumedBufferLength < CompanionProtocol.ButtonEventPayloadLength)
             {
                 HostLog.Write("Button event notification ignored; payload too short.");
                 return;
@@ -859,6 +942,7 @@ namespace X3LaptopCompanion
             var action = reader.ReadByte();
             var sequence = reader.ReadUInt16();
             var uptimeMs = reader.ReadUInt32();
+            var argument = reader.ReadByte();
 
             if (version != CompanionProtocol.ProtocolVersion)
             {
@@ -876,9 +960,10 @@ namespace X3LaptopCompanion
             }
 
             HostLog.Write("Button event received. seq=" + sequence + " button=" + button +
-                " action=" + action + " uptimeMs=" + uptimeMs + " hostReceivedAt=" + DateTimeOffset.Now);
+                " action=" + action + " argument=" + argument + " uptimeMs=" + uptimeMs +
+                " hostReceivedAt=" + DateTimeOffset.Now);
             ButtonEventReceived?.Invoke(this, new CompanionButtonEvent((CompanionButton)button,
-                (CompanionButtonAction)action, sequence, uptimeMs));
+                (CompanionButtonAction)action, sequence, uptimeMs, argument));
         }
 
         private void OnParticipationValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)

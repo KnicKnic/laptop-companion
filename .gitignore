@@ -12,3 +12,4 @@ tools/
 freeink-sd-shared-spi-fix/
 laptop_host/bin/
 laptop_host/obj/
+laptop_host/.vs/

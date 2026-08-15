@@ -6,11 +6,12 @@
         xmlns:local="clr-namespace:X3LaptopCompanion"
         mc:Ignorable="d"
         Title="X3 Laptop Companion"
-        Height="720"
-        Width="620"
-        MinHeight="700"
-        MinWidth="560"
-        WindowStartupLocation="CenterScreen">
+        Height="820"
+        Width="780"
+        MinHeight="560"
+        MinWidth="720"
+        WindowStartupLocation="CenterScreen"
+        SizeToContent="Manual">
     <Grid Margin="24">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -40,6 +41,7 @@
                     <ColumnDefinition Width="*" />
                 </Grid.ColumnDefinitions>
                 <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
@@ -81,10 +83,17 @@
 
                 <TextBlock Grid.Row="9" Text="Participation" Margin="0,8,0,0" FontWeight="SemiBold" />
                 <TextBlock Grid.Row="9" Grid.Column="1" Margin="0,8,0,0" Text="{Binding ParticipationText}" />
+
+                <TextBlock Grid.Row="10" Text="Desktops" Margin="0,8,0,0" FontWeight="SemiBold" />
+                <TextBlock Grid.Row="10" Grid.Column="1" Margin="0,8,0,0" TextWrapping="Wrap"
+                           Text="{Binding DesktopText}" />
             </Grid>
         </Border>
 
-        <StackPanel Grid.Row="2">
+        <ScrollViewer Grid.Row="2"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
+        <StackPanel>
             <CheckBox Content="Test mode"
                       IsChecked="{Binding IsTestMode, Mode=TwoWay}"
                       Margin="0,0,0,8" />
@@ -143,6 +152,7 @@
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
                     <CheckBox Content="{Binding TestTeamsToggleText}"
@@ -190,6 +200,7 @@
                        TextWrapping="Wrap"
                        Foreground="#333333" />
         </StackPanel>
+        </ScrollViewer>
 
         <StackPanel Grid.Row="3"
                     Orientation="Horizontal"

@@ -10,3 +10,6 @@ video_off = video-off
 radio_tower = radio-tower
 activity = activity
 lock = lock
+thumbs_up = thumbs-up
+heart = heart
+clap = sparkles

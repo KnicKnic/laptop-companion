@@ -12,6 +12,7 @@ namespace X3LaptopCompanion
         private readonly TeamsController teamsController = new TeamsController();
         private readonly MediaStatusSensor mediaStatusSensor = new MediaStatusSensor();
         private readonly CompanionConnectionService connectionService = new CompanionConnectionService();
+        private readonly VirtualDesktopService virtualDesktopService = new VirtualDesktopService();
         private readonly DispatcherTimer statusTimer = new DispatcherTimer();
 
         private string connectionText = "Disconnected";
@@ -22,6 +23,15 @@ namespace X3LaptopCompanion
         private string handText = "Unknown";
         private string buttonProtocolText = "No pending button";
         private string participationText = "No participation pulses";
+        private string desktopText = "Unknown";
+        private string lastSentDesktopState;
+        private int desktopStateWriteInFlight;
+        private readonly object desktopSwitchGate = new object();
+        private bool desktopSwitchRunning;
+        private int queuedDesktopSwitchTarget = -1;
+        private ushort queuedDesktopSwitchSequence;
+        private volatile bool desktopStateWriteForced;
+        private volatile ushort handledDesktopSwitchSequence;
         private bool isTestMode;
         private string testModeText = "Off";
         private bool testTeamsDetected = true;
@@ -50,7 +60,7 @@ namespace X3LaptopCompanion
         private ushort microphoneStateCounter;
         private ushort cameraStateCounter;
         private ushort handStateCounter;
-        private bool wasBleConnected;
+        private volatile bool wasBleConnected;
         private bool hostStateWriteInFlight;
         private bool isExiting;
         private bool statusRefreshInFlight;
@@ -196,6 +206,12 @@ namespace X3LaptopCompanion
         {
             get { return participationText; }
             private set { SetField(ref participationText, value, nameof(ParticipationText)); }
+        }
+
+        public string DesktopText
+        {
+            get { return desktopText; }
+            private set { SetField(ref desktopText, value, nameof(DesktopText)); }
         }
 
         public bool IsTestMode
@@ -526,6 +542,8 @@ namespace X3LaptopCompanion
                 return;
             }
 
+            _ = RefreshDesktopStateAsync("timer");
+
             if (IsTestMode)
             {
                 ApplyTestStatusToUi();
@@ -623,6 +641,7 @@ namespace X3LaptopCompanion
 
                 if (reconnected)
                 {
+                    _ = RefreshDesktopStateAsync("ble reconnect", force: true);
                     if (IsTestMode || IsTeamsDryRun)
                     {
                         SendCurrentHostStatus(force: true);
@@ -660,6 +679,18 @@ namespace X3LaptopCompanion
             }
 
             lastButtonSequences[buttonEvent.Button] = buttonEvent.Sequence;
+            if (buttonEvent.Button == CompanionButton.SwitchDesktop)
+            {
+                HandleDesktopSwitchRequest(buttonEvent);
+                return;
+            }
+
+            if (IsReactionButton(buttonEvent.Button))
+            {
+                HandleReactionRequest(buttonEvent);
+                return;
+            }
+
             pendingButton = buttonEvent.Button;
             pendingButtonCounter = buttonEvent.Sequence;
             pendingButtonExpectedState = null;
@@ -701,8 +732,230 @@ namespace X3LaptopCompanion
             }));
         }
 
-        private void OnParticipationEventReceived(object sender, CompanionParticipationEvent participationEvent)
+        private void HandleDesktopSwitchRequest(CompanionButtonEvent buttonEvent)
         {
+            var targetIndex = (int)buttonEvent.Argument;
+            HostLog.Write("Desktop switch requested from X3. index=" + targetIndex + " seq=" + buttonEvent.Sequence);
+            SetButtonProtocolText("Desktop " + (targetIndex + 1) + " #" + buttonEvent.Sequence + " requested");
+
+            lock (desktopSwitchGate)
+            {
+                if (desktopSwitchRunning)
+                {
+                    // The X3 is already waiting on this newer request, so it has to be run (and
+                    // echoed) rather than dropped; the running switch picks it up when it ends.
+                    queuedDesktopSwitchTarget = targetIndex;
+                    queuedDesktopSwitchSequence = buttonEvent.Sequence;
+                    HostLog.Write("Desktop switch queued behind the running switch. index=" + targetIndex +
+                        " seq=" + buttonEvent.Sequence);
+                    return;
+                }
+
+                desktopSwitchRunning = true;
+            }
+
+            _ = Task.Run(() => RunDesktopSwitchesAsync(targetIndex, buttonEvent.Sequence));
+        }
+
+        private async Task RunDesktopSwitchesAsync(int targetIndex, ushort sequence)
+        {
+            var index = targetIndex;
+            var seq = sequence;
+            try
+            {
+                while (true)
+                {
+                    try
+                    {
+                        var switched = virtualDesktopService.SwitchTo(index);
+                        SetButtonProtocolText("Desktop " + (index + 1) + " #" + seq +
+                            (switched ? " active" : " switch failed"));
+                    }
+                    catch (System.Exception ex)
+                    {
+                        HostLog.Write("Desktop switch failed.", ex);
+                    }
+
+                    // Echo the request back even when it failed so the X3 stops waiting on it.
+                    handledDesktopSwitchSequence = seq;
+                    await RefreshDesktopStateAsync("desktop switch", force: true).ConfigureAwait(false);
+
+                    lock (desktopSwitchGate)
+                    {
+                        if (queuedDesktopSwitchTarget < 0)
+                        {
+                            desktopSwitchRunning = false;
+                            return;
+                        }
+
+                        index = queuedDesktopSwitchTarget;
+                        seq = queuedDesktopSwitchSequence;
+                        queuedDesktopSwitchTarget = -1;
+                    }
+                }
+            }
+            catch (System.Exception ex)
+            {
+                HostLog.Write("Desktop switch worker stopped unexpectedly.", ex);
+                lock (desktopSwitchGate)
+                {
+                    queuedDesktopSwitchTarget = -1;
+                    desktopSwitchRunning = false;
+                }
+            }
+        }
+
+        private async Task RefreshDesktopStateAsync(string reason, bool force = false)
+        {
+            if (isExiting)
+            {
+                return;
+            }
+
+            // The post-switch push is the only report of a switch outcome, so a refresh that
+            // loses the race against the timer must not be dropped silently.
+            if (force)
+            {
+                desktopStateWriteForced = true;
+            }
+
+            if (Interlocked.Exchange(ref desktopStateWriteInFlight, 1) == 1)
+            {
+                return;
+            }
+
+            try
+            {
+                var snapshot = await Task.Run(() => virtualDesktopService.Read()).ConfigureAwait(false);
+                if (isExiting || Dispatcher.HasShutdownStarted)
+                {
+                    return;
+                }
+
+                var description = snapshot.Describe();
+                await Dispatcher.InvokeAsync(() =>
+                {
+                    if (!isExiting)
+                    {
+                        DesktopText = description;
+                    }
+                });
+
+                if (!wasBleConnected)
+                {
+                    return;
+                }
+
+                var ackSequence = handledDesktopSwitchSequence;
+                var stateKey = description + "|ack=" + ackSequence;
+                var forced = desktopStateWriteForced;
+                if (!forced && string.Equals(stateKey, lastSentDesktopState, System.StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                desktopStateWriteForced = false;
+                HostLog.Write("Desktop state write queued. reason=" + reason + " desktops=" + description +
+                    " ack=" + ackSequence);
+                if (await connectionService.SendDesktopStateAsync(snapshot.ToCompanionState(ackSequence))
+                    .ConfigureAwait(false))
+                {
+                    lastSentDesktopState = stateKey;
+                }
+                else if (forced)
+                {
+                    // Retry the forced push on the next tick rather than losing the switch result.
+                    desktopStateWriteForced = true;
+                }
+            }
+            catch (System.Exception ex)
+            {
+                HostLog.Write("Desktop state refresh failed. reason=" + reason, ex);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref desktopStateWriteInFlight, 0);
+            }
+        }
+
+        private void SetButtonProtocolText(string text)
+        {
+            if (isExiting || Dispatcher.HasShutdownStarted)
+            {
+                return;
+            }
+
+            Dispatcher.BeginInvoke(new System.Action(() =>
+            {
+                if (!isExiting)
+                {
+                    ButtonProtocolText = text;
+                }
+            }));
+        }
+
+        private static bool IsReactionButton(CompanionButton button)
+        {
+            return button == CompanionButton.ReactLike || button == CompanionButton.ReactHeart ||
+                button == CompanionButton.ReactApplause;
+        }
+
+        /// <summary>
+        /// Reactions are one-shot: Teams reports no state for them, so nothing is tracked as a
+        /// pending button and no acknowledging state write is expected.
+        /// </summary>
+        private void HandleReactionRequest(CompanionButtonEvent buttonEvent)
+        {
+            TeamsCommand command;
+            switch (buttonEvent.Button)
+            {
+                case CompanionButton.ReactLike:
+                    command = TeamsCommand.ReactLike;
+                    break;
+                case CompanionButton.ReactHeart:
+                    command = TeamsCommand.ReactHeart;
+                    break;
+                case CompanionButton.ReactApplause:
+                    command = TeamsCommand.ReactApplause;
+                    break;
+                default:
+                    return;
+            }
+
+            var label = ButtonName(buttonEvent.Button);
+            HostLog.Write("Reaction requested from X3. button=" + buttonEvent.Button + " seq=" + buttonEvent.Sequence);
+            SetButtonProtocolText(label + " #" + buttonEvent.Sequence + " sending");
+
+            if (IsTeamsDryRun || IsTestMode)
+            {
+                HostLog.Write("Reaction not sent; Teams dry run or test mode is active.");
+                SetButtonProtocolText(label + " #" + buttonEvent.Sequence + " skipped (dry run)");
+                return;
+            }
+
+            var targetProcessId = ParseCommandTargetProcessId();
+            _ = Task.Run(() =>
+            {
+                var stopwatch = Stopwatch.StartNew();
+                var sent = false;
+                try
+                {
+                    EnsureAudioProcessCacheForCommand(targetProcessId);
+                    sent = teamsController.TrySendCommand(command, mediaStatusSensor.TeamsAudioProcessIds,
+                        targetProcessId);
+                }
+                catch (System.Exception ex)
+                {
+                    HostLog.Write("Reaction failed.", ex);
+                }
+
+                HostLog.Write("Reaction finished. command=" + TeamsController.CommandName(command) +
+                    " sent=" + sent + " elapsedMs=" + stopwatch.ElapsedMilliseconds);
+                SetButtonProtocolText(label + " #" + buttonEvent.Sequence + (sent ? " sent" : " failed"));
+            });
+        }
+
+        private void OnParticipationEventReceived(object sender, CompanionParticipationEvent participationEvent)        {
             if (isExiting || Dispatcher.HasShutdownStarted)
             {
                 return;
@@ -1330,6 +1583,15 @@ namespace X3LaptopCompanion
         private void ResetHostStateWriteCache()
         {
             lastSentHostState = null;
+            lastSentDesktopState = null;
+            desktopStateWriteForced = false;
+            // A device reboot restarts its button sequence at 1, so a stale echo must not settle
+            // a fresh request in the next session.
+            handledDesktopSwitchSequence = CompanionProtocol.DesktopAckNone;
+            lock (desktopSwitchGate)
+            {
+                queuedDesktopSwitchTarget = -1;
+            }
             pendingHostState = null;
             pendingHostStateReason = null;
             hostStateWriteInFlight = false;
@@ -1400,17 +1662,23 @@ namespace X3LaptopCompanion
 
         private static string ButtonName(CompanionButton button)
         {
-            if (button == CompanionButton.ToggleMute)
+            switch (button)
             {
-                return "Mute";
+                case CompanionButton.ToggleMute:
+                    return "Mute";
+                case CompanionButton.ToggleHand:
+                    return "Hand";
+                case CompanionButton.SwitchDesktop:
+                    return "Desktop";
+                case CompanionButton.ReactLike:
+                    return "Like";
+                case CompanionButton.ReactHeart:
+                    return "Heart";
+                case CompanionButton.ReactApplause:
+                    return "Clap";
+                default:
+                    return "Camera";
             }
-
-            if (button == CompanionButton.ToggleHand)
-            {
-                return "Hand";
-            }
-
-            return "Camera";
         }
 
         private bool SetField(ref string field, string value, string propertyName)

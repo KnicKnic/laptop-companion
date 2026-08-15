@@ -22,11 +22,25 @@ from that SDK through `platformio.ini`.
 - Provides a Bluetooth laptop companion / macro-pad page using NimBLE and
   generated Lucide icons for connection, meeting, microphone, camera, and hand
   status.
+- Shows the laptop's virtual desktops in a row along the bottom of the companion
+  page, including any remote machine that the Windows App has added to Task view,
+  marks the active desktop, and switches to a desktop when its tile is tapped.
+  Each tile shows the desktop's Windows name; a remote machine with no live
+  session is drawn with a dashed border and a struck-through icon and is shown
+  for information only (connect it from Task view). Button round-trip timings
+  render directly above that switcher row.
 - Uses touch across the page body for the page's left / confirm / right actions;
   vertical swipes browse pages, and the capacitive Home key opens or closes the directory.
 - Leaves no footer-button strip on the display.
 - Sends meeting-control events over BLE to the laptop host app for mute, camera,
-  and hand toggles.
+  and hand toggles, meeting reactions, plus virtual desktop switch requests.
+- Offers thumbs up / heart / clap meeting reactions under the hand tile. These
+  are one-shot buttons: they fire on each tap and never show an engaged state.
+- Styles a tapped control with a dithered gray fill while the press is in
+  flight. Reactions have no state coming back, so they stay gray for at least a
+  second before clearing, which keeps the feedback visible on a panel that takes
+  a moment to refresh. The microphone, camera, hand and desktop controls clear
+  when the host reports the new state, or after two seconds if it never does.
 - Shows power and render diagnostics for light-sleep work.
 - On power-button sleep, renders an SD BMP sleep image when available, including
   CrossPoint-style 2-bit/native grayscale and Atkinson dithering support, then
@@ -128,6 +142,22 @@ put it on `PATH`, then run:
 ```powershell
 python freeink\libs\assets\Icons\tools\gen_icons.py --manifest src\icons\companion-icons.txt --svgdir freeink\libs\assets\Icons\lucide\icons --sizes 28,36,48 --out src\icons\CompanionIcons.h
 ```
+
+That path needs both `rsvg-convert` and the Lucide icon submodule under
+`freeink/libs/assets/Icons/lucide`, neither of which is available everywhere. To
+add a few icons without either, `scripts/gen_extra_icons.py` rasterises with
+`svglib` + `reportlab` + `rlPyCairo` and downloads the SVGs from the Lucide
+repository. It emits only the icons asked for, so append its output to
+`src/icons/CompanionIcons.h` and add the aliases to `src/icons/companion-icons.txt`:
+
+```powershell
+python -m pip install svglib reportlab rlPyCairo pillow
+python scripts\gen_extra_icons.py extra_icons.h thumbs_up=thumbs-up heart=heart clap=sparkles
+python scripts\preview_icons.py extra_icons.h 28
+```
+
+`scripts/preview_icons.py` prints any packed icon as ASCII, which is the quickest
+way to check a glyph survives being reduced to 28px before it ships.
 
 ## Local-Only Files
 

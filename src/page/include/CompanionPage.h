@@ -19,6 +19,8 @@ class CompanionPage final : public Page {
 
  private:
   const char* triStateText(uint8_t state, const char* offText, const char* onText) const;
+  bool handleReactionTouch(const freeink::ui::Rect& content, int16_t x, int16_t y);
+  bool handleDesktopTouch(const freeink::ui::Rect& content, int16_t x, int16_t y);
   bool ensureStarted();
 
   bool started_ = false;

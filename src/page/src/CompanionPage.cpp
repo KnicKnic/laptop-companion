@@ -51,6 +51,14 @@ const char* buttonLabel(uint8_t buttonId) {
       return "Hand";
     case CompanionProtocol::ButtonId::ToggleCamera:
       return "Camera";
+    case CompanionProtocol::ButtonId::SwitchDesktop:
+      return "Desktop";
+    case CompanionProtocol::ButtonId::ReactLike:
+      return "Like";
+    case CompanionProtocol::ButtonId::ReactHeart:
+      return "Heart";
+    case CompanionProtocol::ButtonId::ReactApplause:
+      return "Clap";
     default:
       return "Button";
   }
@@ -63,17 +71,25 @@ std::string acknowledgedText(const char* label, uint16_t counter, uint32_t laten
   return text;
 }
 
+// A press is styled with a dithered gray fill until it settles, so the tile visibly
+// acknowledges the tap without yet claiming the new state.
+void fillPressed(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile) {
+  target.fill(tile, freeink::ui::Paint::dither(freeink::ui::Color::LightGray), 4);
+  target.stroke(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
+}
+
 void drawStatusTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile, const freeink::Icon& icon,
-                    const char* label, const char* value, bool active, bool locked = false) {
-  const freeink::ui::Color ink = active ? freeink::ui::Color::White : freeink::ui::Color::Black;
-  if (active) {
+                    const char* label, const char* value, bool active, bool locked = false, bool pending = false) {
+  const freeink::ui::Color ink = (active && !pending) ? freeink::ui::Color::White : freeink::ui::Color::Black;
+  if (pending) {
+    fillPressed(target, tile);
+  } else if (active) {
     target.fill(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 4);
   } else {
     target.stroke(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
   }
   if (locked && tile.width > 12 && tile.height > 12) {
-    target.stroke(tile.inset(freeink::ui::Insets{5, 5, 5, 5}),
-                  freeink::ui::Paint::solid(active ? freeink::ui::Color::White : freeink::ui::Color::Black), 1, 3);
+    target.stroke(tile.inset(freeink::ui::Insets{5, 5, 5, 5}), freeink::ui::Paint::solid(ink), 1, 3);
   }
 
   freeink::ui::TextStyle labelStyle;
@@ -127,8 +143,7 @@ void drawConnectionTile(freeink::ui::DisplayTarget& target, const freeink::ui::R
 }
 
 void drawMeetingTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile, bool active,
-                     const std::string& meetingName) {
-  const freeink::ui::Color ink = active ? freeink::ui::Color::White : freeink::ui::Color::Black;
+                     const std::string& meetingName) {  const freeink::ui::Color ink = active ? freeink::ui::Color::White : freeink::ui::Color::Black;
   if (active) {
     target.fill(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 4);
   } else {
@@ -145,6 +160,166 @@ void drawMeetingTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect
                         freeink::ui::Rect{static_cast<int16_t>(tile.x + 12), static_cast<int16_t>(tile.y + 26),
                                           static_cast<int16_t>(tile.width - 24), 54},
                         label, text);
+}
+
+constexpr int16_t kDesktopRowHeight = 84;
+constexpr int16_t kDesktopTileGap = 8;
+constexpr int16_t kMessageHeight = 30;
+constexpr int16_t kMessageGap = 8;
+
+// Meeting reactions sit just under the hand tile. They fire once per tap and carry no
+// state, so they are drawn as plain outlined buttons that never appear engaged.
+constexpr int16_t kReactionRowTop = 412;
+constexpr int16_t kReactionRowHeight = 86;
+constexpr int16_t kReactionGap = 12;
+constexpr uint8_t kReactionCount = 3;
+
+struct ReactionButton {
+  CompanionProtocol::ButtonId id;
+  const freeink::Icon& icon;
+  const char* label;
+};
+
+const ReactionButton kReactions[kReactionCount] = {
+    {CompanionProtocol::ButtonId::ReactLike, icon_thumbs_up_28, "Like"},
+    {CompanionProtocol::ButtonId::ReactHeart, icon_heart_28, "Heart"},
+    {CompanionProtocol::ButtonId::ReactApplause, icon_clap_28, "Clap"},
+};
+
+freeink::ui::Rect reactionRowRect(const freeink::ui::Rect& content) {
+  return freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + kReactionRowTop), content.width,
+                           kReactionRowHeight};
+}
+
+freeink::ui::Rect reactionTileRect(const freeink::ui::Rect& row, uint8_t index) {
+  const int16_t totalGap = static_cast<int16_t>(kReactionGap * (kReactionCount - 1));
+  const int16_t tileW = static_cast<int16_t>((row.width - totalGap) / kReactionCount);
+  return freeink::ui::Rect{static_cast<int16_t>(row.x + index * (tileW + kReactionGap)), row.y, tileW, row.height};
+}
+
+void drawReactionRow(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content,
+                     const CompanionBleService::PendingButtonStatus& pending) {
+  const freeink::ui::Rect row = reactionRowRect(content);
+  for (uint8_t i = 0; i < kReactionCount; ++i) {
+    const freeink::ui::Rect tile = reactionTileRect(row, i);
+    const bool pressed =
+        pending.reactionPending && pending.reactionButtonId == static_cast<uint8_t>(kReactions[i].id);
+    if (pressed) {
+      fillPressed(target, tile);
+    } else {
+      target.stroke(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
+    }
+
+    drawIcon(target,
+             freeink::ui::Rect{static_cast<int16_t>(tile.x + (tile.width - 28) / 2),
+                               static_cast<int16_t>(tile.y + 14), 28, 28},
+             kReactions[i].icon);
+
+    freeink::ui::TextStyle text;
+    text.align = freeink::ui::TextAlign::Center;
+    text.maxLines = 1;
+    freeink::ui::drawText(target,
+                          freeink::ui::Rect{static_cast<int16_t>(tile.x + 2), static_cast<int16_t>(tile.y + 48),
+                                            static_cast<int16_t>(tile.width - 4), 24},
+                          kReactions[i].label, text);
+  }
+}
+
+// The desktop switcher owns the bottom strip; timings sit directly above it.
+freeink::ui::Rect desktopRowRect(const freeink::ui::Rect& content) {
+  return freeink::ui::Rect{content.x, static_cast<int16_t>(content.bottom() - kDesktopRowHeight), content.width,
+                           kDesktopRowHeight};
+}
+
+freeink::ui::Rect messageRect(const freeink::ui::Rect& content) {
+  const freeink::ui::Rect row = desktopRowRect(content);
+  return freeink::ui::Rect{content.x, static_cast<int16_t>(row.y - kMessageGap - kMessageHeight), content.width,
+                           kMessageHeight};
+}
+
+freeink::ui::Rect desktopTileRect(const freeink::ui::Rect& row, uint8_t count, uint8_t index) {
+  if (count == 0 || index >= count) return freeink::ui::Rect{};
+  const int16_t totalGap = static_cast<int16_t>(kDesktopTileGap * (count - 1));
+  const int16_t tileW = static_cast<int16_t>((row.width - totalGap) / count);
+  return freeink::ui::Rect{static_cast<int16_t>(row.x + index * (tileW + kDesktopTileGap)), row.y, tileW, row.height};
+}
+
+// Outlines a tile with short dashes, marking a remote desktop that has no live session.
+void strokeDashedRect(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& rect, freeink::ui::Color color,
+                      uint8_t width, int16_t dash, int16_t gap) {
+  const freeink::ui::Paint paint = freeink::ui::Paint::solid(color);
+  const int16_t step = static_cast<int16_t>(dash + gap);
+  for (int16_t x = rect.x; x < rect.right(); x = static_cast<int16_t>(x + step)) {
+    const int16_t end = static_cast<int16_t>(x + dash > rect.right() ? rect.right() : x + dash);
+    target.line(freeink::ui::Point{x, rect.y}, freeink::ui::Point{end, rect.y}, width, paint);
+    target.line(freeink::ui::Point{x, static_cast<int16_t>(rect.bottom() - 1)},
+                freeink::ui::Point{end, static_cast<int16_t>(rect.bottom() - 1)}, width, paint);
+  }
+  for (int16_t y = rect.y; y < rect.bottom(); y = static_cast<int16_t>(y + step)) {
+    const int16_t end = static_cast<int16_t>(y + dash > rect.bottom() ? rect.bottom() : y + dash);
+    target.line(freeink::ui::Point{rect.x, y}, freeink::ui::Point{rect.x, end}, width, paint);
+    target.line(freeink::ui::Point{static_cast<int16_t>(rect.right() - 1), y},
+                freeink::ui::Point{static_cast<int16_t>(rect.right() - 1), end}, width, paint);
+  }
+}
+
+void drawDesktopTile(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& tile, const std::string& name,
+                     bool remote, bool disconnected, bool active, bool pending) {
+  const freeink::ui::Color ink = (active && !pending) ? freeink::ui::Color::White : freeink::ui::Color::Black;
+  if (pending) {
+    fillPressed(target, tile);
+  } else if (active) {
+    target.fill(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 4);
+  } else if (disconnected) {
+    strokeDashedRect(target, tile, freeink::ui::Color::Black, 1, 6, 4);
+  } else {
+    target.stroke(tile, freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
+  }
+
+  const freeink::ui::Rect iconRect{static_cast<int16_t>(tile.x + (tile.width - 28) / 2),
+                                   static_cast<int16_t>(tile.y + 14), 28, 28};
+  drawIcon(target, iconRect, remote ? icon_radio_tower_28 : icon_monitor_28, ink);
+  if (disconnected) {
+    // Strike through the icon so an offline desktop reads as unavailable at a glance.
+    target.line(freeink::ui::Point{static_cast<int16_t>(iconRect.x + 2), static_cast<int16_t>(iconRect.bottom() - 3)},
+                freeink::ui::Point{static_cast<int16_t>(iconRect.right() - 3), static_cast<int16_t>(iconRect.y + 2)}, 2,
+                freeink::ui::Paint::solid(ink));
+  }
+
+  if (name.empty()) return;
+
+  freeink::ui::TextStyle text;
+  text.align = freeink::ui::TextAlign::Center;
+  text.maxLines = 1;
+  text.color = ink;
+
+  freeink::ui::drawText(target,
+                        freeink::ui::Rect{static_cast<int16_t>(tile.x + 2), static_cast<int16_t>(tile.y + 48),
+                                          static_cast<int16_t>(tile.width - 4), 24},
+                        name.c_str(), text);
+}
+
+void drawDesktopRow(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content,
+                    const CompanionBleService::DesktopStatus& desktops,
+                    const CompanionBleService::PendingButtonStatus& pending) {
+  const freeink::ui::Rect row = desktopRowRect(content);
+  if (!desktops.valid || desktops.count == 0) {
+    target.stroke(row, freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
+    freeink::ui::TextStyle text;
+    text.align = freeink::ui::TextAlign::Center;
+    text.maxLines = 1;
+    freeink::ui::drawText(target,
+                          freeink::ui::Rect{row.x, static_cast<int16_t>(row.y + (row.height - 24) / 2), row.width, 24},
+                          "No desktop info", text);
+    return;
+  }
+
+  for (uint8_t i = 0; i < desktops.count; ++i) {
+    const bool pendingTile = pending.desktopPending && pending.desktopTargetIndex == i;
+    drawDesktopTile(target, desktopTileRect(row, desktops.count, i), desktops.desktops[i].name,
+                    desktops.desktops[i].remote, desktops.desktops[i].disconnected, desktops.activeIndex == i,
+                    pendingTile);
+  }
 }
 }  // namespace
 
@@ -207,7 +382,58 @@ bool CompanionPage::handleTouch(freeink::ui::DisplayTarget& target, int16_t x, i
   if (freeink::ui::Rect{content.x, static_cast<int16_t>(mediaTileY + 124), content.width, 88}.contains(x, y)) {
     return handleButton(ButtonPressKind::Right);
   }
-  return false;
+  if (handleReactionTouch(content, x, y)) {
+    return true;
+  }
+  return handleDesktopTouch(content, x, y);
+}
+
+bool CompanionPage::handleReactionTouch(const freeink::ui::Rect& content, int16_t x, int16_t y) {
+  const freeink::ui::Rect row = reactionRowRect(content);
+  if (!row.contains(x, y)) return false;
+
+  CompanionBleService& service = CompanionBleService::getInstance();
+  for (uint8_t i = 0; i < kReactionCount; ++i) {
+    if (!reactionTileRect(row, i).contains(x, y)) continue;
+
+    uint16_t counter = 0;
+    actionMessage_ = service.notifyReactionReleased(kReactions[i].id, &counter)
+                         ? pressedText(kReactions[i].label, counter)
+                         : "Host not ready";
+    return true;
+  }
+  return true;
+}
+
+bool CompanionPage::handleDesktopTouch(const freeink::ui::Rect& content, int16_t x, int16_t y) {
+  CompanionBleService& service = CompanionBleService::getInstance();
+  const CompanionBleService::DesktopStatus desktops = service.getDesktopStatus();
+  const freeink::ui::Rect row = desktopRowRect(content);
+  if (!row.contains(x, y)) return false;
+  if (!desktops.valid || desktops.count == 0) {
+    actionMessage_ = "No desktop info";
+    return true;
+  }
+
+  for (uint8_t i = 0; i < desktops.count; ++i) {
+    if (!desktopTileRect(row, desktops.count, i).contains(x, y)) continue;
+    if (desktops.activeIndex == i) {
+      actionMessage_ = "Desktop already active";
+      return true;
+    }
+    if (desktops.desktops[i].disconnected) {
+      // Connecting a remote machine has to be done from Task view; the tile becomes
+      // switchable here once its session is up.
+      actionMessage_ = "Offline - connect in Task view";
+      return true;
+    }
+
+    uint16_t counter = 0;
+    actionMessage_ = service.notifySwitchDesktopReleased(i, &counter) ? pressedText("Desktop", counter)
+                                                                     : "Desktop switch unavailable";
+    return true;
+  }
+  return true;
 }
 
 void CompanionPage::onLeave() {
@@ -257,15 +483,15 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
 
   const int16_t mediaTileY = static_cast<int16_t>(content.y + 188);
   drawStatusTile(target, freeink::ui::Rect{content.x, mediaTileY, tileW, 100}, micStatusIcon(host.microphone),
-                 "Microphone", triStateText(host.microphone, "Muted", "Live"), micLive);
+                 "Microphone", triStateText(host.microphone, "Muted", "Live"), micLive, false, pending.mutePending);
   drawStatusTile(target,
                  freeink::ui::Rect{static_cast<int16_t>(content.x + tileW + gap), mediaTileY, tileW, 100},
                  cameraStatusIcon(host.camera), "Camera",
                  host.cameraLocked ? "Locked" : triStateText(host.camera, "Off", "Active"), cameraLive,
-                 host.cameraLocked);
+                 host.cameraLocked, pending.cameraPending);
   drawStatusTile(target, freeink::ui::Rect{content.x, static_cast<int16_t>(mediaTileY + 124), content.width, 88},
                  icon_activity_36, "Hand", host.handLocked ? "Locked" : triStateText(host.hand, "Lowered", "Raised"),
-                 handRaised, host.handLocked);
+                 handRaised, host.handLocked, pending.handPending);
 
   std::string pendingText;
   if (pending.mutePending) {
@@ -274,6 +500,8 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
     pendingText = pressedText("Hand", pending.handCounter);
   } else if (pending.cameraPending) {
     pendingText = pressedText("Camera", pending.cameraCounter);
+  } else if (pending.desktopPending) {
+    pendingText = pressedText("Desktop", pending.desktopCounter);
   } else if (!actionMessage_.empty() && actionMessage_.find("pressed") != std::string::npos) {
     actionMessage_.clear();
   }
@@ -285,10 +513,11 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
 
   const std::string& message = pendingText.empty() ? actionMessage_ : pendingText;
   if (!message.empty()) {
-    freeink::ui::drawText(target,
-                          freeink::ui::Rect{content.x, static_cast<int16_t>(content.bottom() - 72), content.width, 30},
-                          message.c_str(), center);
+    freeink::ui::drawText(target, messageRect(content), message.c_str(), center);
   }
+
+  drawDesktopRow(target, content, service.getDesktopStatus(), pending);
+  drawReactionRow(target, content, pending);
 
   drawPageChrome(target);
   return tx;
