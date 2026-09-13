@@ -78,3 +78,10 @@ uint32_t inputButtonInterruptCount();
 const char* inputBackendName();
 InputDiagnosticsSnapshot copyInputDiagnostics();
 const char* inputPressKindName(ButtonPressKind kind);
+
+// True only for input backends that can re-apply the GT911 touch-key
+// (including Home key) sensitivity live, i.e. the X4 Pro backend.
+bool inputSupportsHomeKeySensitivity();
+// Applies a 0-15 sensitivity nibble to all four GT911 key slots. No-op
+// (returns false) on backends without inputSupportsHomeKeySensitivity().
+bool setHomeKeySensitivity(uint8_t sensitivity);

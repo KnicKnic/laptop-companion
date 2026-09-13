@@ -2,12 +2,71 @@
 
 #include "AppLog.h"
 #include "AppState.h"
+#include "Frontlight.h"
+#include "IsrInput.h"
 #include "PageDrawing.h"
 #include "PageManager.h"
+#include "PowerManagement.h"
 #include "Settings.h"
 
 #include <Arduino.h>
 #include <FreeInkUIDisplayTarget.h>
+
+namespace {
+constexpr freeink::ui::ActionId kActionChangeSetting = 1;
+constexpr freeink::ui::ActionId kActionFrontlightBrightnessSlider = 2;
+constexpr freeink::ui::ActionId kActionFrontlightColorSlider = 3;
+constexpr int16_t kRowH = 44;
+constexpr int16_t kRowStep = 50;
+// Width of the label portion of a frontlight row; the slider track fills the
+// rest. The percentage is folded into the label text itself (see
+// SettingsPage::render), so there's no separate value column to collide with.
+constexpr int16_t kFrontlightLabelWidth = 230;
+
+// Row geometry shared by render() and handleTouch() so a tap always lands on
+// exactly the row it visually overlaps. `position` is the row's 0-based slot
+// among the currently active rows (SettingsPage::activeRows), not a row id.
+freeink::ui::Rect settingsRowRect(const freeink::ui::Rect& content, uint8_t position) {
+  const int16_t rowX = static_cast<int16_t>(content.x + 20);
+  const int16_t rowW = static_cast<int16_t>(content.width - 40);
+  const int16_t firstRowY = static_cast<int16_t>(content.y + 96);
+  return freeink::ui::Rect{rowX, static_cast<int16_t>(firstRowY + position * kRowStep), rowW, kRowH};
+}
+
+freeink::ui::Rect frontlightSliderTrack(const freeink::ui::Rect& row) {
+  return freeink::ui::Rect{static_cast<int16_t>(row.x + kFrontlightLabelWidth), row.y,
+                           static_cast<int16_t>(row.width - kFrontlightLabelWidth), row.height};
+}
+
+void drawFrontlightSlider(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& row, uint8_t percent) {
+  // A throwaway Frame purely for drawing: hit-testing for the slider happens
+  // separately in handleTouch() against the same frontlightSliderTrack() rect.
+  freeink::ui::InputSnapshot input;
+  freeink::ui::InteractionBuffer<1> interactions;
+  freeink::ui::Frame<1> frame(target, target.deviceContext(), input, interactions);
+  freeink::ui::SliderProps props;
+  props.value = percent;
+  props.max = 100;
+  props.trackHeight = 8;
+  props.knobWidth = 12;
+  props.knobHeight = static_cast<int16_t>(row.height - 14);
+  props.horizontalPadding = 6;
+  freeink::ui::slider(frame, frontlightSliderTrack(row), props);
+}
+
+// Steps a 0-100 percentage up by 10, wrapping back to 0 past 100. Used by
+// Confirm/tap-on-label so the frontlight rows follow the same "Confirm
+// cycles the value" model as every other row on this page.
+uint8_t stepPercent(uint8_t value) {
+  return static_cast<uint8_t>(((value / 10) + 1) % 11 * 10);
+}
+
+// Steps a 0-15 nibble up by 1, wrapping back to 0 past 15 (0->f, then back to
+// 0), for the GT911 home-key sensitivity row.
+uint8_t stepNibble(uint8_t value) {
+  return static_cast<uint8_t>((value + 1) % 16);
+}
+}  // namespace
 
 SettingsPage::SettingsPage(EInkDisplay& display) : Page(display) {}
 
@@ -19,16 +78,48 @@ const char* SettingsPage::name() const {
   return "settings";
 }
 
+uint8_t SettingsPage::activeRows(uint8_t* rows) {
+  uint8_t count = 0;
+  rows[count++] = kRowPowerManagement;
+  rows[count++] = kRowAutoLightSleep;
+  rows[count++] = kRowStartupPage;
+  rows[count++] = kRowRefreshMode;
+  rows[count++] = kRowSerialLogging;
+  rows[count++] = kRowPowerStatsPage;
+  if (frontlightPresent()) {
+    rows[count++] = kRowFrontlightBrightness;
+    if (frontlightHasColorTemperature()) rows[count++] = kRowFrontlightColor;
+  }
+  if (inputSupportsHomeKeySensitivity()) rows[count++] = kRowHomeKeySensitivity;
+  return count;
+}
+
+void SettingsPage::moveSelection(int8_t direction) {
+  uint8_t rows[kMaxRows];
+  const uint8_t count = activeRows(rows);
+  if (count == 0) return;
+
+  int position = 0;
+  for (uint8_t i = 0; i < count; ++i) {
+    if (rows[i] == selectedRow_) {
+      position = i;
+      break;
+    }
+  }
+  position = (position + direction + count) % count;
+  selectedRow_ = rows[position];
+}
+
 bool SettingsPage::handleButton(ButtonPressKind kind) {
   switch (kind) {
     case ButtonPressKind::Confirm:
       toggleSelectedSetting();
       return true;
     case ButtonPressKind::Right:
-      selectedRow_ = (selectedRow_ + 1) % kEditableRows;
+      moveSelection(1);
       return true;
     case ButtonPressKind::Left:
-      selectedRow_ = (selectedRow_ + kEditableRows - 1) % kEditableRows;
+      moveSelection(-1);
       return true;
     default:
       return false;
@@ -36,28 +127,47 @@ bool SettingsPage::handleButton(ButtonPressKind kind) {
 }
 
 bool SettingsPage::handleTouch(freeink::ui::DisplayTarget& target, int16_t x, int16_t y) {
-  // Keep the tap geometry identical to the six rendered setting rows. A tap
+  // Keep the tap geometry identical to the rendered setting rows. A tap
   // changes that setting immediately; it no longer acts through a page-wide
   // left/middle/right zone.
   const freeink::ui::Rect content = pageMainPanel(target).inset(freeink::ui::Insets{12, 8, 24, 18});
-  const int16_t rowX = static_cast<int16_t>(content.x + 20);
-  const int16_t rowW = static_cast<int16_t>(content.width - 40);
-  constexpr int16_t rowH = 44;
-  constexpr int16_t rowStep = 50;
-  const int16_t firstRowY = static_cast<int16_t>(content.y + 96);
+
+  uint8_t rows[kMaxRows];
+  const uint8_t count = activeRows(rows);
 
   freeink::ui::InputSnapshot input;
   input.touchReleased = true;
   input.touchX = x;
   input.touchY = y;
-  freeink::ui::InteractionBuffer<kEditableRows> interactions;
-  freeink::ui::Frame<kEditableRows> frame(target, target.deviceContext(), input, interactions);
-  constexpr freeink::ui::ActionId kActionChangeSetting = 1;
-  for (uint8_t row = 0; row < kEditableRows; ++row) {
-    frame.hit(freeink::ui::Rect{rowX, static_cast<int16_t>(firstRowY + row * rowStep), rowW, rowH},
-              kActionChangeSetting, row, freeink::ui::InputTouch);
+  freeink::ui::InteractionBuffer<kMaxRows + 2> interactions;
+  freeink::ui::Frame<kMaxRows + 2> frame(target, target.deviceContext(), input, interactions);
+
+  // Whole-row hits first (Confirm-equivalent: cycles the value), then the
+  // frontlight slider sub-rects on top of them. Frame resolves overlapping
+  // hits in most-recently-added-first order, so a tap on the slider itself
+  // is claimed by the slider hit even though the row hit also covers it.
+  for (uint8_t position = 0; position < count; ++position) {
+    frame.hit(settingsRowRect(content, position), kActionChangeSetting, rows[position], freeink::ui::InputTouch);
   }
+  for (uint8_t position = 0; position < count; ++position) {
+    if (rows[position] == kRowFrontlightBrightness) {
+      frame.hit(frontlightSliderTrack(settingsRowRect(content, position)), kActionFrontlightBrightnessSlider, 0,
+                freeink::ui::InputTouch | freeink::ui::InputDrag);
+    } else if (rows[position] == kRowFrontlightColor) {
+      frame.hit(frontlightSliderTrack(settingsRowRect(content, position)), kActionFrontlightColorSlider, 0,
+                freeink::ui::InputTouch | freeink::ui::InputDrag);
+    }
+  }
+
   const freeink::ui::ActionEvent event = frame.finish();
+  if (event.action == kActionFrontlightBrightnessSlider && event.dragPermille >= 0) {
+    setFrontlightBrightnessValue(static_cast<uint8_t>(event.dragPermille / 10));
+    return true;
+  }
+  if (event.action == kActionFrontlightColorSlider && event.dragPermille >= 0) {
+    setFrontlightColorValue(static_cast<uint8_t>(event.dragPermille / 10));
+    return true;
+  }
   if (event.action != kActionChangeSetting) return false;
 
   selectedRow_ = static_cast<uint8_t>(event.value);
@@ -66,11 +176,21 @@ bool SettingsPage::handleTouch(freeink::ui::DisplayTarget& target, int16_t x, in
 }
 
 void SettingsPage::onLeave() {
+  // The frontlight rows drive the hardware directly so the value can be
+  // previewed while adjusting it; always leave it off when navigating away
+  // rather than only on a "dirty" change, since a preview may have been left
+  // running without ever nudging a value (e.g. viewing then leaving).
+  setFrontlightBrightness(0);
+
   if (!dirty_) return;
   if (saveSettingsToSd()) {
     setCompanionSettingsStatus(true, true, true);
-    dirty_ = false;
   }
+  // Re-apply the live settings now rather than waiting for a reboot: power
+  // management (DFS/light-sleep) is normally configured once at boot, so a
+  // change made on this page would otherwise sit unused until next boot.
+  configurePowerManagementFromSettings();
+  dirty_ = false;
 }
 
 std::unique_ptr<RenderTransaction> SettingsPage::render(freeink::ui::DisplayTarget& target,
@@ -103,23 +223,51 @@ std::unique_ptr<RenderTransaction> SettingsPage::render(freeink::ui::DisplayTarg
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 20), content.width, 44},
                         titleLine, title);
 
-  const int16_t rowX = static_cast<int16_t>(content.x + 20);
-  const int16_t rowW = static_cast<int16_t>(content.width - 40);
-  constexpr int16_t rowH = 44;
-  int16_t y = static_cast<int16_t>(content.y + 96);
-  drawSettingRow(target, freeink::ui::Rect{rowX, y, rowW, rowH}, "Power management", pmEnable, selectedRow_ == 0);
-  y += 50;
-  drawSettingRow(target, freeink::ui::Rect{rowX, y, rowW, rowH}, "Auto light sleep", autoSleep, selectedRow_ == 1);
-  y += 50;
-  drawSettingRow(target, freeink::ui::Rect{rowX, y, rowW, rowH}, "Startup page", settings.system.page.startup.c_str(),
-                 selectedRow_ == 2);
-  y += 50;
-  drawSettingRow(target, freeink::ui::Rect{rowX, y, rowW, rowH}, "Refresh mode",
-                 settings.system.display.refreshMode.c_str(), selectedRow_ == 3);
-  y += 50;
-  drawSettingRow(target, freeink::ui::Rect{rowX, y, rowW, rowH}, "Serial logging", logging, selectedRow_ == 4);
-  y += 50;
-  drawSettingRow(target, freeink::ui::Rect{rowX, y, rowW, rowH}, "Power stats page", powerStats, selectedRow_ == 5);
+  uint8_t rows[kMaxRows];
+  const uint8_t count = activeRows(rows);
+  char brightnessLabel[40];
+  char colorLabel[48];
+  char sensitivityValue[8];
+  for (uint8_t position = 0; position < count; ++position) {
+    const freeink::ui::Rect row = settingsRowRect(content, position);
+    const bool selected = selectedRow_ == rows[position];
+    switch (rows[position]) {
+      case kRowPowerManagement:
+        drawSettingRow(target, row, "Power management", pmEnable, selected);
+        break;
+      case kRowAutoLightSleep:
+        drawSettingRow(target, row, "Auto light sleep", autoSleep, selected);
+        break;
+      case kRowStartupPage:
+        drawSettingRow(target, row, "Startup page", settings.system.page.startup.c_str(), selected);
+        break;
+      case kRowRefreshMode:
+        drawSettingRow(target, row, "Refresh mode", settings.system.display.refreshMode.c_str(), selected);
+        break;
+      case kRowSerialLogging:
+        drawSettingRow(target, row, "Serial logging", logging, selected);
+        break;
+      case kRowPowerStatsPage:
+        drawSettingRow(target, row, "Power stats page", powerStats, selected);
+        break;
+      case kRowFrontlightBrightness:
+        snprintf(brightnessLabel, sizeof(brightnessLabel), "Touch brightness: %u%%",
+                 settings.system.frontlight.touchBrightness);
+        drawSettingRow(target, row, brightnessLabel, nullptr, selected);
+        drawFrontlightSlider(target, row, settings.system.frontlight.touchBrightness);
+        break;
+      case kRowFrontlightColor:
+        snprintf(colorLabel, sizeof(colorLabel), "Touch color (warm): %u%%",
+                 settings.system.frontlight.touchColorTemperature);
+        drawSettingRow(target, row, colorLabel, nullptr, selected);
+        drawFrontlightSlider(target, row, settings.system.frontlight.touchColorTemperature);
+        break;
+      case kRowHomeKeySensitivity:
+        snprintf(sensitivityValue, sizeof(sensitivityValue), "0x%X", settings.system.touch.homeKeySensitivity);
+        drawSettingRow(target, row, "Home key sensitivity", sensitivityValue, selected);
+        break;
+    }
+  }
 
   char sleepPathLine[96];
   snprintf(sleepPathLine, sizeof(sleepPathLine), "Sleep image: %s", settings.system.sleep.imagePath.c_str());
@@ -128,7 +276,7 @@ std::unique_ptr<RenderTransaction> SettingsPage::render(freeink::ui::DisplayTarg
                         sleepPathLine, body);
   freeink::ui::drawText(target,
                         freeink::ui::Rect{content.x, static_cast<int16_t>(content.bottom() - 42), content.width, 30},
-                        "Left/Right: select setting   Confirm: toggle", body);
+                        "Left/Right: select setting   Confirm: toggle   Tap a slider to set it", body);
   drawPageChrome(target);
   return tx;
 }
@@ -136,28 +284,56 @@ std::unique_ptr<RenderTransaction> SettingsPage::render(freeink::ui::DisplayTarg
 void SettingsPage::toggleSelectedSetting() {
   CompanionSettings settings = copySettings();
   switch (selectedRow_) {
-    case 0:
+    case kRowPowerManagement:
       settings.system.powerManagement.enable = !settings.system.powerManagement.enable;
       break;
-    case 1:
+    case kRowAutoLightSleep:
       settings.system.powerManagement.autoLightSleep = !settings.system.powerManagement.autoLightSleep;
       break;
-    case 2:
+    case kRowStartupPage:
       settings.system.page.startup = nextStartupPage(settings.system.page.startup);
       break;
-    case 3:
+    case kRowRefreshMode:
       settings.system.display.refreshMode = nextRefreshMode(settings.system.display.refreshMode);
       break;
-    case 4:
+    case kRowSerialLogging:
       settings.system.debug.serialLogging = !settings.system.debug.serialLogging;
       setSerialLoggingEnabled(settings.system.debug.serialLogging);
       break;
-    case 5:
+    case kRowPowerStatsPage:
       settings.system.debug.showPowerStatsPage = !settings.system.debug.showPowerStatsPage;
+      break;
+    case kRowFrontlightBrightness:
+      settings.system.frontlight.touchBrightness = stepPercent(settings.system.frontlight.touchBrightness);
+      setFrontlightBrightness(settings.system.frontlight.touchBrightness);
+      break;
+    case kRowFrontlightColor:
+      settings.system.frontlight.touchColorTemperature = stepPercent(settings.system.frontlight.touchColorTemperature);
+      setFrontlightColorTemperature(settings.system.frontlight.touchColorTemperature);
+      break;
+    case kRowHomeKeySensitivity:
+      settings.system.touch.homeKeySensitivity = stepNibble(settings.system.touch.homeKeySensitivity);
+      setHomeKeySensitivity(settings.system.touch.homeKeySensitivity);
       break;
   }
   updateSettings(settings);
   dirty_ = true;
+}
+
+void SettingsPage::setFrontlightBrightnessValue(uint8_t percent) {
+  CompanionSettings settings = copySettings();
+  settings.system.frontlight.touchBrightness = percent;
+  updateSettings(settings);
+  dirty_ = true;
+  setFrontlightBrightness(percent);
+}
+
+void SettingsPage::setFrontlightColorValue(uint8_t percent) {
+  CompanionSettings settings = copySettings();
+  settings.system.frontlight.touchColorTemperature = percent;
+  updateSettings(settings);
+  dirty_ = true;
+  setFrontlightColorTemperature(percent);
 }
 
 String SettingsPage::nextStartupPage(const String& current) {
@@ -174,3 +350,4 @@ String SettingsPage::nextRefreshMode(const String& current) {
   if (current == "half") return "full";
   return "fast";
 }
+

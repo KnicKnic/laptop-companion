@@ -81,3 +81,21 @@ process that leads to the right hosted meeting window.
 ```powershell
 dotnet build .\X3LaptopCompanion.csproj
 ```
+
+## Run
+
+From the repository root, run `.\launch.ps1` to pull updates, build, and launch
+the host directly through `dotnet`. Press `Ctrl+C` in that terminal to request
+graceful shutdown: the app stops its BLE service and status timer, removes its
+tray icon, and exits through the same path as the tray menu's `Exit` command.
+The launcher does not kill the app.
+Closing the status window only hides it; it does not exit the app.
+
+To launch an existing build from this directory without pulling or rebuilding:
+
+```powershell
+dotnet .\bin\Debug\net10.0-windows10.0.19041.0\X3LaptopCompanion.dll
+```
+
+Launching the `.exe` from Explorer still runs as a tray app without a console;
+use the tray menu's `Exit` command in that case.

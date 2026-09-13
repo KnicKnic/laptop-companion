@@ -19,6 +19,7 @@
 #include "AppSdBus.h"
 #include "AppState.h"
 #include "DisplayWorker.h"
+#include "Frontlight.h"
 #include "IsrInput.h"
 #include "InterruptStats.h"
 #include "LinkerQuirks.h"
@@ -215,6 +216,14 @@ void setup() {
   display->begin();
   if (!beginPageManager(*display, bootPage)) {
     logPrintf("Failed to create page manager mutex.\n");
+    while (true) delay(1000);
+  }
+  // Must run before beginInput(): the X4 Pro touch backend starts its touch
+  // task inside beginInput() and immediately drains any GT911 status already
+  // asserted at boot, which can call into Frontlight (touch-feedback flash)
+  // before its mutex exists otherwise.
+  if (!beginFrontlight()) {
+    logPrintf("Failed to create frontlight mutex.\n");
     while (true) delay(1000);
   }
   beginInput();

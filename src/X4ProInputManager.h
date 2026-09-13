@@ -59,6 +59,10 @@ class X4ProInputManager {
   uint32_t touchIrqCount() const;
   uint32_t buttonIrqCount() const;
   X4ProInputDiagnostics copyDiagnostics() const;
+  // Re-applies the GT911 touch-key sensitivity (all four virtual key slots,
+  // including the Home key) live, from the Settings page. `sensitivity` is a
+  // 0-15 nibble; clamped. No-op if the controller was never detected.
+  void setKeySensitivity(uint8_t sensitivity);
 
  private:
   struct Point {
@@ -81,15 +85,25 @@ class X4ProInputManager {
   bool writeReg(uint16_t reg, const uint8_t* data, uint8_t length);
   void readLoadedKeyConfig();
   void applyKeySensitivity(uint8_t sensitivity);
+  // Applies pendingKeySensitivity_ (if keySensitivityPending_) from touchTask_
+  // context, so the I2C write never races pollTouch()'s own Wire traffic.
+  void applyPendingKeySensitivity();
   void clearStatus();
   void pollTouch(unsigned long now);
   void finishTouch(unsigned long now);
+  // Turns the touch-feedback frontlight flash on/off based on live down-state
+  // (touchDown_ || homeDown_), not on GT911 bus-drain timing: a held Home key
+  // reports no coordinate contact (count stays 0), so the old drain-based
+  // model turned the light back off while the key was still physically held.
+  void updateTouchFeedbackLight();
   bool isPressed(uint8_t button) const;
 
   volatile bool touchIrqPending_ = false;
   volatile bool touchRetryPending_ = false;
   volatile bool touchInterruptMasked_ = false;
   volatile bool eventPending_ = false;
+  volatile bool keySensitivityPending_ = false;
+  volatile uint8_t pendingKeySensitivity_ = 0;
   volatile uint32_t touchIrqCount_ = 0;
   volatile uint32_t buttonIrqCount_ = 0;
   volatile uint8_t lastGt911Status_ = 0;
@@ -119,6 +133,7 @@ class X4ProInputManager {
   int8_t buttonPins_[3] = {-1, -1, -1};
   bool buttonRearmPending_ = false;
   bool touchDrainActive_ = false;
+  bool touchFeedbackLightOn_ = false;
   uint8_t gt911Address_ = 0;
   unsigned long ignorePowerUntil_ = 0;
   uint8_t buttonState_ = 0;
@@ -148,7 +163,6 @@ class X4ProInputManager {
   static constexpr uint16_t kKeyConfigReg = 0x8098;
   static constexpr uint16_t kKeySensitivity12Reg = 0x809A;
   static constexpr uint16_t kKeySensitivity34Reg = 0x809B;
-  static constexpr uint8_t kConfiguredKeySensitivity = 9;
   static constexpr uint8_t kConfigWriteChunkBytes = 24;
   static constexpr uint16_t kPanelWidth = 800;
   static constexpr uint16_t kPanelHeight = 480;

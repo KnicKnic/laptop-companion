@@ -1,7 +1,9 @@
 #include "X4ProInputManager.h"
 
 #include "AppLog.h"
+#include "Frontlight.h"
 #include "PowerManagement.h"
+#include "Settings.h"
 
 #include <BoardConfig.h>
 #include <Wire.h>
@@ -57,7 +59,8 @@ void X4ProInputManager::begin() {
   }
   if (gt911Address_ != 0) {
     readLoadedKeyConfig();
-    applyKeySensitivity(kConfiguredKeySensitivity);
+    const CompanionSettings settings = copySettings();
+    applyKeySensitivity(settings.system.touch.homeKeySensitivity);
     readLoadedKeyConfig();
   }
 
@@ -241,6 +244,7 @@ void X4ProInputManager::touchTask() {
   for (;;) {
     const TickType_t timeout = touchRetryPending_ ? kTouchRetryTicks : portMAX_DELAY;
     ulTaskNotifyTake(pdTRUE, timeout);
+    applyPendingKeySensitivity();
     pollTouch(millis());
   }
 }
@@ -406,6 +410,41 @@ void X4ProInputManager::applyKeySensitivity(uint8_t sensitivity) {
   logPrintf("GT911: applied touch-key sensitivity %u to all four key slots.\n", sensitivity);
 }
 
+void X4ProInputManager::setKeySensitivity(uint8_t sensitivity) {
+  if (gt911Address_ == 0) return;
+  const uint8_t clamped = sensitivity > 15 ? 15 : sensitivity;
+
+  if (touchTask_ == nullptr) {
+    // No dedicated touch task: pollTouch() only ever runs from update() on
+    // the caller's own task (see update()), so applying inline here can't
+    // race it.
+    applyKeySensitivity(clamped);
+    readLoadedKeyConfig();
+    return;
+  }
+
+  // The common case: a dedicated touchTask_ owns all I2C traffic for this
+  // controller. Hand the write off to it via notify rather than doing the
+  // Wire calls here, so this (Settings-page) caller's task never races
+  // pollTouch()'s own reads/writes on the same bus.
+  portENTER_CRITICAL(&irqMux_);
+  pendingKeySensitivity_ = clamped;
+  keySensitivityPending_ = true;
+  portEXIT_CRITICAL(&irqMux_);
+  xTaskNotifyGive(touchTask_);
+}
+
+void X4ProInputManager::applyPendingKeySensitivity() {
+  portENTER_CRITICAL(&irqMux_);
+  const bool pending = keySensitivityPending_;
+  const uint8_t sensitivity = pendingKeySensitivity_;
+  keySensitivityPending_ = false;
+  portEXIT_CRITICAL(&irqMux_);
+  if (!pending) return;
+  applyKeySensitivity(sensitivity);
+  readLoadedKeyConfig();
+}
+
 void X4ProInputManager::clearStatus() {
   Wire.beginTransmission(gt911Address_);
   Wire.write(static_cast<uint8_t>(kStatusReg >> 8));
@@ -464,6 +503,7 @@ void X4ProInputManager::pollTouch(unsigned long now) {
     notifyEventTask();
   }
   homeDown_ = homeDown;
+  updateTouchFeedbackLight();
   const uint8_t count = status & 0x0F;
   if (count == 0) {
     finishTouch(now);
@@ -488,6 +528,7 @@ void X4ProInputManager::pollTouch(unsigned long now) {
       touchDown_ = true;
       down_ = mapped;
       touchDownAt_ = now;
+      updateTouchFeedbackLight();
     }
     last_ = mapped;
   } else {
@@ -525,6 +566,20 @@ void X4ProInputManager::finishTouch(unsigned long now) {
     notifyEventTask();
   }
   touchDown_ = false;
+  updateTouchFeedbackLight();
+}
+
+void X4ProInputManager::updateTouchFeedbackLight() {
+  const bool active = touchDown_ || homeDown_;
+  if (active == touchFeedbackLightOn_) return;
+  touchFeedbackLightOn_ = active;
+  if (active) {
+    const CompanionSettings settings = copySettings();
+    setFrontlightColorTemperature(settings.system.frontlight.touchColorTemperature);
+    setFrontlightBrightness(settings.system.frontlight.touchBrightness);
+  } else {
+    setFrontlightBrightness(0);
+  }
 }
 
 bool X4ProInputManager::isPressed(uint8_t button) const {

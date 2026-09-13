@@ -100,6 +100,72 @@ pio run -e x4pro -t upload -j4
 pio device monitor -b 115200
 ```
 
+## Troubleshooting
+
+### `pio` is not recognized
+
+Installing PlatformIO with `python -m pip install platformio` does not necessarily
+put `pio` on `PATH`. The executable lives in the PlatformIO core virtualenv:
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -e x4pro -j4
+```
+
+To add it to `PATH` permanently for your user:
+
+```powershell
+[Environment]::SetEnvironmentVariable('PATH', "$env:USERPROFILE\.platformio\penv\Scripts;" + [Environment]::GetEnvironmentVariable('PATH','User'), 'User')
+```
+
+### `Failed to install Python dependencies into penv`
+
+A build that fails immediately with:
+
+```text
+Error: Failed to install Python dependencies (exit code: 2)
+Error: Failed to install Python dependencies into penv
+```
+
+usually means the `pioarduino` espressif32 platform could not reach PyPI. The
+platform installs its Python dependencies with `uv`, not `pip`, and it hides the
+underlying error. Reproduce it with output visible to confirm:
+
+```powershell
+$penv = "$env:USERPROFILE\.platformio\penv"
+& "$penv\Scripts\uv.exe" pip install --python="$penv\Scripts\python.exe" --reinstall --no-cache "intelhex>=2.3.0"
+```
+
+`--reinstall --no-cache` matters here: without them `uv` can satisfy the request
+from its cache and appear to succeed while the real build still fails. You can
+also test the blocked host directly:
+
+```powershell
+curl.exe -sS -o NUL -w "http=%{http_code}`n" https://files.pythonhosted.org/
+```
+
+On corporate networks this typically fails with a TLS handshake error against
+`files.pythonhosted.org`, because that host is blocked and traffic is expected to
+go through an approved proxy feed instead. `pip` already honours such a feed via
+the machine-wide `C:\ProgramData\pip\pip.ini`, but **`uv` does not read
+`pip.ini`**, so it needs its own configuration.
+
+Check which index `pip` is configured to use:
+
+```powershell
+python -m pip config debug
+```
+
+Then point `uv` at the same index by creating `%APPDATA%\uv\uv.toml`:
+
+```toml
+[[index]]
+url = "https://your-approved-pypi-proxy/pypi/simple/"
+default = true
+```
+
+This is user-level configuration, so it persists across shells and survives
+future PlatformIO platform reinstalls. Re-run the build afterwards.
+
 ## SD Card Files
 
 The firmware expects a settings file at:

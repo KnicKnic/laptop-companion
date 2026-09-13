@@ -40,6 +40,22 @@ struct CompanionSettings {
     bool showPowerStatsPage = true;
   };
 
+  // Frontlight test/feedback levels: also used by the touch driver as its
+  // touch-down flash brightness/color (0 brightness effectively disables the
+  // flash). Board-agnostic; a no-op on boards without a frontlight.
+  struct Frontlight {
+    uint8_t touchBrightness = 60;
+    uint8_t touchColorTemperature = 50;
+  };
+
+  // GT911 touch-key sensitivity (all four virtual key slots, including the
+  // Home key), as a single 0-15 nibble applied to both sensitivity registers.
+  // Only meaningful on input backends that report
+  // inputSupportsHomeKeySensitivity() (currently X4 Pro); a no-op elsewhere.
+  struct Touch {
+    uint8_t homeKeySensitivity = 9;  // matches the GT911 config the SDK shipped with
+  };
+
   struct System {
     PowerManagement powerManagement;
     Page page;
@@ -47,6 +63,8 @@ struct CompanionSettings {
     Sleep sleep;
     Buttons buttons;
     Debug debug;
+    Frontlight frontlight;
+    Touch touch;
   };
 
   System system;

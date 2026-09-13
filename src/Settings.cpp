@@ -51,6 +51,15 @@ String jsonStringOrDefault(const cJSON* object, const char* key, const String& d
   return String(item->valuestring);
 }
 
+uint8_t jsonUint8OrDefault(const cJSON* object, const char* key, uint8_t defaultValue) {
+  const cJSON* item = objectItem(object, key);
+  if (!cJSON_IsNumber(item)) return defaultValue;
+  int value = item->valueint;
+  if (value < 0) value = 0;
+  if (value > 255) value = 255;
+  return static_cast<uint8_t>(value);
+}
+
 cJSON* addObject(cJSON* parent, const char* key) {
   cJSON* object = cJSON_CreateObject();
   cJSON_AddItemToObject(parent, key, object);
@@ -109,6 +118,19 @@ bool CompanionSettings::deserialize(const String& json, char* error, size_t erro
   parsed.system.debug.showPowerStatsPage =
       jsonBoolOrDefault(debug, "show_power_stats_page", parsed.system.debug.showPowerStatsPage);
 
+  const cJSON* frontlight = objectItem(systemObj, "frontlight");
+  uint8_t touchBrightness =
+      jsonUint8OrDefault(frontlight, "touch_brightness", parsed.system.frontlight.touchBrightness);
+  uint8_t touchColorTemperature =
+      jsonUint8OrDefault(frontlight, "touch_color_temperature", parsed.system.frontlight.touchColorTemperature);
+  parsed.system.frontlight.touchBrightness = touchBrightness > 100 ? 100 : touchBrightness;
+  parsed.system.frontlight.touchColorTemperature = touchColorTemperature > 100 ? 100 : touchColorTemperature;
+
+  const cJSON* touch = objectItem(systemObj, "touch");
+  const uint8_t homeKeySensitivity =
+      jsonUint8OrDefault(touch, "home_key_sensitivity", parsed.system.touch.homeKeySensitivity);
+  parsed.system.touch.homeKeySensitivity = homeKeySensitivity > 15 ? 15 : homeKeySensitivity;
+
   *this = parsed;
   setError(error, errorLen, "");
   cJSON_Delete(root);
@@ -139,6 +161,13 @@ String CompanionSettings::serialize() const {
   cJSON* debug = addObject(systemObj, "debug");
   cJSON_AddBoolToObject(debug, "serial_logging", system.debug.serialLogging);
   cJSON_AddBoolToObject(debug, "show_power_stats_page", system.debug.showPowerStatsPage);
+
+  cJSON* frontlight = addObject(systemObj, "frontlight");
+  cJSON_AddNumberToObject(frontlight, "touch_brightness", system.frontlight.touchBrightness);
+  cJSON_AddNumberToObject(frontlight, "touch_color_temperature", system.frontlight.touchColorTemperature);
+
+  cJSON* touch = addObject(systemObj, "touch");
+  cJSON_AddNumberToObject(touch, "home_key_sensitivity", system.touch.homeKeySensitivity);
 
   char* printed = cJSON_Print(root);
   String out = printed ? String(printed) : String("{}");

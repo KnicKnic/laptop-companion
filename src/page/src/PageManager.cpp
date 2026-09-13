@@ -78,12 +78,18 @@ uint8_t directoryIndex = 1;
 
 bool batteryCached = false;
 bool batteryKnown = false;
+bool batteryCharging = false;
 uint16_t batteryPercent = 0;
 unsigned long batteryReadAtMs = 0;
+unsigned long chargingReadAtMs = 0;
 constexpr unsigned long kBatteryRefreshMs = 5UL * 60UL * 1000UL;
 // The CW2017 can briefly return 0% while its profile settles after boot. Don't
 // pin that provisional value in the page chrome's five-minute cache.
 constexpr unsigned long kBatteryRetryMs = 2UL * 1000UL;
+// Charge state flips the instant a cable is plugged in, so it can't ride the
+// five-minute percentage cache; it gets its own short interval, which still
+// coalesces the I2C read across a burst of renders.
+constexpr unsigned long kChargingRefreshMs = 5UL * 1000UL;
 
 constexpr size_t pageCount() {
   return sizeof(pages) / sizeof(pages[0]);
@@ -125,15 +131,22 @@ bool isCompanionRoute(PageId page) {
 void refreshBatteryForRender() {
   const unsigned long now = millis();
   const unsigned long refreshInterval = (batteryKnown && batteryPercent > 0) ? kBatteryRefreshMs : kBatteryRetryMs;
-  if (batteryCached && now - batteryReadAtMs < refreshInterval) return;
-
+  if (!batteryCached || now - batteryReadAtMs >= refreshInterval) {
+    BatteryMonitor battery;
+    const BatteryMonitor::Status status = battery.readStatus();
+    batteryKnown = status.percentageKnown;
+    batteryPercent = status.percentage > 100 ? 100 : status.percentage;
+    batteryCharging = status.chargingKnown && status.charging;
+    batteryReadAtMs = now;
+    chargingReadAtMs = now;
+    batteryCached = true;
+    setBootBatteryPercentage(batteryKnown, batteryPercent);
+    return;
+  }
+  if (now - chargingReadAtMs < kChargingRefreshMs) return;
   BatteryMonitor battery;
-  const BatteryMonitor::Status status = battery.readStatus();
-  batteryKnown = status.percentageKnown;
-  batteryPercent = status.percentage > 100 ? 100 : status.percentage;
-  batteryReadAtMs = now;
-  batteryCached = true;
-  setBootBatteryPercentage(batteryKnown, batteryPercent);
+  batteryCharging = battery.isCharging();
+  chargingReadAtMs = now;
 }
 
 PageId rootNavPage(uint8_t index) {
@@ -655,7 +668,10 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
   freeink::ui::Frame<1> frame(target, target.deviceContext(), input, interactions);
   freeink::ui::StatusBarProps status;
   status.leading = "Nicholas.Maliwack@gmail.com";
-  status.trailing = battery;
+  // The battery percentage is owned by the battery indicator below; leaving the
+  // status bar's right cluster empty keeps the two from drawing on top of each
+  // other in the same corner.
+  status.trailing = nullptr;
   status.fillBackground = true;
   status.text.maxLines = 1;
   status.trailingSecondary = nullptr;
@@ -663,6 +679,7 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
 
   freeink::ui::BatteryIndicatorProps batteryProps;
   batteryProps.percent = batteryKnown ? static_cast<uint8_t>(batteryPercent) : 0;
+  batteryProps.charging = batteryCharging;
   batteryProps.label = battery;
   batteryProps.text.align = freeink::ui::TextAlign::Right;
   batteryProps.text.maxLines = 1;

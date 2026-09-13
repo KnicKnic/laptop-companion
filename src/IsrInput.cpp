@@ -280,3 +280,21 @@ InputDiagnosticsSnapshot copyInputDiagnostics() {
 const char* inputPressKindName(ButtonPressKind kind) {
   return buttonPressName(kind);
 }
+
+bool inputSupportsHomeKeySensitivity() {
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool setHomeKeySensitivity(uint8_t sensitivity) {
+#if defined(FREEINK_DEVICE_X4PRO) && FREEINK_DEVICE_X4PRO
+  input.setKeySensitivity(sensitivity);
+  return true;
+#else
+  (void)sensitivity;
+  return false;
+#endif
+}
