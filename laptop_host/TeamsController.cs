@@ -54,15 +54,7 @@ namespace X3LaptopCompanion
 
         private static readonly string[] MicrophoneButtonNames = { "Mute mic", "Unmute mic" };
         private static readonly string[] CameraButtonNames = { "Turn camera on", "Turn camera off" };
-        private static readonly string[] HandButtonNames = { "Raise your hand", "Lower your hand" };
-
-        // Teams replaced the stateful "Raise your hand" / "Lower your hand" pair with a single
-        // button that is always called "Raise" and exposes no state. When only that button is
-        // present the raised state cannot be read back, so it is tracked here and toggled on each
-        // press. The stateful path above is kept and is used automatically whenever Teams exposes
-        // it again, so nothing has to change here if the product reverts.
-        private const string SingleHandAutomationId = "raisehands-button";
-        private static readonly string[] SingleHandButtonNames = { "Raise" };
+        private const string HandAutomationId = "raisehands-button";
 
         // Reactions live behind a flyout. Automation ids are matched first because they are stable
         // across Teams' UI and language changes; the display names are only a fallback.
@@ -79,21 +71,12 @@ namespace X3LaptopCompanion
             "Unmute mic",
             "Mute mic",
             "Turn camera off",
-            "Turn camera on",
-            "Raise your hand",
-            "Lower your hand",
-            "Raise"
+            "Turn camera on"
         };
         private IntPtr cachedMeetingWindowHandle = IntPtr.Zero;
         private int cachedMeetingTargetProcessId;
         private string cachedMeetingTargetProcessName = string.Empty;
         private readonly object cachedMeetingWindowLock = new object();
-
-        // Faked hand state, used only while Teams exposes the stateless "Raise" button. Reset
-        // whenever the meeting changes so a new meeting starts with the hand down.
-        private readonly object trackedHandLock = new object();
-        private bool trackedHandRaised;
-        private bool trackedHandValid;
 
         // Last-known meeting state, held so the companion keeps showing the meeting (and cached camera/hand)
         // while a full-screen Remote Desktop session DWM-cloaks the local Teams window and its UIA tree.
@@ -149,37 +132,12 @@ namespace X3LaptopCompanion
         {
             lock (meetingStateCacheLock)
             {
-                // A different meeting starts with the hand down, so drop any faked state.
-                var name = meetingName ?? string.Empty;
-                if (haveCachedMeetingState &&
-                    !string.Equals(name, lastKnownMeetingName, StringComparison.Ordinal))
-                {
-                    ResetTrackedHand("meeting changed");
-                }
-
                 haveCachedMeetingState = true;
-                lastKnownMeetingName = name;
+                lastKnownMeetingName = meetingName ?? string.Empty;
                 lastKnownMicrophone = microphone;
                 lastKnownCamera = camera;
                 lastKnownHand = hand;
             }
-        }
-
-        /// <summary>Drops the faked hand state used with the stateless "Raise" button.</summary>
-        private void ResetTrackedHand(string reason)
-        {
-            lock (trackedHandLock)
-            {
-                if (!trackedHandValid && !trackedHandRaised)
-                {
-                    return;
-                }
-
-                trackedHandRaised = false;
-                trackedHandValid = false;
-            }
-
-            HostLog.Write("Teams tracked hand state reset. reason=" + reason);
         }
 
         private void ClearMeetingStateCache(string reason)
@@ -366,13 +324,6 @@ namespace X3LaptopCompanion
             if (!TryFindCommandButtonTarget(command, audioProcessIds, explicitTargetProcessId, out var context,
                     out var button))
             {
-                // The raise/lower pair is gone in newer Teams; fall back to the stateless button.
-                if (command == TeamsCommand.ToggleHand &&
-                    TryToggleHandViaSingleButton(audioProcessIds, explicitTargetProcessId, stopwatch))
-                {
-                    return true;
-                }
-
                 HostLog.Write("Teams command failed; no current UIA button was found. command=" +
                     CommandName(command) + " elapsedMs=" + stopwatch.ElapsedMilliseconds);
                 return false;
@@ -423,45 +374,6 @@ namespace X3LaptopCompanion
                 default:
                     return Array.Empty<string>();
             }
-        }
-
-        /// <summary>
-        /// Toggles the hand with the stateless "Raise" button that replaced the raise/lower pair,
-        /// flipping the locally tracked state so the companion still shows raised or lowered.
-        /// </summary>
-        private bool TryToggleHandViaSingleButton(IReadOnlyCollection<int> audioProcessIds,
-            int? explicitTargetProcessId, Stopwatch stopwatch)
-        {
-            if (!TryFindMeetingWindow(audioProcessIds, explicitTargetProcessId, out var context))
-            {
-                return false;
-            }
-
-            var button = FindButtonByAutomationId(context.Root, SingleHandAutomationId) ??
-                FindButtonByNames(context.Root, SingleHandButtonNames);
-            if (button == null)
-            {
-                return false;
-            }
-
-            if (!TryInvokeButton(button.Element, button.Name))
-            {
-                HostLog.Write("Teams hand toggle failed; stateless button did not invoke. buttonName=\"" +
-                    button.Name + "\"");
-                return false;
-            }
-
-            bool raised;
-            lock (trackedHandLock)
-            {
-                trackedHandRaised = !trackedHandRaised;
-                trackedHandValid = true;
-                raised = trackedHandRaised;
-            }
-
-            HostLog.Write("Teams hand toggled via stateless button. buttonName=\"" + button.Name +
-                "\" trackedRaised=" + raised + " elapsedMs=" + stopwatch.ElapsedMilliseconds);
-            return true;
         }
 
         private static string GetReactionAutomationId(TeamsCommand command)
@@ -752,7 +664,7 @@ namespace X3LaptopCompanion
 
             var microphone = GetMicrophoneState(controls);
             var camera = GetCameraState(controls);
-            var hand = GetHandState(controls);
+            var hand = GetHandState(context.Hwnd, controls);
             var meetingName = ExtractMeetingName(controls.FirstWindowName);
             UpdateMeetingStateCache(meetingName, microphone, camera, hand);
 
@@ -762,7 +674,8 @@ namespace X3LaptopCompanion
                 " meeting=\"" + meetingName + "\" " + controls.DescribeState();
 
             HostLog.Write("Teams UIA snapshot. " + detail);
-            return new TeamsMeetingSnapshot(true, true, meetingName, microphone, camera, hand, detail);
+            return new TeamsMeetingSnapshot(true, true, meetingName, microphone, camera, hand, detail,
+                handLocked: hand == CompanionTriState.Unknown);
         }
 
         public static string CommandName(TeamsCommand command)
@@ -808,49 +721,57 @@ namespace X3LaptopCompanion
             return controls.TurnCameraOnButton != null ? CompanionTriState.Off : CompanionTriState.Unknown;
         }
 
-        private CompanionTriState GetHandState(MeetingControls controls)
+        private static CompanionTriState GetHandState(IntPtr windowHandle, MeetingControls controls)
         {
-            // Preferred path: Teams names the button after the action it will perform, so the
-            // pair tells us the current state directly.
-            if (controls.LowerHandButton != null)
+            if (controls.HandButton == null)
             {
-                lock (trackedHandLock)
+                HostLog.Write("Teams hand state unavailable; raisehands-button was not found.");
+                return CompanionTriState.Unknown;
+            }
+
+            try
+            {
+                controls.HandDescription = NativeUiAutomation.ReadFullDescription(windowHandle,
+                    controls.HandButton.Element.GetRuntimeId());
+                var state = ParseHandState(controls.HandDescription);
+                if (state == CompanionTriState.Unknown)
                 {
-                    trackedHandRaised = true;
-                    trackedHandValid = true;
+                    HostLog.Write("Teams hand state unavailable; unrecognized FullDescription=\"" +
+                        controls.HandDescription + "\".");
                 }
 
+                return state;
+            }
+            catch (Exception ex) when (ex is COMException || ex is ElementNotAvailableException ||
+                ex is NotSupportedException)
+            {
+                HostLog.Write("Teams hand FullDescription read failed.", ex);
+                return CompanionTriState.Unknown;
+            }
+        }
+
+        internal static CompanionTriState ParseHandState(string description)
+        {
+            var action = (description ?? string.Empty).Trim();
+            if (DescribesHandAction(action, "Lower your hand"))
+            {
                 return CompanionTriState.On;
             }
 
-            if (controls.RaiseHandButton != null)
+            if (DescribesHandAction(action, "Raise your hand"))
             {
-                lock (trackedHandLock)
-                {
-                    trackedHandRaised = false;
-                    trackedHandValid = true;
-                }
-
                 return CompanionTriState.Off;
             }
 
-            // Fallback: only the stateless "Raise" button exists, so report what we last set. A
-            // meeting starts with the hand down, which is the seed used until something is pressed.
-            if (controls.SingleHandButton != null)
-            {
-                lock (trackedHandLock)
-                {
-                    if (!trackedHandValid)
-                    {
-                        trackedHandRaised = false;
-                        trackedHandValid = true;
-                    }
-
-                    return trackedHandRaised ? CompanionTriState.On : CompanionTriState.Off;
-                }
-            }
-
             return CompanionTriState.Unknown;
+        }
+
+        private static bool DescribesHandAction(string description, string action)
+        {
+            return description.StartsWith(action, StringComparison.OrdinalIgnoreCase) &&
+                (description.Length == action.Length ||
+                 char.IsWhiteSpace(description[action.Length]) ||
+                 char.IsPunctuation(description[action.Length]));
         }
 
         private static string ExtractMeetingName(string windowName)
@@ -912,10 +833,16 @@ namespace X3LaptopCompanion
 
             MeetingWindowContext bestContext = null;
             var bestScore = 0;
+            var probedWindows = new HashSet<IntPtr>();
             foreach (var target in targets)
             {
                 foreach (var window in FindCandidateWindows(target.ProcessId))
                 {
+                    if (!probedWindows.Add(window.Hwnd))
+                    {
+                        continue;
+                    }
+
                     HostLog.Write("Teams UIA target probe. " + DescribeTarget(target) +
                         " hwnd=0x" + window.Hwnd.ToInt64().ToString("X") +
                         " title=\"" + window.Title + "\" hosted=" + window.HostsRequestedProcess + ".");
@@ -935,13 +862,15 @@ namespace X3LaptopCompanion
                             " hwnd=0x" + window.Hwnd.ToInt64().ToString("X") +
                             " score=" + score + " " + controls.DescribeState());
 
-                        if (score > bestScore)
+                        if (controls.HasMeetingControl && score > bestScore)
                         {
                             bestScore = score;
                             bestContext = new MeetingWindowContext(target, window.Hwnd, root, controls);
                         }
 
-                        if (controls.HasMeetingControl)
+                        // Compact/sharing windows can have mic and camera controls but no hand
+                        // button. Keep looking for the full meeting toolbar before accepting one.
+                        if (controls.HandButton != null)
                         {
                             context = new MeetingWindowContext(target, window.Hwnd, root, controls);
                             RememberMeetingWindow(context);
@@ -1091,6 +1020,13 @@ namespace X3LaptopCompanion
         private static bool TryFindCommandButton(AutomationElement root, TeamsCommand command, out ButtonInfo button,
             out string method)
         {
+            if (command == TeamsCommand.ToggleHand)
+            {
+                button = FindButtonByAutomationId(root, HandAutomationId);
+                method = "FindFirst:id=" + HandAutomationId;
+                return button != null;
+            }
+
             button = null;
             method = string.Empty;
             foreach (var name in GetCommandButtonNames(command))
@@ -1182,8 +1118,6 @@ namespace X3LaptopCompanion
             {
                 case TeamsCommand.ToggleMute:
                     return MicrophoneButtonNames;
-                case TeamsCommand.ToggleHand:
-                    return HandButtonNames;
                 case TeamsCommand.ToggleVideo:
                     return CameraButtonNames;
                 default:
@@ -1228,7 +1162,7 @@ namespace X3LaptopCompanion
                 HostLog.Write("Teams UIA cached target score. hwnd=0x" +
                     handle.ToInt64().ToString("X") +
                     " score=" + controls.Score + " " + controls.DescribeState());
-                if (!controls.HasMeetingControl)
+                if (!controls.HasMeetingControl || controls.HandButton == null)
                 {
                     ClearMeetingWindowCache();
                     return false;
@@ -1319,18 +1253,9 @@ namespace X3LaptopCompanion
             {
                 controls.TurnCameraOffButton = button;
             }
-            else if (NameEquals(button.Name, "Raise your hand"))
+            else if (string.Equals(button.AutomationId, HandAutomationId, StringComparison.Ordinal))
             {
-                controls.RaiseHandButton = button;
-            }
-            else if (NameEquals(button.Name, "Lower your hand"))
-            {
-                controls.LowerHandButton = button;
-            }
-            else if (NameEquals(button.Name, "Raise"))
-            {
-                // Stateless replacement for the raise/lower pair.
-                controls.SingleHandButton = button;
+                controls.HandButton = button;
             }
 
             if (string.IsNullOrEmpty(controls.AnchorButtonName))
@@ -1362,10 +1287,6 @@ namespace X3LaptopCompanion
                     return expectedState.Value == CompanionTriState.Off
                         ? new[] { "Turn camera on", "Turn camera off" }
                         : new[] { "Turn camera off", "Turn camera on" };
-                case TeamsCommand.ToggleHand:
-                    return expectedState.Value == CompanionTriState.Off
-                        ? new[] { "Raise your hand", "Lower your hand" }
-                        : new[] { "Lower your hand", "Raise your hand" };
                 default:
                     return MeetingButtonNames;
             }
@@ -1381,7 +1302,9 @@ namespace X3LaptopCompanion
                     .ToArray();
                 var condition = new AndCondition(
                     new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
-                    nameConditions.Length == 1 ? nameConditions[0] : new OrCondition(nameConditions));
+                    new OrCondition(
+                        new OrCondition(nameConditions),
+                        new PropertyCondition(AutomationElement.AutomationIdProperty, HandAutomationId)));
 
                 var cacheRequest = new CacheRequest { TreeScope = TreeScope.Element };
                 cacheRequest.Add(AutomationElement.NameProperty);
@@ -1871,9 +1794,8 @@ namespace X3LaptopCompanion
             public ButtonInfo UnmuteMicButton { get; set; }
             public ButtonInfo TurnCameraOnButton { get; set; }
             public ButtonInfo TurnCameraOffButton { get; set; }
-            public ButtonInfo RaiseHandButton { get; set; }
-            public ButtonInfo LowerHandButton { get; set; }
-            public ButtonInfo SingleHandButton { get; set; }
+            public ButtonInfo HandButton { get; set; }
+            public string HandDescription { get; set; } = string.Empty;
             public int NodesVisited { get; set; }
             public long FindMs { get; set; }
             public string AnchorButtonName { get; set; }
@@ -1887,9 +1809,7 @@ namespace X3LaptopCompanion
                         UnmuteMicButton != null ||
                         TurnCameraOnButton != null ||
                         TurnCameraOffButton != null ||
-                        RaiseHandButton != null ||
-                        LowerHandButton != null ||
-                        SingleHandButton != null;
+                        HandButton != null;
                 }
             }
 
@@ -1908,7 +1828,7 @@ namespace X3LaptopCompanion
                         score += 3;
                     }
 
-                    if (RaiseHandButton != null || LowerHandButton != null)
+                    if (HandButton != null)
                     {
                         score += 2;
                     }
@@ -1933,8 +1853,8 @@ namespace X3LaptopCompanion
                     " unmuteButton=\"" + ButtonName(UnmuteMicButton) + "\"" +
                     " cameraOnButton=\"" + ButtonName(TurnCameraOnButton) + "\"" +
                     " cameraOffButton=\"" + ButtonName(TurnCameraOffButton) + "\"" +
-                    " raiseHandButton=\"" + ButtonName(RaiseHandButton) + "\"" +
-                    " lowerHandButton=\"" + ButtonName(LowerHandButton) + "\"";
+                    " handButton=\"" + ButtonName(HandButton) + "\"" +
+                    " handDescription=\"" + HandDescription + "\"";
             }
 
             private static string ButtonName(ButtonInfo button)

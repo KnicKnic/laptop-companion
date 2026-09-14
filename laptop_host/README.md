@@ -34,20 +34,22 @@
     between. If that call is unavailable on the running Windows build, it falls
     back to stepping with `Ctrl+Win+Left/Right`.
 - Finds the active Teams meeting window from the parent of the Teams audio
-  process when possible.
+  process when possible, preferring the full meeting toolbar with its hand button
+  over compact/sharing windows that only expose microphone and camera controls.
 - Handles mute, camera, and raise-hand commands by finding the current Teams UI
   Automation button and invoking it with `InvokePattern`. The meeting window is
   cached, but controls are rediscovered for each command because Teams rerenders
   the meeting toolbar.
-- Reads the raised-hand state from the `Raise your hand` / `Lower your hand`
-  button pair, whose names describe the next action and therefore the current
-  state. Newer Teams builds replaced that pair with a single stateless button
-  called `Raise` (`raisehands-button`). When only that button is present the
-  state cannot be read back, so the host remembers it, toggles it on each press,
-  and reports the remembered value. That fallback engages automatically and the
-  stateful path is kept intact, so nothing needs changing if Teams restores it.
-  The remembered value is a guess: it is seeded to lowered and reset whenever the
-  meeting changes, so it can disagree with Teams if the hand is changed elsewhere.
+- Finds the hand button by its automation id (`raisehands-button`) and reads its
+  native UI Automation `FullDescription` (property 30159), not its fixed `Raise`
+  label. `Lower your hand` means raised; `Raise your hand` means lowered. The
+  description is readable without hovering or focusing Teams, including suffixes
+  such as `. Has context menu`. The host does not guess or toggle a local hand
+  state, and post-command refreshes wait for the observed state.
+  Missing or unrecognized descriptions are logged and reported as unknown, with
+  the hand tile locked rather than assuming the hand is lowered. As before, an
+  unreachable meeting window holds the last observed state with the tile locked.
+  Hand-state descriptions currently require English Teams text.
 - Handles meeting reactions (like, heart, applause) by expanding the meeting's
   React menu button and then invoking the reaction inside the flyout, searching
   the desktop root as well because the flyout is a popup window. The React
@@ -71,9 +73,10 @@
 - Writes a diagnostic log to `%LOCALAPPDATA%\X3LaptopCompanion\host.log`.
   Use the `Open Log` button or tray menu item to jump to it.
 
-Microphone, camera, and hand state are inferred from the current Teams button
-names, for example `Mute mic` means the microphone is live and `Unmute mic`
-means Teams is muted. WASAPI is still sampled to discover the Teams audio
+Microphone and camera state are inferred from the current Teams button names;
+hand state comes from the hand button's native `FullDescription`. For example,
+`Mute mic` means the microphone is live and `Unmute mic` means Teams is muted.
+WASAPI is still sampled to discover the Teams audio
 process that leads to the right hosted meeting window.
 
 ## Build
@@ -81,6 +84,18 @@ process that leads to the right hosted meeting window.
 ```powershell
 dotnet build .\X3LaptopCompanion.csproj
 ```
+
+## Hand-state regression checks
+
+From the repository root, run the dependency-free checks with the .NET SDK:
+
+```powershell
+dotnet run --project .\laptop_host.tests\X3LaptopCompanion.Tests.csproj --configuration Release
+```
+
+To also verify native description reads and repeated meeting snapshots, append
+`-- --live <Teams audio PID> <Teams window PID>`. This requires an active meeting
+and only reads UI Automation; it never invokes a meeting control.
 
 ## Run
 

@@ -8,4 +8,8 @@
     <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="X3LaptopCompanion.Tests" />
+  </ItemGroup>
+
 </Project>
