@@ -589,21 +589,17 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
   }
 
   switch (kind) {
-    case ButtonPressKind::Back:
     case ButtonPressKind::Directory:
       xSemaphoreTake(pageMutex, portMAX_DELAY);
       syncDirectorySelection(page);
       directoryOpen = true;
-      directoryOpenedByHomeKey = kind == ButtonPressKind::Directory;
+      directoryOpenedByHomeKey = true;
       xSemaphoreGive(pageMutex);
       return PageButtonResult{page, true, true};
     case ButtonPressKind::Up:
     case ButtonPressKind::Down:
-      if (pageFor(page).handleButton(kind)) {
-        return PageButtonResult{activePage(), true, false};
-      }
-      return PageButtonResult{
-          kind == ButtonPressKind::Up ? showPreviousPage() : showNextPage(), true, false};
+      return PageButtonResult{activePage(), pageFor(page).handleButton(kind), false};
+    case ButtonPressKind::Back:
     case ButtonPressKind::Left:
     case ButtonPressKind::Right:
     case ButtonPressKind::Confirm:
