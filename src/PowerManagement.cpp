@@ -11,8 +11,14 @@
 namespace {
 
 constexpr int kMaxCpuMhz = 240;
-constexpr int kMinCpuMhz = 10;
+// DFS floor. 40 MHz (XTAL, no divider): at 10 MHz the btSlp timer ISR -> esp_timer
+// task dispatch after a light-sleep wake took ~1.2 ms avg / 2.7 ms max, eating
+// the BLE controller's 1.8 ms wake lead; at 40 MHz it is ~0.22 / 0.71 ms.
+constexpr int kDefaultMinCpuMhz = 40;
 constexpr uint64_t kBootNoLightSleepUs = 60ULL * 1000ULL * 1000ULL;
+
+int minCpuMhz = kDefaultMinCpuMhz;
+bool pmStatsDumpEnabled = true;
 
 PowerManagementState state;
 TimedPowerManagementLock maxPower(ESP_PM_CPU_FREQ_MAX, "max-power");
@@ -123,7 +129,7 @@ bool configurePowerManagementFromSettings() {
   state.autoLightSleep = settings.system.powerManagement.autoLightSleep;
   state.configResult = ESP_OK;
   state.maxFreqMhz = kMaxCpuMhz;
-  state.minFreqMhz = kMinCpuMhz;
+  state.minFreqMhz = minCpuMhz;
 
   if (!settings.system.powerManagement.enable) {
     logPrintf("Power management disabled by settings.\n");
@@ -132,7 +138,7 @@ bool configurePowerManagementFromSettings() {
 
   esp_pm_config_t pmConfig = {};
   pmConfig.max_freq_mhz = kMaxCpuMhz;
-  pmConfig.min_freq_mhz = kMinCpuMhz;
+  pmConfig.min_freq_mhz = minCpuMhz;
   pmConfig.light_sleep_enable = settings.system.powerManagement.autoLightSleep;
   if (pmConfig.light_sleep_enable) {
     BoardConfig::holdPowerRailsForLightSleep();
@@ -237,4 +243,22 @@ void disarmLightSleepDeadman() {
 
 uint32_t lightSleepDeadmanTrips() {
   return deadmanTrips;
+}
+
+void setPowerManagementMinFreqMhz(int mhz) {
+  // ESP32-S3 DFS accepts XTAL dividers (10/20/40) or PLL rates (80/160/240).
+  if (mhz != 10 && mhz != 20 && mhz != 40 && mhz != 80 && mhz != 160 && mhz != 240) return;
+  minCpuMhz = mhz;
+}
+
+int powerManagementMinFreqMhz() {
+  return minCpuMhz;
+}
+
+void setPmStatsDumpEnabled(bool enabled) {
+  pmStatsDumpEnabled = enabled;
+}
+
+bool pmStatsDumpIsEnabled() {
+  return pmStatsDumpEnabled;
 }

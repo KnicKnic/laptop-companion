@@ -43,8 +43,15 @@ Also need to mess with
 ### Config fix
 `CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP` defaults to `y`, so commenting it out in platformio.ini did **not**
 disable it (the generated sdkconfig.x4pro still had it on). It is now explicitly unset.
-The light-sleep code is also kept in IRAM (`CONFIG_PM_SLP_IRAM_OPT`, `CONFIG_PM_RTOS_IDLE_OPT`), which cut
-late BT wakes ~5x in testing.
+The light-sleep code is also kept in IRAM (`CONFIG_PM_SLP_IRAM_OPT`, `CONFIG_PM_RTOS_IDLE_OPT`).
+
+**pioarduino ignores linker-fragment options.** With `custom_sdkconfig`, pioarduino rebuilds the IDF libs and
+copies the `.a` files and `memory.ld` into framework-arduinoespressif32-libs, but not the generated
+`sections.ld`, so the Arduino link keeps the prebuilt one: `esp_light_sleep_start`, `vApplicationSleep`,
+`esp_pm_impl_waiti` stayed in flash even with the IRAM options on (verified with `nm`). Every Kconfig option
+implemented through linker fragments was silently ignored. `scripts/install_idf_sections_ld.py` (post: script on
+the x4pro env) installs the generated `sections.ld` during the IDF phase. To force that phase after changing the
+script, change `custom_sdkconfig` or the `# TASMOTA__<hash>` first line of sdkconfig.defaults.
 
 ### Instrumentation (`src/BtSleepTiming.*`, linker `--wrap` of esp_timer_create/start_once/stop and rtc_clk_cal)
 * **BTW line** (power stats page, serial, BLE): for every `btSlp`-scheduled wake, the margin between the CPU
@@ -90,7 +97,7 @@ late BT wakes ~5x in testing.
 | PM on, light sleep off | stable; bt lock ~1-4%; min BT wake margin ~0.9-1.0ms of the 1.8ms lead |
 | light sleep, CPU power-down on (as previously shipped) | link drops every ~17s; 22 drops in 3 min |
 | light sleep, CPU power-down off | still drops: 414 of 1878 BT wakes late, 9 past -2.5ms, min margin -3.2ms, supervision timeout |
-| + sleep code in IRAM (`PM_SLP_IRAM_OPT`, `PM_RTOS_IDLE_OPT`) | fewer late wakes (79 of 1779) but 15 past -2.5ms, min -4.8ms, 2 supervision timeouts |
+| + sleep code in IRAM (`PM_SLP_IRAM_OPT`, `PM_RTOS_IDLE_OPT`); options were not actually applied yet, see "pioarduino ignores linker-fragment options" | fewer late wakes (79 of 1779) but 15 past -2.5ms, min -4.8ms, 2 supervision timeouts (difference likely run-to-run/temperature) |
 | + `rtcf=1` | one panic (rst=4) right after enabling, not reproduced; retry: 1543 sleeps, still a supervision timeout |
 | + `tune=1` (laptop fan moved away) | **stable**: 0 disconnects in 12 + 25 min; ~97% light sleep, bt lock 1.1%; lead converged to ~5-6ms; 7-9 late wakes, all during convergence |
 | control, same conditions, `tune=0` | 1015 of 2086 wakes late, 21 missed, supervision timeout; dead-man switch turned light sleep off by itself |
@@ -108,18 +115,41 @@ late BT wakes ~5x in testing.
   single unconfirmed `digitalRead` edge in X4ProInputManager) or a hang. The next boot's `rst=` tells:
   8 = woke from deep sleep, 4 = panic, 1 = power-on/reset.
 
+### Where the wake delay comes from (btSlp due -> bt lock), `tune=1` unless noted, laptop moved away
+`wl` = light-sleep exit vs timer due, `dsp` = due/exit -> btSlp callback (timer ISR + esp_timer task),
+`off` = callback -> bt lock (controller task). avg / max in us.
+
+| Config | wl | dsp | off | late | tuned lead | light sleep |
+|---|---|---|---|---|---|---|
+| IRAM opts not applied, 10 MHz floor | - | - | - | 7-9 | 5-6 ms | 75-88% |
+| IRAM applied, 10 MHz floor | -866 / +417 | **1230 / 2704** | 17 / 48 | 2 | 3.9 ms | 88.2% |
+| IRAM applied, 40 MHz floor | -1224 / +20 | **228 / 712** | 18 / 42 | 0 | 2.0-2.2 ms | 91.7% |
+| same, `tune=0` (IDF's 1.8 ms) | -770 / -16 | 236 / 711 | 20 / 43 | 0, min margin 0.75 ms | 1.8 ms | 93.0% |
+| same, `tune=0`, PM-stats dump task off | -175 / +22 | 230 / 711 | 18 / 46 | 0, min margin 1.05 ms | 1.8 ms | 93.7% |
+
+* The CPU wakes on time or early; the cost was dispatching the timer at the 10 MHz DFS floor (ISR, context
+  switch, PLL ramp to 240 MHz all at 10 MHz). The DFS floor is now 40 MHz (XTAL, no divider), as in IDF's
+  BLE power-save example. Live A/B over BLE: `minf=10|20|40|80`.
+* The 15 s PM-stats dump task (formats PM/timer tables, writes to the dead USB console) costs ~0.3 ms of the
+  tail; `dump=0` disables it live.
+* The 8MD256 calibration error (-600..+1000 ppm here, ~1 ms at 1.3 s sleeps) is invisible to these margins
+  (esp_timer is corrected with the same calibration). `tune=1` keeps a guard for it; with `tune=0` the link held
+  for 14 minutes but has no margin for it.
+
 ### Conclusion
-`bt_wake_autotune` (now on by default) is what makes auto light sleep + BLE work on the S3: the X3 trick of
-avoiding the 7% RC window was necessary but not sufficient, because the 8MD256 calibration is still off by
-hundreds to thousands of ppm, more than IDF's fixed 1.8ms lead covers at 1.2-1.3s BT sleeps. The tuner
-trades ~4ms more awake per BT wake (~0.3% duty) for a stable link. Keep the laptop fan off the device when
-measuring: the warm air roughly doubled the calibration error.
+Auto light sleep + BLE works on the S3 once the light-sleep path really is in IRAM and the DFS floor is 40 MHz;
+then IDF's stock 1.8 ms lead is enough in testing. `bt_wake_autotune` stays on by default as a safety net for
+slow-clock calibration error (it settles ~0.2-0.4 ms above IDF's lead). The X3 trick of avoiding the 7% RC
+window is still required. Keep warm air off the device when measuring: it roughly doubled the calibration error.
 
 To use it day to day, turn on "Auto light sleep" on the Settings page (saved to SD). USB stays usable for
-60s after each boot; after that, reset the device to flash.
+60s after each boot; after that, reset the device to flash. Do not run esptool while the device is light
+sleeping: twice it left the device unreachable (no advertising, no ROM response) until a manual reset.
 
 ### Possible follow-ups
-* Lower the tuner's target (400us + guard, +1ms per late wake) once longer soaks show margin to spare.
-* Check `rtcf=1` together with `tune=1`; with the fan removed the 10-cycle calibration was only -600..+1000 ppm.
+* Turn the PM-stats dump task and PM/esp_timer profiling off by default for normal use.
+* The companion BLE worker polls every 500 ms (~2 wakes/s, more than BLE itself); make it event-driven.
 * Debounce the X4 Pro power button (single `digitalRead` edge) in case a wake glitch caused the earlier
   "device unreachable" episodes.
+* Settings page: 11 rows fit with 16 px to spare on the 480x800 portrait layout and there is no scrolling;
+  another row needs paging.

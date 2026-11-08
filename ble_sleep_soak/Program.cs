@@ -164,7 +164,9 @@ internal static class Program
                 $"itvl={Get(kv, "itvl")}/lat{Get(kv, "lat")} wakes={Get(kv, "wakes")} late={Get(kv, "late")} " +
                 $"miss={Get(kv, "miss")} min={Get(kv, "min_us")}us avg={Get(kv, "avg_us")}us " +
                 $"lead={Get(kv, "lead_us")}/{Get(kv, "idf_lead_us")}us tune={Get(kv, "tune")} " +
-                $"cal={Get(kv, "cal_min")}..{Get(kv, "cal_max")}ppm rtcf={Get(kv, "rtcf")} " +
+                $"cal={Get(kv, "cal_min")}..{Get(kv, "cal_max")}ppm rtcf={Get(kv, "rtcf")} minf={Get(kv, "minf")} " +
+                $"wl={Get(kv, "wl_avg")}/{Get(kv, "wl_max")} dsp={Get(kv, "dsp_avg")}/{Get(kv, "dsp_max")} " +
+                $"off={Get(kv, "off_avg")}/{Get(kv, "off_max")}us " +
                 $"disc={Get(kv, "gap_disc")} sto={Get(kv, "sto")} reason={Get(kv, "disc_reason")}");
         }
         catch (Exception ex)

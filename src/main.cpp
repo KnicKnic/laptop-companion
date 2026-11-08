@@ -47,6 +47,7 @@ void pmStatsDumpTask(void*) {
   bool havePreviousInterruptStats = false;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(kPmStatsDumpPeriodMs));
+    if (!pmStatsDumpIsEnabled()) continue;
     const InterruptStatsSnapshot interruptStats = copyInterruptStats();
     const uint32_t touchIrqCount = inputTouchInterruptCount();
     const uint32_t buttonIrqCount = inputButtonInterruptCount();

@@ -57,6 +57,18 @@ DRAM_ATTR uint32_t s_calGuardPpm = 0;
 DRAM_ATTR int64_t s_btLockAcquiredAtUs = 0;
 DRAM_ATTR int64_t s_statsResetAtUs = 0;
 
+// Latency decomposition.
+DRAM_ATTR esp_timer_cb_t s_btSlpOrigCb = nullptr;
+DRAM_ATTR void* s_btSlpOrigArg = nullptr;
+DRAM_ATTR int64_t s_armAtUs = 0;
+DRAM_ATTR volatile int64_t s_cbAtUs = 0;
+DRAM_ATTR volatile int64_t s_lastLightSleepExitUs = 0;
+
+void IRAM_ATTR btSlpCallbackTrampoline(void*) {
+  s_cbAtUs = esp_timer_get_time();
+  if (s_btSlpOrigCb) s_btSlpOrigCb(s_btSlpOrigArg);
+}
+
 // RTC calibration tracking.
 DRAM_ATTR bool s_rtcFilter = false;
 DRAM_ATTR int64_t s_emaQ8 = 0;
@@ -207,11 +219,18 @@ void referenceCalibrationTask(void*) {
 
 extern "C" esp_err_t __wrap_esp_timer_create(const esp_timer_create_args_t* create_args,
                                              esp_timer_handle_t* out_handle) {
-  const esp_err_t err = __real_esp_timer_create(create_args, out_handle);
-  if (err == ESP_OK && create_args && create_args->name && out_handle && strcmp(create_args->name, "btSlp") == 0) {
-    s_btSlpTimer = *out_handle;
+  if (create_args && create_args->name && out_handle && strcmp(create_args->name, "btSlp") == 0) {
+    // Interpose on the controller's wake timer callback to timestamp dispatch.
+    esp_timer_create_args_t args = *create_args;
+    s_btSlpOrigCb = create_args->callback;
+    s_btSlpOrigArg = create_args->arg;
+    args.callback = btSlpCallbackTrampoline;
+    args.arg = nullptr;
+    const esp_err_t err = __real_esp_timer_create(&args, out_handle);
+    if (err == ESP_OK) s_btSlpTimer = *out_handle;
+    return err;
   }
-  return err;
+  return __real_esp_timer_create(create_args, out_handle);
 }
 
 extern "C" esp_err_t IRAM_ATTR __wrap_esp_timer_start_once(esp_timer_handle_t timer, uint64_t timeout_us) {
@@ -233,6 +252,8 @@ extern "C" esp_err_t IRAM_ATTR __wrap_esp_timer_start_once(esp_timer_handle_t ti
     lead = defaultLead;
   }
   s_pending = true;
+  s_armAtUs = nowUs;
+  s_cbAtUs = 0;
   s_expectedFireAtUs = nowUs + adjusted;
   s_controllerWakeAtUs = nowUs + usToSleep;
   s_stats.btSlpArmed++;
@@ -309,8 +330,31 @@ void btSleepTimingOnBtLockAcquired(int64_t nowUs) {
   if (timerPath) {
     s_stats.marginSumUs += marginUs;
     autotuneOnWake(marginUs);
+    const int64_t cbAt = s_cbAtUs;
+    if (cbAt > 0) {
+      const int64_t exitAt = s_lastLightSleepExitUs;
+      const bool asleep = exitAt > s_armAtUs && exitAt <= cbAt;
+      const int64_t dispatchFrom = asleep && exitAt > s_expectedFireAtUs ? exitAt : s_expectedFireAtUs;
+      const int32_t dispatchUs = static_cast<int32_t>(cbAt - dispatchFrom);
+      const int32_t offloadUs = static_cast<int32_t>(nowUs - cbAt);
+      s_stats.latSamples++;
+      s_stats.dispatchSumUs += dispatchUs;
+      if (dispatchUs > s_stats.dispatchMaxUs) s_stats.dispatchMaxUs = dispatchUs;
+      s_stats.offloadSumUs += offloadUs;
+      if (offloadUs > s_stats.offloadMaxUs) s_stats.offloadMaxUs = offloadUs;
+      if (asleep) {
+        const int32_t wakeLateUs = static_cast<int32_t>(exitAt - s_expectedFireAtUs);
+        s_stats.latAsleep++;
+        s_stats.wakeLateSumUs += wakeLateUs;
+        if (s_stats.latAsleep == 1 || wakeLateUs > s_stats.wakeLateMaxUs) s_stats.wakeLateMaxUs = wakeLateUs;
+      }
+    }
   }
   portEXIT_CRITICAL_SAFE(&s_mux);
+}
+
+void btSleepTimingOnLightSleepExit(int64_t nowUs) {
+  s_lastLightSleepExitUs = nowUs;
 }
 
 void btSleepTimingOnBtLockReleased(int64_t nowUs) {
@@ -416,26 +460,30 @@ std::string formatBtSleepTimingKv() {
   const int32_t avg = s.timerWakes > 0 ? static_cast<int32_t>(s.marginSumUs / static_cast<int64_t>(s.timerWakes)) : 0;
   const unsigned btPermille =
       s.wallUs > 0 ? static_cast<unsigned>((s.btAwakeUs * 1000ULL) / s.wallUs) : 0;
-  char kv[480];
+  const long wlAvg = s.latAsleep > 0 ? static_cast<long>(s.wakeLateSumUs / s.latAsleep) : 0;
+  const long dspAvg = s.latSamples > 0 ? static_cast<long>(s.dispatchSumUs / s.latSamples) : 0;
+  const long offAvg = s.latSamples > 0 ? static_cast<long>(s.offloadSumUs / s.latSamples) : 0;
+  // Kept under the 512-byte ATT value limit together with the BLE service's prefix.
+  char kv[400];
   snprintf(kv, sizeof(kv),
-           "win_s=%lu armed=%lu wakes=%lu tmr=%lu pre=%lu unsched=%lu late=%lu miss=%lu min_us=%ld avg_us=%ld "
-           "last_us=%ld lead_us=%lu idf_lead_us=%lu sleep_us=%lu tune=%u bt_pm=%u "
+           "win_s=%lu wakes=%lu tmr=%lu pre=%lu late=%lu miss=%lu min_us=%ld avg_us=%ld "
+           "lsw=%lu wl_avg=%ld wl_max=%ld dsp_avg=%ld dsp_max=%ld off_avg=%ld off_max=%ld "
+           "lead_us=%lu idf_lead_us=%lu sleep_us=%lu tune=%u bt_pm=%u "
            "mb=%lu/%lu/%lu/%lu/%lu/%lu/%lu "
-           "cal_hz=%lu cal_n=%lu cal_min=%ld cal_max=%ld cal_avg=%ld cal_ema=%ld cal_worst=%ld guard=%lu rtcf=%u rc=%u",
-           static_cast<unsigned long>(s.wallUs / 1000000ULL), static_cast<unsigned long>(s.btSlpArmed),
-           static_cast<unsigned long>(s.wakes), static_cast<unsigned long>(s.timerWakes),
-           static_cast<unsigned long>(s.preemptedWakes), static_cast<unsigned long>(s.unscheduledWakes),
+           "cal_hz=%lu cal_n=%lu cal_min=%ld cal_max=%ld cal_ema=%ld guard=%lu rtcf=%u",
+           static_cast<unsigned long>(s.wallUs / 1000000ULL), static_cast<unsigned long>(s.wakes),
+           static_cast<unsigned long>(s.timerWakes), static_cast<unsigned long>(s.preemptedWakes),
            static_cast<unsigned long>(s.lateWakes), static_cast<unsigned long>(s.missedWakes),
-           static_cast<long>(s.minMarginUs), static_cast<long>(avg), static_cast<long>(s.lastMarginUs),
-           static_cast<unsigned long>(s.leadUs), static_cast<unsigned long>(s.defaultLeadUs),
-           static_cast<unsigned long>(s.lastSleepUs), s.autotune ? 1U : 0U, btPermille,
-           static_cast<unsigned long>(s.marginBuckets[0]), static_cast<unsigned long>(s.marginBuckets[1]),
-           static_cast<unsigned long>(s.marginBuckets[2]), static_cast<unsigned long>(s.marginBuckets[3]),
-           static_cast<unsigned long>(s.marginBuckets[4]), static_cast<unsigned long>(s.marginBuckets[5]),
-           static_cast<unsigned long>(s.marginBuckets[6]), static_cast<unsigned long>(s.refSlowClockHz),
-           static_cast<unsigned long>(s.calSamples), static_cast<long>(s.calMinPpm),
-           static_cast<long>(s.calMaxPpm), static_cast<long>(s.calMeanPpm), static_cast<long>(s.calEmaPpm),
-           static_cast<long>(s.calWorstPpm), static_cast<unsigned long>(s.calGuardPpm), s.rtcFilter ? 1U : 0U,
-           s.rtcSlowIsRc ? 1U : 0U);
+           static_cast<long>(s.minMarginUs), static_cast<long>(avg), static_cast<unsigned long>(s.latAsleep), wlAvg,
+           static_cast<long>(s.wakeLateMaxUs), dspAvg, static_cast<long>(s.dispatchMaxUs), offAvg,
+           static_cast<long>(s.offloadMaxUs), static_cast<unsigned long>(s.leadUs),
+           static_cast<unsigned long>(s.defaultLeadUs), static_cast<unsigned long>(s.lastSleepUs),
+           s.autotune ? 1U : 0U, btPermille, static_cast<unsigned long>(s.marginBuckets[0]),
+           static_cast<unsigned long>(s.marginBuckets[1]), static_cast<unsigned long>(s.marginBuckets[2]),
+           static_cast<unsigned long>(s.marginBuckets[3]), static_cast<unsigned long>(s.marginBuckets[4]),
+           static_cast<unsigned long>(s.marginBuckets[5]), static_cast<unsigned long>(s.marginBuckets[6]),
+           static_cast<unsigned long>(s.refSlowClockHz), static_cast<unsigned long>(s.calSamples),
+           static_cast<long>(s.calMinPpm), static_cast<long>(s.calMaxPpm), static_cast<long>(s.calEmaPpm),
+           static_cast<unsigned long>(s.calGuardPpm), s.rtcFilter ? 1U : 0U);
   return kv;
 }

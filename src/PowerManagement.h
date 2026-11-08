@@ -55,3 +55,10 @@ bool lightSleepBootGraceActive();
 void armLightSleepDeadman(uint32_t milliseconds);
 void disarmLightSleepDeadman();
 uint32_t lightSleepDeadmanTrips();
+
+// Live (unsaved) experiment knobs, driven over BLE by ble_sleep_soak.
+// Takes effect on the next configurePowerManagementFromSettings().
+void setPowerManagementMinFreqMhz(int mhz);
+int powerManagementMinFreqMhz();
+void setPmStatsDumpEnabled(bool enabled);
+bool pmStatsDumpIsEnabled();

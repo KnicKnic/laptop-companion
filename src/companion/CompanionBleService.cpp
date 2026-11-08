@@ -1687,6 +1687,11 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
     } else if (key == "rtcf") {
       settings.system.powerManagement.rtcCalFilter = on;
       settingsChanged = true;
+    } else if (key == "minf") {
+      setPowerManagementMinFreqMhz(atoi(token.c_str() + eq + 1));
+      settingsChanged = true;
+    } else if (key == "dump") {
+      setPmStatsDumpEnabled(on);
     } else if (key == "reset" && on) {
       resetBtSleepTimingStats();
     }
@@ -1741,8 +1746,6 @@ void CompanionBleService::publishSleepDiagnostics() {
   lockState();
   const uint16_t interval = negotiatedConnInterval_;
   const uint16_t latency = negotiatedConnLatency_;
-  const uint16_t timeout = negotiatedConnTimeout_;
-  const uint32_t connects = activityStats_.gapConnects;
   const uint32_t disconnects = activityStats_.gapDisconnects;
   const int lastReason = lastDisconnectReason_;
   const uint32_t supervisionTimeouts = supervisionTimeouts_;
@@ -1754,17 +1757,16 @@ void CompanionBleService::publishSleepDiagnostics() {
       power.wallUptimeUs > 0 ? static_cast<unsigned>((power.lightSleepUs * 1000ULL) / power.wallUptimeUs) : 0;
   char head[240];
   snprintf(head, sizeof(head),
-           "up_s=%llu conn_s=%lu sleep_pm=%u ls_n=%llu ls_rej=%llu pm=%u als=%u itvl=%u lat=%u to=%u "
-           "gap_conn=%lu gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d als_revert=%lu deadman=%lu grace=%u ",
+           "up_s=%llu conn_s=%lu sleep_pm=%u ls_n=%llu ls_rej=%llu pm=%u als=%u minf=%d dump=%u itvl=%u lat=%u "
+           "gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d rev=%lu deadman=%lu grace=%u ",
            static_cast<unsigned long long>(power.wallUptimeUs / 1000000ULL),
            static_cast<unsigned long>(connectedForMs / 1000UL), sleepPermille,
            static_cast<unsigned long long>(power.lightSleepEntries),
            static_cast<unsigned long long>(power.lightSleepRejects), settings.system.powerManagement.enable ? 1U : 0U,
-           power.autoLightSleep ? 1U : 0U, static_cast<unsigned>(interval), static_cast<unsigned>(latency),
-           static_cast<unsigned>(timeout), static_cast<unsigned long>(connects),
-           static_cast<unsigned long>(disconnects), static_cast<unsigned>(lastReason),
-           static_cast<unsigned long>(supervisionTimeouts), static_cast<int>(esp_reset_reason()),
-           static_cast<unsigned long>(safetyReverts),
+           power.autoLightSleep ? 1U : 0U, powerManagementMinFreqMhz(), pmStatsDumpIsEnabled() ? 1U : 0U,
+           static_cast<unsigned>(interval), static_cast<unsigned>(latency), static_cast<unsigned long>(disconnects),
+           static_cast<unsigned>(lastReason), static_cast<unsigned long>(supervisionTimeouts),
+           static_cast<int>(esp_reset_reason()), static_cast<unsigned long>(safetyReverts),
            static_cast<unsigned long>(lightSleepDeadmanTrips()), lightSleepBootGraceActive() ? 1U : 0U);
   std::string report = head;
   report += formatBtSleepTimingKv();

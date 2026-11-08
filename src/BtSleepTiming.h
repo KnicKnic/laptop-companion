@@ -48,6 +48,20 @@ struct BtSleepTimingStats {
   uint64_t btAwakeUs = 0;           // Time the "bt" PM lock was held.
   uint64_t wallUs = 0;              // Wall time since stats reset.
 
+  // Where a timer-path wake spends its time (esp_timer clock). For wakes where
+  // the CPU was in light sleep when btSlp was due:
+  //   wakeLate  = light-sleep exit - btSlp due time (RTC timer + exit overhead)
+  //   dispatch  = btSlp callback start - max(due, exit) (ISR + esp_timer task)
+  //   offload   = bt lock acquired - callback start (BT controller task)
+  uint32_t latSamples = 0;
+  uint32_t latAsleep = 0;
+  int64_t wakeLateSumUs = 0;
+  int32_t wakeLateMaxUs = 0;
+  int64_t dispatchSumUs = 0;
+  int32_t dispatchMaxUs = 0;
+  int64_t offloadSumUs = 0;
+  int32_t offloadMaxUs = 0;
+
   // RTC slow clock calibration.
   bool rtcFilter = false;
   bool rtcSlowIsRc = false;
@@ -73,6 +87,8 @@ BtSleepTimingStats copyBtSleepTimingStats();
 // "bt" PM lock goes 0 -> 1 (controller awake) and 1 -> 0 (controller asleep).
 void btSleepTimingOnBtLockAcquired(int64_t nowUs);
 void btSleepTimingOnBtLockReleased(int64_t nowUs);
+// Called from the PM light-sleep exit callback (PowerStats.cpp).
+void btSleepTimingOnLightSleepExit(int64_t nowUs);
 
 std::string formatBtWakeLine();
 std::string formatRtcCalLine();

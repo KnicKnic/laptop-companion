@@ -205,6 +205,7 @@ esp_err_t onLightSleepEnter(int64_t sleepTimeUs, void*) {
 }
 
 esp_err_t onLightSleepExit(int64_t sleptUsFromPm, void*) {
+  btSleepTimingOnLightSleepExit(esp_timer_get_time());
   portENTER_CRITICAL(&lightSleepStatsMux);
   if (lightSleepEnteredAtUs > 0) {
     const uint64_t sleptUs = sleptUsFromPm > 0 ? static_cast<uint64_t>(sleptUsFromPm) : 0;
