@@ -48,3 +48,10 @@ TimedPowerManagementLock& maxPowerLock();
 // and logs right after a reset, whatever the saved settings say.
 void holdLightSleepOffAfterBoot();
 bool lightSleepBootGraceActive();
+
+// Dead-man switch for light sleep enabled over BLE: unless re-armed (keepalive)
+// within `milliseconds`, an esp_timer (which also wakes the chip from light
+// sleep) switches auto light sleep back off, independent of the BLE stack.
+void armLightSleepDeadman(uint32_t milliseconds);
+void disarmLightSleepDeadman();
+uint32_t lightSleepDeadmanTrips();

@@ -24,7 +24,9 @@
 // and can optionally:
 //   * auto-tune the btSlp lead time from the measured margins (instead of the
 //     fixed 1.8 ms / 7% window), and
-//   * low-pass filter the per-sleep slow clock calibration.
+//   * replace IDF's 10-cycle per-sleep slow clock calibration (measured noisy
+//     and biased by several hundred ppm on the X4 Pro) with the periodic long
+//     reference calibration.
 
 struct BtSleepTimingStats {
   // BT wake path.
@@ -54,7 +56,7 @@ struct BtSleepTimingStats {
   int32_t calMinPpm = 0;            // Raw per-sleep calibration error vs reference (last window).
   int32_t calMaxPpm = 0;
   int32_t calMeanPpm = 0;
-  int32_t calEmaPpm = 0;            // Filtered value vs reference.
+  int32_t calEmaPpm = 0;            // EMA of the per-sleep samples vs reference (bias).
   int32_t calWorstPpm = 0;          // Largest |raw error| since boot / reset.
   uint32_t calGuardPpm = 0;         // Error budget used by the auto-tuner.
   uint32_t refSlowClockHz = 0;      // From the latest reference calibration.

@@ -198,3 +198,43 @@ void holdLightSleepOffAfterBoot() {
 bool lightSleepBootGraceActive() {
   return bootGraceActive;
 }
+
+namespace {
+esp_timer_handle_t deadmanTimer = nullptr;
+volatile uint32_t deadmanTrips = 0;
+
+void onLightSleepDeadman(void*) {
+  deadmanTrips++;
+  CompanionSettings settings = copySettings();
+  settings.system.powerManagement.autoLightSleep = false;
+  updateSettings(settings);
+  configurePowerManagementFromSettings();
+  logPrintf("Light-sleep dead-man switch tripped: auto light sleep disabled.\n");
+}
+}  // namespace
+
+void armLightSleepDeadman(uint32_t milliseconds) {
+  if (!deadmanTimer) {
+    const esp_timer_create_args_t args = {
+        .callback = onLightSleepDeadman,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "ls-deadman",
+        .skip_unhandled_events = true,
+    };
+    if (esp_timer_create(&args, &deadmanTimer) != ESP_OK) {
+      deadmanTimer = nullptr;
+      return;
+    }
+  }
+  esp_timer_stop(deadmanTimer);
+  esp_timer_start_once(deadmanTimer, static_cast<uint64_t>(milliseconds) * 1000ULL);
+}
+
+void disarmLightSleepDeadman() {
+  if (deadmanTimer) esp_timer_stop(deadmanTimer);
+}
+
+uint32_t lightSleepDeadmanTrips() {
+  return deadmanTrips;
+}

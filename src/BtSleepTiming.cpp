@@ -60,6 +60,8 @@ DRAM_ATTR int64_t s_statsResetAtUs = 0;
 // RTC calibration tracking.
 DRAM_ATTR bool s_rtcFilter = false;
 DRAM_ATTR int64_t s_emaQ8 = 0;
+// Latest long reference calibration; what rtc_cal_filter hands to IDF.
+DRAM_ATTR uint32_t s_refCal = 0;
 DRAM_ATTR uint32_t s_calWinCount = 0;
 DRAM_ATTR uint32_t s_calWinMin = UINT32_MAX;
 DRAM_ATTR uint32_t s_calWinMax = 0;
@@ -135,11 +137,20 @@ int32_t ppmError(uint32_t value, uint32_t reference) {
 }
 
 void referenceCalibrationTask(void*) {
+  uint32_t previousRef = 0;
+  // First reference soon after boot (the boot calibration drifts quickly as RC_FAST warms up).
+  TickType_t delayTicks = pdMS_TO_TICKS(5000);
   for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(kReferencePeriodMs));
+    vTaskDelay(delayTicks);
+    delayTicks = pdMS_TO_TICKS(kReferencePeriodMs);
     const uint32_t ref = __real_rtc_clk_cal(RTC_CAL_RTC_MUX, kReferenceCalCycles);
     if (ref == 0) continue;
     const uint32_t inUse = esp_clk_slowclk_cal_get();
+    // Slow-clock drift between two references: the error the reference value
+    // handed to IDF (rtc_cal_filter) can accumulate before the next refresh.
+    const int32_t refDriftPpm = previousRef != 0 ? ppmError(ref, previousRef) : 0;
+    previousRef = ref;
+    s_refCal = ref;
 
     portENTER_CRITICAL(&s_mux);
     const uint32_t n = s_calWinCount;
@@ -180,7 +191,7 @@ void referenceCalibrationTask(void*) {
       }
       // What the wake timing actually uses: the filtered value when filtering,
       // otherwise any raw sample.
-      const uint32_t guard = s_rtcFilter ? static_cast<uint32_t>(std::abs(update.calEmaPpm)) + 50U
+      const uint32_t guard = s_rtcFilter ? static_cast<uint32_t>(std::abs(refDriftPpm)) + 50U
                                          : static_cast<uint32_t>(worst) + 50U;
       s_calGuardPpm = guard;
       s_stats.calGuardPpm = guard;
@@ -264,7 +275,10 @@ extern "C" uint32_t IRAM_ATTR __wrap_rtc_clk_cal(rtc_cal_sel_t cal_clk, uint32_t
   const bool filter = s_rtcFilter;
   const uint32_t filtered = static_cast<uint32_t>((s_emaQ8 + 128) >> 8);
   portEXIT_CRITICAL_SAFE(&s_mux);
-  return filter ? filtered : raw;
+  if (!filter) return raw;
+  // Prefer the long reference: the 10-cycle sample is both noisy and biased.
+  const uint32_t ref = s_refCal;
+  return ref != 0 ? ref : filtered;
 }
 
 void btSleepTimingOnBtLockAcquired(int64_t nowUs) {

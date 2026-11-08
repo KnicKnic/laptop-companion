@@ -35,6 +35,7 @@ internal static class Program
         public string? AbKey;
         public double PhaseMinutes = 15;
         public bool Handshake = true;
+        public ulong? Address;
         public string LogPath = $"ble_sleep_soak_{DateTime.Now:yyyyMMdd_HHmmss}.log";
     }
 
@@ -53,6 +54,7 @@ internal static class Program
     private static StreamWriter? log;
     private static PhaseSummary currentPhase = new() { Name = "all" };
     private static readonly List<PhaseSummary> Phases = new();
+    private static bool doHandshake = true;
 
     private static async Task<int> Main(string[] args)
     {
@@ -63,7 +65,10 @@ internal static class Program
         Log($"# BleSleepSoak minutes={options.Minutes} poll={options.PollSeconds}s set='{options.Set}' " +
             $"ab={options.AbKey} phase={options.PhaseMinutes}m handshake={options.Handshake}");
 
-        var address = await FindDeviceAsync(TimeSpan.FromSeconds(60));
+        // A device Windows is still connected to does not advertise; --address attaches to it directly.
+        var address = options.Address.HasValue
+            ? (options.Address.Value, BluetoothAddressType.Public)
+            : await FindDeviceAsync(TimeSpan.FromSeconds(60));
         if (address == null)
         {
             Log("! No advertising companion device found (is it already connected to laptop_host? use --no-handshake " +
@@ -73,7 +78,10 @@ internal static class Program
 
         if (!await ConnectAsync(address.Value.Address, address.Value.Type, options.Handshake)) return 1;
 
-        if (!string.IsNullOrWhiteSpace(options.Set)) await SendCommandAsync(options.Set + " reset=1");
+        // Counters are reset only when an experiment starts, so a recovery command
+        // (e.g. --set "als=0") leaves the failing window's statistics readable.
+        if (!string.IsNullOrWhiteSpace(options.Set))
+            await SendCommandAsync(options.Set.Contains("als=1") ? options.Set + " reset=1" : options.Set);
 
         var start = DateTime.Now;
         var deadline = start.AddMinutes(options.Minutes);
@@ -144,6 +152,9 @@ internal static class Program
                 return;
             }
 
+            // Keepalive for the device's light-sleep dead-man switch: if this tool
+            // stops reaching the device, BLE-enabled light sleep reverts by itself.
+            await SendKeepaliveAsync();
             var text = Encoding(result.Value);
             var kv = ParseKv(text);
             currentPhase.Last = kv;
@@ -173,6 +184,21 @@ internal static class Program
         Log($"> {command} ({status.Status})");
         // The device applies commands from its worker loop (<= 0.5 s).
         await Task.Delay(1500);
+    }
+
+    private static async Task SendKeepaliveAsync()
+    {
+        if (diagnostics == null) return;
+        try
+        {
+            var writer = new DataWriter();
+            writer.WriteString("ka=1");
+            await diagnostics.WriteValueWithResultAsync(writer.DetachBuffer(), GattWriteOption.WriteWithResponse);
+        }
+        catch (Exception ex)
+        {
+            Log($"! keepalive failed: {ex.GetType().Name} 0x{ex.HResult:X8}");
+        }
     }
 
     private static async Task<(ulong Address, BluetoothAddressType Type)?> FindDeviceAsync(TimeSpan timeout)
@@ -205,7 +231,7 @@ internal static class Program
         {
             if (d.ConnectionStatus == BluetoothConnectionStatus.Disconnected) currentPhase.Disconnects++;
             Log($"# connection {d.ConnectionStatus}");
-            if (d.ConnectionStatus == BluetoothConnectionStatus.Connected) _ = TryRefreshCharacteristicsAsync();
+            if (d.ConnectionStatus == BluetoothConnectionStatus.Connected) _ = ReconnectAsync();
         };
 
         session = await GattSession.FromDeviceIdAsync(device.BluetoothDeviceId);
@@ -215,9 +241,17 @@ internal static class Program
             await Task.Delay(250);
         }
 
+        doHandshake = handshake;
         if (!await TryRefreshCharacteristicsAsync()) return false;
         if (handshake) await HandshakeAsync();
         return true;
+    }
+
+    // Windows re-establishes the maintained session by itself, but the device
+    // drops hosts that do not finish the handshake within 15 s, so redo it.
+    private static async Task ReconnectAsync()
+    {
+        if (await TryRefreshCharacteristicsAsync() && doHandshake) await HandshakeAsync();
     }
 
     private static readonly SemaphoreSlim RefreshLock = new(1, 1);
@@ -337,9 +371,10 @@ internal static class Program
                 case "--phase-minutes": o.PhaseMinutes = double.Parse(Next(), CultureInfo.InvariantCulture); break;
                 case "--no-handshake": o.Handshake = false; break;
                 case "--log": o.LogPath = Next(); break;
+                case "--address": o.Address = ulong.Parse(Next().Replace(":", ""), NumberStyles.HexNumber, CultureInfo.InvariantCulture); break;
                 default:
                     Console.WriteLine("usage: BleSleepSoak [--minutes N] [--poll S] [--set \"pm=1 als=1 tune=0 rtcf=0\"]");
-                    Console.WriteLine("                    [--ab tune|rtcf|als --phase-minutes M] [--no-handshake] [--log FILE]");
+                    Console.WriteLine("                    [--ab tune|rtcf|als --phase-minutes M] [--no-handshake] [--log FILE] [--address 7CE8B1AB5641]");
                     return null;
             }
         }

@@ -43,6 +43,8 @@ Also need to mess with
 ### Config fix
 `CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP` defaults to `y`, so commenting it out in platformio.ini did **not**
 disable it (the generated sdkconfig.x4pro still had it on). It is now explicitly unset.
+The light-sleep code is also kept in IRAM (`CONFIG_PM_SLP_IRAM_OPT`, `CONFIG_PM_RTOS_IDLE_OPT`), which cut
+late BT wakes ~5x in testing.
 
 ### Instrumentation (`src/BtSleepTiming.*`, linker `--wrap` of esp_timer_create/start_once/stop and rtc_clk_cal)
 * **BTW line** (power stats page, serial, BLE): for every `btSlp`-scheduled wake, the margin between the CPU
@@ -57,7 +59,8 @@ disable it (the generated sdkconfig.x4pro still had it on). It is now explicitly
 ### Experimental fixes (off by default; settings page rows or `companion_settings.json` `power_management`)
 * `bt_wake_autotune`: replaces IDF's fixed lead with one auto-calibrated from the measured margins
   (target 400us + measured slow-clock error x sleep length, +1ms on any late wake, slow step down).
-* `rtc_cal_filter`: feeds IDF an EMA (1/16) of the 10-cycle per-sleep calibrations instead of each noisy sample.
+* `rtc_cal_filter`: feeds IDF the periodic 1024-cycle reference calibration instead of each 10-cycle per-sleep
+  sample (measured biased by ~+835 ppm, worst 963 ppm, on the X4 Pro).
 
 ### Testing
 1. Flash: `pio run -e x4pro -t upload` (set `PLATFORMIO_BUILD_DIR` to a short path such as `C:\pb` if the
@@ -70,31 +73,42 @@ disable it (the generated sdkconfig.x4pro still had it on). It is now explicitly
    counters at each phase; the per-phase summary at the end compares sleep %, bt awake %, late/miss and disconnects.
 4. What to look for: `miss`/`late` > 0 or `sto` (supervision timeouts, reason 0x208) means the CPU is waking too late;
    `cal` ppm x sleep length approaching the lead means slow-clock calibration noise is eating the margin.
-5. Recovery: while auto light sleep is on, USB is dead (no flashing, no serial). Send `als=0` over BLE
-   (`--set "als=0"`), or power-cycle; the BLE commands are not saved, so a reboot reverts to the SD settings.
-   Opening COM3 with pyserial toggles DTR/RTS and resets the chip.
+5. Safety (the device must never be left unreachable):
+   * Light sleep is blocked for 60s after every boot (`boot-usb` PM lock), so USB/flashing always works right
+     after a reset.
+   * Light sleep enabled over BLE (`als=1`) is not saved to SD (a reboot reverts it), is reverted after 3
+     device-side disconnects or 2 minutes without a link, and has a 90s dead-man timer that only the soak tool's
+     `ka=1` keepalives (sent after every successful read) extend.
+   * While light sleep is on, USB is dead (no flashing, no serial); send `--set "als=0"` or reset the device.
+     Opening COM3 with pyserial's default DTR/RTS resets the chip; set dtr/rts False before `open()`.
+   * If Windows still holds the connection the device does not advertise; use `--address 7CE8B1AB5641`.
+   * Trust the device-side `gap_disc`; Windows' ConnectionStatus events flap and over-count.
 
-### Results so far (X4 Pro, idle conn 120ms / latency 10)
-* Slow clock measured ~70.9 kHz (8MD256, not RC), so the 7% path is not active. The boot 3000-cycle
-  calibration was already ~1239 ppm off the 1024-cycle reference a few minutes after boot (RC_FAST drifts).
-* PM on, light sleep off: link stable, bt lock held ~1-4%, min BT wake margin ~1.0ms of the 1.8ms lead.
-* Baseline: PM + auto light sleep with CPU power-down still on (as previously shipped): 22 disconnects in
-  3 minutes, ~every 17s (15s supervision timeout + reconnect); the device never reset. Every connection event
-  is effectively being missed once light sleep starts.
-* After that test (and a failed flash attempt while it was light sleeping) the device stopped advertising and
-  stopped answering esptool; it needs a manual reset / BOOT+reset before the next flash.
+### Results (X4 Pro, idle conn 120ms / latency 10)
+| Config | Result |
+|---|---|
+| PM on, light sleep off | stable; bt lock ~1-4%; min BT wake margin ~0.9-1.0ms of the 1.8ms lead |
+| light sleep, CPU power-down on (as previously shipped) | link drops every ~17s; 22 drops in 3 min |
+| light sleep, CPU power-down off | still drops: 414 of 1878 BT wakes late, 9 past -2.5ms, min margin -3.2ms, supervision timeout |
+| + sleep code in IRAM (`PM_SLP_IRAM_OPT`, `PM_RTOS_IDLE_OPT`) | fewer late wakes (79 of 1779) but 15 past -2.5ms, min -4.8ms, 2 supervision timeouts |
+| + `rtcf=1` | one panic (rst=4) right after enabling, not reproduced; retry: 1543 sleeps, still a supervision timeout |
+| + `tune=1` | not tested yet |
+
+* Slow clock is 8MD256 at ~71 kHz, so the 7% RC_SLOW path is not active.
+* IDF's 10-cycle per-sleep calibration of it is badly off on the S3: +947..+2189 ppm vs the 1024-cycle reference
+  (EMA bias +835..+1885 ppm, worst seen -2272 ppm). At a 1.2s BT sleep that alone is 1-2.6ms, more than the
+  1.8ms lead. A likely contributor is RC_FAST shifting with the digital supply voltage, which differs between
+  calibration (awake, DFS) and light sleep; that would also explain why a better awake calibration (`rtcf`)
+  did not fully fix it.
+* The BT controller's sleep timer runs on the main XTAL, so a late wake shows up directly as a negative margin.
+  That is what `tune=1` closes the loop on (+1ms per late wake, then converges to 400us + calibration guard).
+* Twice the device ended up unreachable (no advertising, no USB, no ROM bootloader) after a failing light-sleep
+  run. Cause unknown: deep sleep from a glitched power-button read after a light-sleep wake (power press is a
+  single unconfirmed `digitalRead` edge in X4ProInputManager) or a hang. The next boot's `rst=` tells:
+  8 = woke from deep sleep, 4 = panic, 1 = power-on/reset.
 
 ### Next steps
-1. Flash the current build (CPU power-down really off) and run
-   `dotnet run --project ble_sleep_soak -- --minutes 15 --set "pm=1 als=1"`. If the link holds, the BTW/RTC
-   numbers show how much margin is left.
-2. If it still drops, try the auto-tuned lead and the calibration filter, one at a time:
-   `--set "pm=1 als=1" --ab tune --phase-minutes 10`, then `--ab rtcf`.
-3. Config candidates if wake latency is the problem: `CONFIG_PM_SLP_IRAM_OPT=y` and `CONFIG_PM_RTOS_IDLE_OPT=y`
-   (sleep code runs from flash on the S3 by default; IDF's default S3 sleep-out overhead is 8628us in that case
-   vs 382us in IRAM).
-
-
-
-
-
+1. Reset the device; flash (`PLATFORMIO_BUILD_DIR=C:\pb2 pio run -e x4pro -t upload`) and note `rst=` from the first read.
+2. `dotnet run --project ble_sleep_soak -- --address 7CE8B1AB5641 --minutes 10 --poll 20 --set "pm=1 als=1 tune=1 rtcf=0"`,
+   then the same with `rtcf=1`.
+3. If `tune=1` holds the link, measure the cost: `bt_pm` and `sleep_pm` vs the 1.8ms default lead.

@@ -28,6 +28,9 @@ constexpr unsigned long kParticipationWindowMs = 5000;
 constexpr unsigned long kWorkerPollMs = 500;
 constexpr unsigned long kWorkerPollActiveMs = 25;
 constexpr unsigned long kSleepDiagnosticsPeriodMs = 5000;
+// Auto light sleep enabled over BLE turns itself off unless the test host
+// sends "ka=1" at least this often (see armLightSleepDeadman()).
+constexpr uint32_t kLightSleepDeadmanMs = 90000;
 constexpr size_t kStatusMessageMaxLen = 48;
 constexpr size_t kEncodedStateLen = 2;
 
@@ -1667,6 +1670,17 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
       disconnectsAtAlsCommand_ = activityStats_.gapDisconnects;
       disconnectedSinceMs_ = 0;
       unlockState();
+      if (on) {
+        armLightSleepDeadman(kLightSleepDeadmanMs);
+      } else {
+        disarmLightSleepDeadman();
+      }
+    } else if (key == "ka" && on) {
+      lockState();
+      const bool commanded = alsEnabledByCommand_;
+      unlockState();
+      if (commanded) armLightSleepDeadman(kLightSleepDeadmanMs);
+      continue;
     } else if (key == "tune") {
       settings.system.powerManagement.btWakeAutotune = on;
       settingsChanged = true;
@@ -1677,7 +1691,7 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
       resetBtSleepTimingStats();
     }
   }
-  logPrintf("Companion BLE: sleep diagnostics command '%s'\n", command.c_str());
+  if (command != "ka=1") logPrintf("Companion BLE: sleep diagnostics command '%s'\n", command.c_str());
   if (settingsChanged) {
     updateSettings(settings);
     configurePowerManagementFromSettings();
@@ -1709,6 +1723,7 @@ void CompanionBleService::revertCommandedLightSleepIfLinkUnhealthy() {
   alsEnabledByCommand_ = false;
   alsSafetyReverts_++;
   unlockState();
+  disarmLightSleepDeadman();
 
   logPrintf("Companion BLE: reverting BLE-commanded auto light sleep (%lu disconnects%s)\n",
             static_cast<unsigned long>(disconnects), longDisconnect ? ", link down" : "");
@@ -1740,7 +1755,7 @@ void CompanionBleService::publishSleepDiagnostics() {
   char head[240];
   snprintf(head, sizeof(head),
            "up_s=%llu conn_s=%lu sleep_pm=%u ls_n=%llu ls_rej=%llu pm=%u als=%u itvl=%u lat=%u to=%u "
-           "gap_conn=%lu gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d als_revert=%lu grace=%u ",
+           "gap_conn=%lu gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d als_revert=%lu deadman=%lu grace=%u ",
            static_cast<unsigned long long>(power.wallUptimeUs / 1000000ULL),
            static_cast<unsigned long>(connectedForMs / 1000UL), sleepPermille,
            static_cast<unsigned long long>(power.lightSleepEntries),
@@ -1749,7 +1764,8 @@ void CompanionBleService::publishSleepDiagnostics() {
            static_cast<unsigned>(timeout), static_cast<unsigned long>(connects),
            static_cast<unsigned long>(disconnects), static_cast<unsigned>(lastReason),
            static_cast<unsigned long>(supervisionTimeouts), static_cast<int>(esp_reset_reason()),
-           static_cast<unsigned long>(safetyReverts), lightSleepBootGraceActive() ? 1U : 0U);
+           static_cast<unsigned long>(safetyReverts),
+           static_cast<unsigned long>(lightSleepDeadmanTrips()), lightSleepBootGraceActive() ? 1U : 0U);
   std::string report = head;
   report += formatBtSleepTimingKv();
   if (report.size() > CompanionProtocol::SLEEP_DIAGNOSTICS_MAX_LEN) {
