@@ -42,3 +42,9 @@ class TimedPowerManagementLock {
 bool configurePowerManagementFromSettings();
 PowerManagementState copyPowerManagementState();
 TimedPowerManagementLock& maxPowerLock();
+
+// Blocks auto light sleep for a fixed window after boot so the USB-Serial-JTAG
+// port (which does not survive S3 light sleep) is always usable for flashing
+// and logs right after a reset, whatever the saved settings say.
+void holdLightSleepOffAfterBoot();
+bool lightSleepBootGraceActive();

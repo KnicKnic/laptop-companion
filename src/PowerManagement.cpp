@@ -12,9 +12,21 @@ namespace {
 
 constexpr int kMaxCpuMhz = 240;
 constexpr int kMinCpuMhz = 10;
+constexpr uint64_t kBootNoLightSleepUs = 60ULL * 1000ULL * 1000ULL;
 
 PowerManagementState state;
 TimedPowerManagementLock maxPower(ESP_PM_CPU_FREQ_MAX, "max-power");
+esp_pm_lock_handle_t bootNoLightSleepLock = nullptr;
+esp_timer_handle_t bootNoLightSleepTimer = nullptr;
+volatile bool bootGraceActive = false;
+
+void releaseBootNoLightSleep(void*) {
+  if (bootNoLightSleepLock && bootGraceActive) {
+    esp_pm_lock_release(bootNoLightSleepLock);
+  }
+  bootGraceActive = false;
+  logPrintf("Boot light-sleep grace window ended; auto light sleep may now disable USB.\n");
+}
 
 }  // namespace
 
@@ -156,4 +168,33 @@ PowerManagementState copyPowerManagementState() {
 
 TimedPowerManagementLock& maxPowerLock() {
   return maxPower;
+}
+
+void holdLightSleepOffAfterBoot() {
+  if (bootNoLightSleepLock) return;
+  if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "boot-usb", &bootNoLightSleepLock) != ESP_OK ||
+      esp_pm_lock_acquire(bootNoLightSleepLock) != ESP_OK) {
+    logPrintf("Boot light-sleep grace lock failed\n");
+    return;
+  }
+  bootGraceActive = true;
+  const esp_timer_create_args_t args = {
+      .callback = releaseBootNoLightSleep,
+      .arg = nullptr,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "boot-usb",
+      .skip_unhandled_events = true,
+  };
+  if (esp_timer_create(&args, &bootNoLightSleepTimer) != ESP_OK ||
+      esp_timer_start_once(bootNoLightSleepTimer, kBootNoLightSleepUs) != ESP_OK) {
+    // Never leave the lock held forever because a timer failed.
+    releaseBootNoLightSleep(nullptr);
+    return;
+  }
+  logPrintf("Auto light sleep held off for %llus after boot (USB stays usable).\n",
+            static_cast<unsigned long long>(kBootNoLightSleepUs / 1000000ULL));
+}
+
+bool lightSleepBootGraceActive() {
+  return bootGraceActive;
 }

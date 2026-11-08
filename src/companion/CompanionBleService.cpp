@@ -1608,6 +1608,7 @@ void CompanionBleService::workerLoop() {
   while (!workerStopRequested_) {
     update();
     applyPendingSleepDiagnosticsCommand();
+    revertCommandedLightSleepIfLinkUnhealthy();
     lockState();
     const bool participationActive = hostConnected_ && participationSubscribed_ && participationUntilMs_ != 0;
     const bool connected = hostConnected_;
@@ -1661,6 +1662,11 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
     } else if (key == "als") {
       settings.system.powerManagement.autoLightSleep = on;
       settingsChanged = true;
+      lockState();
+      alsEnabledByCommand_ = on;
+      disconnectsAtAlsCommand_ = activityStats_.gapDisconnects;
+      disconnectedSinceMs_ = 0;
+      unlockState();
     } else if (key == "tune") {
       settings.system.powerManagement.btWakeAutotune = on;
       settingsChanged = true;
@@ -1679,6 +1685,39 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
   publishSleepDiagnostics();
 }
 
+void CompanionBleService::revertCommandedLightSleepIfLinkUnhealthy() {
+  constexpr uint32_t kMaxDisconnects = 3;
+  constexpr unsigned long kMaxDisconnectedMs = 120000;
+
+  lockState();
+  if (!alsEnabledByCommand_) {
+    unlockState();
+    return;
+  }
+  const unsigned long now = millis();
+  if (hostConnected_) {
+    disconnectedSinceMs_ = 0;
+  } else if (disconnectedSinceMs_ == 0) {
+    disconnectedSinceMs_ = now;
+  }
+  const uint32_t disconnects = activityStats_.gapDisconnects - disconnectsAtAlsCommand_;
+  const bool longDisconnect = disconnectedSinceMs_ != 0 && now - disconnectedSinceMs_ >= kMaxDisconnectedMs;
+  if (disconnects < kMaxDisconnects && !longDisconnect) {
+    unlockState();
+    return;
+  }
+  alsEnabledByCommand_ = false;
+  alsSafetyReverts_++;
+  unlockState();
+
+  logPrintf("Companion BLE: reverting BLE-commanded auto light sleep (%lu disconnects%s)\n",
+            static_cast<unsigned long>(disconnects), longDisconnect ? ", link down" : "");
+  CompanionSettings settings = copySettings();
+  settings.system.powerManagement.autoLightSleep = false;
+  updateSettings(settings);
+  configurePowerManagementFromSettings();
+}
+
 void CompanionBleService::publishSleepDiagnostics() {
   if (!sleepDiagnosticsCharacteristic_) return;
 
@@ -1692,6 +1731,7 @@ void CompanionBleService::publishSleepDiagnostics() {
   const uint32_t disconnects = activityStats_.gapDisconnects;
   const int lastReason = lastDisconnectReason_;
   const uint32_t supervisionTimeouts = supervisionTimeouts_;
+  const uint32_t safetyReverts = alsSafetyReverts_;
   const unsigned long connectedForMs = hostConnected_ ? millis() - hostConnectedAtMs_ : 0;
   unlockState();
 
@@ -1700,7 +1740,7 @@ void CompanionBleService::publishSleepDiagnostics() {
   char head[240];
   snprintf(head, sizeof(head),
            "up_s=%llu conn_s=%lu sleep_pm=%u ls_n=%llu ls_rej=%llu pm=%u als=%u itvl=%u lat=%u to=%u "
-           "gap_conn=%lu gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d ",
+           "gap_conn=%lu gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d als_revert=%lu grace=%u ",
            static_cast<unsigned long long>(power.wallUptimeUs / 1000000ULL),
            static_cast<unsigned long>(connectedForMs / 1000UL), sleepPermille,
            static_cast<unsigned long long>(power.lightSleepEntries),
@@ -1708,7 +1748,8 @@ void CompanionBleService::publishSleepDiagnostics() {
            power.autoLightSleep ? 1U : 0U, static_cast<unsigned>(interval), static_cast<unsigned>(latency),
            static_cast<unsigned>(timeout), static_cast<unsigned long>(connects),
            static_cast<unsigned long>(disconnects), static_cast<unsigned>(lastReason),
-           static_cast<unsigned long>(supervisionTimeouts), static_cast<int>(esp_reset_reason()));
+           static_cast<unsigned long>(supervisionTimeouts), static_cast<int>(esp_reset_reason()),
+           static_cast<unsigned long>(safetyReverts), lightSleepBootGraceActive() ? 1U : 0U);
   std::string report = head;
   report += formatBtSleepTimingKv();
   if (report.size() > CompanionProtocol::SLEEP_DIAGNOSTICS_MAX_LEN) {

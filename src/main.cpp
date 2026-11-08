@@ -206,6 +206,7 @@ void setup() {
   }
 
   beginBtSleepTiming();
+  holdLightSleepOffAfterBoot();
   configurePowerManagementFromSettings();
   armMaxPowerIfConfigured(kBootMaxPowerMs);
   beginPowerStats();
