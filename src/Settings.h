@@ -17,7 +17,9 @@ struct CompanionSettings {
     bool enable = false;
     bool autoLightSleep = false;
     // Auto-tune the BLE controller's light-sleep wake lead (see BtSleepTiming.h).
-    bool btWakeAutotune = false;
+    // On by default: with IDF's fixed 1.8 ms lead the X4 Pro misses enough
+    // connection events under auto light sleep to drop the link.
+    bool btWakeAutotune = true;
     // Use the periodic 1024-cycle RTC slow clock reference calibration instead of
     // IDF's 10-cycle per-light-sleep one.
     bool rtcCalFilter = false;

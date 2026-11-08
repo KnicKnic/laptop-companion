@@ -92,7 +92,8 @@ late BT wakes ~5x in testing.
 | light sleep, CPU power-down off | still drops: 414 of 1878 BT wakes late, 9 past -2.5ms, min margin -3.2ms, supervision timeout |
 | + sleep code in IRAM (`PM_SLP_IRAM_OPT`, `PM_RTOS_IDLE_OPT`) | fewer late wakes (79 of 1779) but 15 past -2.5ms, min -4.8ms, 2 supervision timeouts |
 | + `rtcf=1` | one panic (rst=4) right after enabling, not reproduced; retry: 1543 sleeps, still a supervision timeout |
-| + `tune=1` | not tested yet |
+| + `tune=1` (laptop fan moved away) | **stable**: 0 disconnects in 12 + 25 min; ~97% light sleep, bt lock 1.1%; lead converged to ~5-6ms; 7-9 late wakes, all during convergence |
+| control, same conditions, `tune=0` | 1015 of 2086 wakes late, 21 missed, supervision timeout; dead-man switch turned light sleep off by itself |
 
 * Slow clock is 8MD256 at ~71 kHz, so the 7% RC_SLOW path is not active.
 * IDF's 10-cycle per-sleep calibration of it is badly off on the S3: +947..+2189 ppm vs the 1024-cycle reference
@@ -107,8 +108,18 @@ late BT wakes ~5x in testing.
   single unconfirmed `digitalRead` edge in X4ProInputManager) or a hang. The next boot's `rst=` tells:
   8 = woke from deep sleep, 4 = panic, 1 = power-on/reset.
 
-### Next steps
-1. Reset the device; flash (`PLATFORMIO_BUILD_DIR=C:\pb2 pio run -e x4pro -t upload`) and note `rst=` from the first read.
-2. `dotnet run --project ble_sleep_soak -- --address 7CE8B1AB5641 --minutes 10 --poll 20 --set "pm=1 als=1 tune=1 rtcf=0"`,
-   then the same with `rtcf=1`.
-3. If `tune=1` holds the link, measure the cost: `bt_pm` and `sleep_pm` vs the 1.8ms default lead.
+### Conclusion
+`bt_wake_autotune` (now on by default) is what makes auto light sleep + BLE work on the S3: the X3 trick of
+avoiding the 7% RC window was necessary but not sufficient, because the 8MD256 calibration is still off by
+hundreds to thousands of ppm, more than IDF's fixed 1.8ms lead covers at 1.2-1.3s BT sleeps. The tuner
+trades ~4ms more awake per BT wake (~0.3% duty) for a stable link. Keep the laptop fan off the device when
+measuring: the warm air roughly doubled the calibration error.
+
+To use it day to day, turn on "Auto light sleep" on the Settings page (saved to SD). USB stays usable for
+60s after each boot; after that, reset the device to flash.
+
+### Possible follow-ups
+* Lower the tuner's target (400us + guard, +1ms per late wake) once longer soaks show margin to spare.
+* Check `rtcf=1` together with `tune=1`; with the fan removed the 10-cycle calibration was only -600..+1000 ppm.
+* Debounce the X4 Pro power button (single `digitalRead` edge) in case a wake glitch caused the earlier
+  "device unreachable" episodes.
