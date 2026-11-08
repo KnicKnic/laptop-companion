@@ -526,6 +526,8 @@ namespace X3LaptopCompanion
 
         private void ApplyTeamsSnapshotToUi(TeamsMeetingSnapshot snapshot)
         {
+            liveMeetingDetected = snapshot.MeetingDetected;
+            if (liveMeetingDetected) meetingJoinMessage = string.Empty;
             TeamsText = TeamsTextForSnapshot(snapshot);
             MeetingText = snapshot.MeetingDetected
                 ? (string.IsNullOrWhiteSpace(snapshot.MeetingName) ? "Yes" : snapshot.MeetingName)
@@ -543,6 +545,7 @@ namespace X3LaptopCompanion
             }
 
             _ = RefreshDesktopStateAsync("timer");
+            _ = RefreshMeetingListAsync();
 
             if (IsTestMode)
             {
@@ -679,6 +682,14 @@ namespace X3LaptopCompanion
             }
 
             lastButtonSequences[buttonEvent.Button] = buttonEvent.Sequence;
+            if (buttonEvent.Button == CompanionButton.JoinMeeting ||
+                buttonEvent.Button == CompanionButton.PreviousMeetings ||
+                buttonEvent.Button == CompanionButton.NextMeetings)
+            {
+                if (!isExiting && !Dispatcher.HasShutdownStarted)
+                    Dispatcher.BeginInvoke(new System.Action(() => _ = HandleMeetingRequestAsync(buttonEvent)));
+                return;
+            }
             if (buttonEvent.Button == CompanionButton.SwitchDesktop)
             {
                 HandleDesktopSwitchRequest(buttonEvent);
@@ -1571,6 +1582,7 @@ namespace X3LaptopCompanion
 
         private void StopServicesForExit()
         {
+            meetingLifetime.Cancel();
             statusTimer.Stop();
             connectionService.StatusChanged -= OnConnectionStatusChanged;
             connectionService.ButtonEventReceived -= OnButtonEventReceived;
@@ -1584,6 +1596,7 @@ namespace X3LaptopCompanion
         {
             lastSentHostState = null;
             lastSentDesktopState = null;
+            lastSentMeetingKey = null;
             desktopStateWriteForced = false;
             // A device reboot restarts its button sequence at 1, so a stale echo must not settle
             // a fresh request in the next session.

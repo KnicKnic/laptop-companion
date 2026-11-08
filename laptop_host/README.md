@@ -7,6 +7,8 @@
 - Windows 10 19041 or newer.
 - .NET 10 SDK.
 - Bluetooth LE adapter.
+- Classic Outlook desktop signed into the default calendar, for nearby meeting
+  enumeration. New Outlook alone does not expose the local Outlook object model.
 
 ## Current Status
 
@@ -70,6 +72,26 @@
   the X3.
 - Includes a Teams dry-run mode that keeps BLE active and acknowledges X3 mute
   commands without focusing or controlling Teams.
+- When not in a meeting, reads the default Outlook calendar every 30 seconds
+  through the bundled `OutlookCalendar.ps1` sidecar. It expands recurring
+  occurrences, includes invitations regardless of acceptance status, and excludes
+  cancelled meetings and entries without a Teams join link. The time filter is
+  inclusive: `End >= now - 15 minutes` and `Start <= now + 40 minutes`, so an
+  ongoing meeting is included even if it began more than 15 minutes ago.
+- Sends four meetings per device page, with previous/next navigation for every
+  remaining match. Tap a row to join, or use Up/Down to select, Confirm to join,
+  and Left/Right to change pages. Times use the laptop's local clock.
+  The idle screen hides Bluetooth, microphone, camera, hand and reaction icons,
+  while retaining the desktop switcher.
+- Opens a selected meeting in desktop Teams, sets its pre-join camera off and
+  microphone muted (without disabling incoming audio), re-reads both states, then
+  invokes Join now. Missing, ambiguous or conflicting media controls stop the join
+  instead of assuming they are off. Pre-join state labels currently require
+  English Teams text. Existing calls/pre-join screens must be closed first.
+  Joining does not start recording or transcription.
+- Reports calendar/join failures on the device and in the host log. Calendar
+  access and joining are disabled in test/dry-run modes. Calendar reads and join
+  waits are cancelled on host shutdown.
 - Writes a diagnostic log to `%LOCALAPPDATA%\X3LaptopCompanion\host.log`.
   Use the `Open Log` button or tray menu item to jump to it.
 
@@ -96,6 +118,35 @@ dotnet run --project .\laptop_host.tests\X3LaptopCompanion.Tests.csproj --config
 To also verify native description reads and repeated meeting snapshots, append
 `-- --live <Teams audio PID> <Teams window PID>`. This requires an active meeting
 and only reads UI Automation; it never invokes a meeting control.
+
+The same checks cover meeting-window boundaries, unaccepted invitations, safe
+join-link validation, stale list selections, UTF-8 payloads, BLE fragmentation,
+and pre-join media state parsing. Append `-- --calendar` to also perform a live,
+read-only Outlook calendar query and print only the meeting count.
+
+Run the calendar sidecar's fixture checks without Outlook access:
+
+```powershell
+powershell.exe -NoProfile -NonInteractive -File .\laptop_host.tests\OutlookCalendar.Tests.ps1
+```
+
+## Meeting-list protocol
+
+The host and firmware must both be updated: protocol version **5** adds the
+meeting-list characteristic (`...00000d`) and extends button events from 10 to
+12 bytes. The final two little-endian bytes carry the displayed meeting-page
+revision; join requests also carry a row index in the existing argument byte.
+The host rejects stale revisions rather than joining a different meeting after
+a refresh. No join URLs are sent to the device.
+
+A meeting page contains `[revision:u16][page:u16][pageCount:u16][status:u8]`
+`[count:u8][messageBytes:u8][UTF-8 message]`, followed by up to four entries of
+`[startMinutes:u16][endMinutes:u16][titleBytes:u8][UTF-8 title]`. Times are
+minutes after local midnight; status is ready (0), joining (1), or error (2).
+Messages are at most 80 bytes and titles 64 bytes, truncated at UTF-8 boundaries.
+Pages are fragmented to the negotiated ATT payload with
+`[version:u8][offset:u16][totalBytes:u16][data]` and written with responses.
+The device validates bounds and commits only a fully reassembled page.
 
 ## Run
 

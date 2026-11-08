@@ -47,7 +47,7 @@ namespace X3LaptopCompanion
         public bool HandLocked { get; }
     }
 
-    public sealed class TeamsController
+    public sealed partial class TeamsController
     {
         private const int MaxMeetingSearchDepth = 42;
         private const int MaxMeetingSearchNodes = 12000;

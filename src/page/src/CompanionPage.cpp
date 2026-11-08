@@ -237,6 +237,65 @@ freeink::ui::Rect messageRect(const freeink::ui::Rect& content) {
                            kMessageHeight};
 }
 
+freeink::ui::Rect meetingPagerRect(const freeink::ui::Rect& content) {
+  return freeink::ui::Rect{content.x, static_cast<int16_t>(messageRect(content).y - 54), content.width, 44};
+}
+
+freeink::ui::Rect meetingRowRect(const freeink::ui::Rect& content, uint8_t index) {
+  const int16_t top = static_cast<int16_t>(content.y + 170);
+  const int16_t height = static_cast<int16_t>((meetingPagerRect(content).y - top - 12) /
+                                               MeetingListProtocol::kMeetingsPerPage);
+  return freeink::ui::Rect{content.x, static_cast<int16_t>(top + index * height), content.width,
+                           static_cast<int16_t>(height - 8)};
+}
+
+void drawMeetingList(freeink::ui::DisplayTarget& target, const freeink::ui::Rect& content,
+                     const MeetingListProtocol::Page& page, uint8_t selected, bool connected) {
+  freeink::ui::TextStyle text;
+  text.maxLines = 1;
+  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 64), content.width, 28},
+                       "Nearby meetings  (-15m / +40m)", text);
+  text.maxLines = 2;
+  const char* message = !connected ? "Connect the laptop host to list meetings" :
+      !page.valid ? "Waiting for Outlook calendar..." : page.message.c_str();
+  freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 102), content.width, 58},
+                       message, text);
+  if (!connected || !page.valid) return;
+  for (uint8_t i = 0; i < page.count; ++i) {
+    const auto row = meetingRowRect(content, i);
+    target.stroke(row, freeink::ui::Paint::solid(freeink::ui::Color::Black), i == selected ? 2 : 1, 4);
+    const auto& meeting = page.meetings[i];
+    char time[40];
+    snprintf(time, sizeof(time), "%02u:%02u - %02u:%02u%s", meeting.startMinutes / 60, meeting.startMinutes % 60,
+             meeting.endMinutes / 60, meeting.endMinutes % 60, page.status == 0 ? "   Join" : "");
+    text.maxLines = 1;
+    freeink::ui::drawText(target, freeink::ui::Rect{static_cast<int16_t>(row.x + 12),
+                         static_cast<int16_t>(row.y + 6), static_cast<int16_t>(row.width - 24), 24}, time, text);
+    text.maxLines = 2;
+    freeink::ui::drawText(target, freeink::ui::Rect{static_cast<int16_t>(row.x + 12),
+                         static_cast<int16_t>(row.y + 32), static_cast<int16_t>(row.width - 24),
+                         static_cast<int16_t>(row.height - 36)}, meeting.subject.c_str(), text);
+  }
+  const auto pager = meetingPagerRect(content);
+  text.maxLines = 1;
+  text.align = freeink::ui::TextAlign::Center;
+  if (page.pageIndex > 0) {
+    target.stroke(freeink::ui::Rect{pager.x, pager.y, 100, pager.height},
+                  freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
+    freeink::ui::drawText(target, freeink::ui::Rect{pager.x, static_cast<int16_t>(pager.y + 8), 100, 28}, "< Prev", text);
+  }
+  if (page.pageIndex + 1 < page.pageCount) {
+    const int16_t x = static_cast<int16_t>(pager.right() - 100);
+    target.stroke(freeink::ui::Rect{x, pager.y, 100, pager.height},
+                  freeink::ui::Paint::solid(freeink::ui::Color::Black), 1, 4);
+    freeink::ui::drawText(target, freeink::ui::Rect{x, static_cast<int16_t>(pager.y + 8), 100, 28}, "Next >", text);
+  }
+  char number[24];
+  snprintf(number, sizeof(number), "%u / %u", page.pageIndex + 1, page.pageCount);
+  freeink::ui::drawText(target, freeink::ui::Rect{static_cast<int16_t>(pager.x + 104),
+                       static_cast<int16_t>(pager.y + 8), static_cast<int16_t>(pager.width - 208), 28}, number, text);
+}
+
 freeink::ui::Rect desktopTileRect(const freeink::ui::Rect& row, uint8_t count, uint8_t index) {
   if (count == 0 || index >= count) return freeink::ui::Rect{};
   const int16_t totalGap = static_cast<int16_t>(kDesktopTileGap * (count - 1));
@@ -342,6 +401,7 @@ bool CompanionPage::handleButton(ButtonPressKind kind) {
   CompanionBleService& service = CompanionBleService::getInstance();
   ensureStarted();
   const CompanionBleService::HostStatus host = service.getHostStatus();
+  if (!host.meetingDetected) return handleMeetingButton(kind);
   uint16_t counter = 0;
   switch (kind) {
     case ButtonPressKind::Left:
@@ -368,6 +428,10 @@ bool CompanionPage::handleButton(ButtonPressKind kind) {
 
 bool CompanionPage::handleTouch(freeink::ui::DisplayTarget& target, int16_t x, int16_t y) {
   const freeink::ui::Rect content = pageMainPanel(target).inset(freeink::ui::Insets{12, 8, 24, 18});
+  if (!CompanionBleService::getInstance().getHostStatus().meetingDetected) {
+    if (handleDesktopTouch(content, x, y)) return true;
+    return handleMeetingTouch(content, x, y);
+  }
   constexpr int16_t gap = 12;
   const int16_t tileW = static_cast<int16_t>((content.width - gap) / 2);
   const int16_t mediaTileY = static_cast<int16_t>(content.y + 188);
@@ -386,6 +450,55 @@ bool CompanionPage::handleTouch(freeink::ui::DisplayTarget& target, int16_t x, i
     return true;
   }
   return handleDesktopTouch(content, x, y);
+}
+
+bool CompanionPage::handleMeetingButton(ButtonPressKind kind) {
+  const auto page = CompanionBleService::getInstance().getMeetingList();
+  if (!page.valid) return false;
+  if (page.revision != renderedMeetingRevision_.load()) {
+    actionMessage_ = "List changed; tap again";
+    return true;
+  }
+  const uint8_t selected = selectedMeeting_.load();
+  if (kind == ButtonPressKind::Up || kind == ButtonPressKind::Down) {
+    if (page.count == 0) return false;
+    selectedMeeting_ = kind == ButtonPressKind::Up
+        ? static_cast<uint8_t>((selected + page.count - 1) % page.count)
+        : static_cast<uint8_t>((selected + 1) % page.count);
+    return true;
+  }
+  CompanionProtocol::ButtonId button;
+  if (kind == ButtonPressKind::Confirm && selected < page.count) {
+    button = CompanionProtocol::ButtonId::JoinMeeting;
+  } else if (kind == ButtonPressKind::Left && page.pageIndex > 0) {
+    button = CompanionProtocol::ButtonId::PreviousMeetings;
+  } else if (kind == ButtonPressKind::Right && page.pageIndex + 1 < page.pageCount) {
+    button = CompanionProtocol::ButtonId::NextMeetings;
+  } else {
+    return false;
+  }
+  const bool sent = CompanionBleService::getInstance().notifyMeetingReleased(button, selected, page.revision);
+  actionMessage_ = sent ? (button == CompanionProtocol::ButtonId::JoinMeeting ? "Join requested" : "Loading meetings...")
+                        : "List changed or host not ready";
+  return true;
+}
+
+bool CompanionPage::handleMeetingTouch(const freeink::ui::Rect& content, int16_t x, int16_t y) {
+  const auto page = CompanionBleService::getInstance().getMeetingList();
+  if (page.revision != renderedMeetingRevision_.load()) {
+    actionMessage_ = "List changed; tap again";
+    return true;
+  }
+  for (uint8_t i = 0; i < page.count; ++i) {
+    if (!meetingRowRect(content, i).contains(x, y)) continue;
+    selectedMeeting_ = i;
+    return handleMeetingButton(ButtonPressKind::Confirm);
+  }
+  const auto pager = meetingPagerRect(content);
+  if (!pager.contains(x, y)) return false;
+  if (x < pager.x + 100) return handleMeetingButton(ButtonPressKind::Left);
+  if (x >= pager.right() - 100) return handleMeetingButton(ButtonPressKind::Right);
+  return false;
 }
 
 bool CompanionPage::handleReactionTouch(const freeink::ui::Rect& content, int16_t x, int16_t y) {
@@ -466,6 +579,21 @@ std::unique_ptr<RenderTransaction> CompanionPage::render(freeink::ui::DisplayTar
 
   freeink::ui::drawText(target, freeink::ui::Rect{content.x, static_cast<int16_t>(content.y + 20), content.width, 34},
                         "Laptop Companion", title);
+  if (!host.meetingDetected) {
+    const auto page = service.getMeetingList();
+    if (page.revision != renderedMeetingRevision_.load()) {
+      selectedMeeting_ = 0;
+      actionMessage_.clear();
+    }
+    drawMeetingList(target, content, page, selectedMeeting_.load(), connected);
+    renderedMeetingRevision_ = page.revision;
+    if (!actionMessage_.empty()) {
+      freeink::ui::drawText(target, messageRect(content), actionMessage_.c_str(), center);
+    }
+    drawDesktopRow(target, content, service.getDesktopStatus(), pending);
+    drawPageChrome(target);
+    return tx;
+  }
   drawIcon(target, freeink::ui::Rect{static_cast<int16_t>(content.right() - 36), static_cast<int16_t>(content.y + 18),
                                      36, 36},
            icon_laptop_36);

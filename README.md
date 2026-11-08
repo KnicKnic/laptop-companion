@@ -36,6 +36,13 @@ from that SDK through `platformio.ini`.
   and hand toggles, meeting reactions, plus virtual desktop switch requests.
 - Offers thumbs up / heart / clap meeting reactions under the hand tile. These
   are one-shot buttons: they fire on each tap and never show an engaged state.
+- When not in a meeting, replaces the call-control icons with a paged list of
+  nearby Teams meetings from the laptop's default Outlook calendar, including
+  recurring and not-yet-accepted invitations. A meeting is included when its
+  duration overlaps now minus 15 minutes through now plus 40 minutes.
+  Tap a meeting to join with the microphone muted and camera off; the host
+  refuses to join unless both states can be verified on Teams' pre-join screen.
+  Desktop switching remains available at the bottom.
 - Styles a tapped control with a dithered gray fill while the press is in
   flight. Reactions have no state coming back, so they stay gray for at least a
   second before clearing, which keeps the feedback visible on a panel that takes

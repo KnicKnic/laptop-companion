@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CompanionProtocol.h"
+#include "MeetingListProtocol.h"
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -114,9 +115,11 @@ class CompanionBleService {
   bool notifyToggleCameraReleased(uint16_t* counter = nullptr);
   bool notifySwitchDesktopReleased(uint8_t desktopIndex, uint16_t* counter = nullptr);
   bool notifyReactionReleased(CompanionProtocol::ButtonId reaction, uint16_t* counter = nullptr);
+  bool notifyMeetingReleased(CompanionProtocol::ButtonId button, uint8_t index, uint16_t revision);
   std::string getStatusText() const;
   HostStatus getHostStatus() const;
   DesktopStatus getDesktopStatus() const;
+  MeetingListProtocol::Page getMeetingList() const;
   PendingButtonStatus getPendingButtonStatus() const;
   ActivityStats getActivityStats() const;
   uint32_t getBluetoothSessionRenderRequests() const;
@@ -134,6 +137,7 @@ class CompanionBleService {
   void onHostHandStateWritten(NimBLECharacteristic* characteristic);
   void onHostStatusMessageWritten(NimBLECharacteristic* characteristic);
   void onHostDesktopStateWritten(NimBLECharacteristic* characteristic);
+  void onHostMeetingListWritten(NimBLECharacteristic* characteristic);
   void onButtonEventSubscribed(bool subscribed);
   void onParticipationSubscribed(bool subscribed);
 
@@ -143,7 +147,8 @@ class CompanionBleService {
   void resetSessionState();
   void publishHostStateValues();
   void publishDeviceInfo();
-  bool publishButtonEvent(uint8_t buttonId, uint8_t action, uint8_t argument, uint16_t* counter);
+  bool publishButtonEvent(uint8_t buttonId, uint8_t action, uint8_t argument, uint16_t* counter,
+                          uint16_t meetingRevision = 0);
   void publishParticipationEventIfDue();
   void requestConnectionParams(ConnectionPowerProfile profile, const char* reason);
   void requestIdleConnectionParamsIfReady(const char* reason);
@@ -169,6 +174,7 @@ class CompanionBleService {
   NimBLECharacteristic* hostHandStateCharacteristic_ = nullptr;
   NimBLECharacteristic* hostStatusMessageCharacteristic_ = nullptr;
   NimBLECharacteristic* hostDesktopStateCharacteristic_ = nullptr;
+  NimBLECharacteristic* hostMeetingListCharacteristic_ = nullptr;
   NimBLECharacteristic* buttonEventCharacteristic_ = nullptr;
   NimBLECharacteristic* participationCharacteristic_ = nullptr;
   NimBLECharacteristic* deviceInfoCharacteristic_ = nullptr;
@@ -207,6 +213,8 @@ class CompanionBleService {
   uint32_t bluetoothSessionRenderBaseline_ = 0;
   HostStatus hostStatus_;
   DesktopStatus desktopStatus_;
+  MeetingListProtocol::Page meetingList_;
+  MeetingListProtocol::Receiver meetingListReceiver_;
   PendingButtonStatus pendingButtons_;
   ActivityStats activityStats_;
   ActivityStats previousActivityStats_;

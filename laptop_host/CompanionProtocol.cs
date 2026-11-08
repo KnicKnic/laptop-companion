@@ -16,8 +16,9 @@ namespace X3LaptopCompanion
         public static readonly Guid HostMeetingNameUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000a");
         public static readonly Guid ConnectionParticipationUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000b");
         public static readonly Guid HostDesktopStateUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000c");
+        public static readonly Guid HostMeetingListUuid = Guid.Parse("7d2d5f00-778d-4df6-a6d5-7c4e7a00000d");
 
-        public const byte ProtocolVersion = 4;
+        public const byte ProtocolVersion = 5;
         public const ushort StateCounterMask = 0x3FFF;
 
         public const int DesktopMaxCount = 8;
@@ -27,7 +28,58 @@ namespace X3LaptopCompanion
         public const byte DesktopFlagRemote = 0x01;
         public const byte DesktopFlagDisconnected = 0x02;
         public const ushort DesktopAckNone = 0;
-        public const int ButtonEventPayloadLength = 10;
+        public const int ButtonEventPayloadLength = 12;
+        public const int MeetingsPerPage = 4;
+        public const int MeetingNameMaxBytes = 64;
+        public const int MeetingMessageMaxBytes = 80;
+        public const int MeetingFragmentHeaderLength = 5;
+
+        public static byte[] EncodeMeetingPage(CompanionMeetingPage page)
+        {
+            if (page.Revision == 0 || page.PageCount < 1 || page.PageIndex >= page.PageCount ||
+                page.Meetings.Count > MeetingsPerPage || page.Status > 2)
+                throw new ArgumentException("Invalid meeting page.");
+            using var stream = new System.IO.MemoryStream();
+            using var writer = new System.IO.BinaryWriter(stream);
+            writer.Write(page.Revision);
+            writer.Write(page.PageIndex);
+            writer.Write(page.PageCount);
+            writer.Write(page.Status);
+            writer.Write((byte)page.Meetings.Count);
+            var message = TruncateName(page.Message, MeetingMessageMaxBytes);
+            writer.Write((byte)message.Length);
+            writer.Write(message);
+            foreach (var meeting in page.Meetings)
+            {
+                var start = meeting.Start.LocalDateTime;
+                var end = meeting.End.LocalDateTime;
+                writer.Write((ushort)(start.Hour * 60 + start.Minute));
+                writer.Write((ushort)(end.Hour * 60 + end.Minute));
+                var name = TruncateName(meeting.Subject, MeetingNameMaxBytes);
+                writer.Write((byte)name.Length);
+                writer.Write(name);
+            }
+            return stream.ToArray();
+        }
+
+        public static System.Collections.Generic.IEnumerable<byte[]> MeetingFragments(byte[] payload, int maxBytes)
+        {
+            if (maxBytes <= MeetingFragmentHeaderLength || payload.Length > 365 || payload.Length < 9)
+                throw new ArgumentException("Invalid meeting fragment size.");
+            for (var offset = 0; offset < payload.Length;)
+            {
+                var length = Math.Min(maxBytes - MeetingFragmentHeaderLength, payload.Length - offset);
+                var fragment = new byte[MeetingFragmentHeaderLength + length];
+                fragment[0] = ProtocolVersion;
+                fragment[1] = (byte)offset;
+                fragment[2] = (byte)(offset >> 8);
+                fragment[3] = (byte)payload.Length;
+                fragment[4] = (byte)(payload.Length >> 8);
+                Array.Copy(payload, offset, fragment, MeetingFragmentHeaderLength, length);
+                yield return fragment;
+                offset += length;
+            }
+        }
 
         public static ushort EncodeState(bool on, ushort counter, bool locked = false)
         {
@@ -175,7 +227,10 @@ namespace X3LaptopCompanion
         SwitchDesktop = 4,
         ReactLike = 5,
         ReactHeart = 6,
-        ReactApplause = 7
+        ReactApplause = 7,
+        JoinMeeting = 8,
+        PreviousMeetings = 9,
+        NextMeetings = 10
     }
 
     public enum CompanionButtonAction : byte
@@ -193,13 +248,14 @@ namespace X3LaptopCompanion
     public sealed class CompanionButtonEvent
     {
         public CompanionButtonEvent(CompanionButton button, CompanionButtonAction action, ushort sequence,
-            uint deviceUptimeMs, byte argument = 0)
+            uint deviceUptimeMs, byte argument = 0, ushort meetingRevision = 0)
         {
             Button = button;
             Action = action;
             Sequence = sequence;
             DeviceUptimeMs = deviceUptimeMs;
             Argument = argument;
+            MeetingRevision = meetingRevision;
         }
 
         public CompanionButton Button { get; }
@@ -209,6 +265,7 @@ namespace X3LaptopCompanion
 
         /// <summary>Button specific payload; the target desktop index for SwitchDesktop.</summary>
         public byte Argument { get; }
+        public ushort MeetingRevision { get; }
     }
 
     public sealed class CompanionParticipationEvent

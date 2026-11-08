@@ -46,6 +46,7 @@ enum class HostStateField : uint8_t {
   Hand,
   Message,
   Desktops,
+  MeetingList,
 };
 
 CompanionBleService* g_service = nullptr;
@@ -251,6 +252,9 @@ class HostStateCallbacks : public NimBLECharacteristicCallbacks {
       case HostStateField::Desktops:
         g_service->onHostDesktopStateWritten(characteristic);
         break;
+      case HostStateField::MeetingList:
+        g_service->onHostMeetingListWritten(characteristic);
+        break;
     }
   }
 
@@ -282,6 +286,7 @@ HostStateCallbacks cameraStateCallbacks(HostStateField::Camera);
 HostStateCallbacks handStateCallbacks(HostStateField::Hand);
 HostStateCallbacks statusMessageCallbacks(HostStateField::Message);
 HostStateCallbacks desktopStateCallbacks(HostStateField::Desktops);
+HostStateCallbacks meetingListCallbacks(HostStateField::MeetingList);
 ButtonEventCallbacks buttonEventCallbacks;
 ParticipationCallbacks participationCallbacks;
 }  // namespace
@@ -349,6 +354,9 @@ bool CompanionBleService::begin() {
       service->createCharacteristic(CompanionProtocol::HOST_STATUS_MESSAGE_UUID, stateProperties, kStatusMessageMaxLen);
   hostDesktopStateCharacteristic_ = service->createCharacteristic(
       CompanionProtocol::HOST_DESKTOP_STATE_UUID, stateProperties, CompanionProtocol::DESKTOP_STATE_MAX_LEN);
+  hostMeetingListCharacteristic_ = service->createCharacteristic(
+      CompanionProtocol::HOST_MEETING_LIST_UUID, stateProperties,
+      MeetingListProtocol::kPayloadMaxBytes + MeetingListProtocol::kFragmentHeaderBytes);
   buttonEventCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::BUTTON_EVENT_UUID,
                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY,
@@ -362,7 +370,7 @@ bool CompanionBleService::begin() {
   if (!hostTeamsStateCharacteristic_ || !hostMeetingStateCharacteristic_ || !hostMeetingNameCharacteristic_ ||
       !hostMicrophoneStateCharacteristic_ || !hostCameraStateCharacteristic_ || !hostHandStateCharacteristic_ ||
       !hostStatusMessageCharacteristic_ || !buttonEventCharacteristic_ || !participationCharacteristic_ ||
-      !deviceInfoCharacteristic_ || !hostDesktopStateCharacteristic_) {
+      !deviceInfoCharacteristic_ || !hostDesktopStateCharacteristic_ || !hostMeetingListCharacteristic_) {
     logPrintf("Companion BLE: failed to create characteristics\n");
     end();
     return false;
@@ -376,6 +384,7 @@ bool CompanionBleService::begin() {
   hostHandStateCharacteristic_->setCallbacks(&handStateCallbacks);
   hostStatusMessageCharacteristic_->setCallbacks(&statusMessageCallbacks);
   hostDesktopStateCharacteristic_->setCallbacks(&desktopStateCallbacks);
+  hostMeetingListCharacteristic_->setCallbacks(&meetingListCallbacks);
   buttonEventCharacteristic_->setCallbacks(&buttonEventCallbacks);
   participationCharacteristic_->setCallbacks(&participationCallbacks);
 
@@ -443,6 +452,7 @@ void CompanionBleService::end() {
   hostHandStateCharacteristic_ = nullptr;
   hostStatusMessageCharacteristic_ = nullptr;
   hostDesktopStateCharacteristic_ = nullptr;
+  hostMeetingListCharacteristic_ = nullptr;
   buttonEventCharacteristic_ = nullptr;
   participationCharacteristic_ = nullptr;
   deviceInfoCharacteristic_ = nullptr;
@@ -497,6 +507,13 @@ CompanionBleService::DesktopStatus CompanionBleService::getDesktopStatus() const
   const DesktopStatus status = desktopStatus_;
   unlockState();
   return status;
+}
+
+MeetingListProtocol::Page CompanionBleService::getMeetingList() const {
+  lockState();
+  const MeetingListProtocol::Page page = meetingList_;
+  unlockState();
+  return page;
 }
 
 CompanionBleService::PendingButtonStatus CompanionBleService::getPendingButtonStatus() const {
@@ -598,6 +615,27 @@ bool CompanionBleService::notifySwitchDesktopReleased(uint8_t desktopIndex, uint
 
   return publishButtonEvent(static_cast<uint8_t>(CompanionProtocol::ButtonId::SwitchDesktop),
                             static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), desktopIndex, counter);
+}
+
+bool CompanionBleService::notifyMeetingReleased(CompanionProtocol::ButtonId button, uint8_t index,
+                                               uint16_t revision) {
+  const bool join = button == CompanionProtocol::ButtonId::JoinMeeting;
+  const bool previous = button == CompanionProtocol::ButtonId::PreviousMeetings;
+  const bool next = button == CompanionProtocol::ButtonId::NextMeetings;
+  lockState();
+  const bool ready = running_ && hostConnected_ && buttonEventSubscribed_ && !hostStatus_.meetingDetected &&
+                     meetingList_.valid && revision == meetingList_.revision && meetingList_.status != 1 &&
+                     ((join && meetingList_.status == 0 && index < meetingList_.count) ||
+                      (previous && meetingList_.pageIndex > 0) ||
+                      (next && meetingList_.pageIndex + 1 < meetingList_.pageCount));
+  unlockState();
+  if (!ready) {
+    logPrintf("Companion BLE: meeting request skipped id=%u revision=%u\n",
+              static_cast<unsigned>(button), static_cast<unsigned>(revision));
+    return false;
+  }
+  return publishButtonEvent(static_cast<uint8_t>(button),
+                            static_cast<uint8_t>(CompanionProtocol::ButtonAction::Released), index, nullptr, revision);
 }
 
 void CompanionBleService::onHostConnected(uint16_t connHandle) {
@@ -962,6 +1000,26 @@ void CompanionBleService::onHostDesktopStateWritten(NimBLECharacteristic* charac
   requestIdleConnectionParamsIfReady("desktop_state");
 }
 
+void CompanionBleService::onHostMeetingListWritten(NimBLECharacteristic* characteristic) {
+  if (!characteristic) return;
+  lockState();
+  activityStats_.hostWrites++;
+  MeetingListProtocol::Page next;
+  const auto result = meetingListReceiver_.accept(characteristic->getValue(), next);
+  StatusChangedCallback callback = nullptr;
+  if (result == MeetingListProtocol::FragmentResult::Complete) {
+    meetingList_ = next;
+    hostStateReceived_ = true;
+    activityStats_.hostStateChanges++;
+    callback = markStatusChangedLocked();
+  }
+  unlockState();
+  if (result == MeetingListProtocol::FragmentResult::Invalid) {
+    logPrintf("Companion BLE: invalid meeting list fragment\n");
+  }
+  notifyStatusChanged(callback);
+}
+
 void CompanionBleService::onButtonEventSubscribed(bool subscribed) {
   lockState();
   buttonEventSubscribed_ = subscribed;
@@ -1116,6 +1174,8 @@ void CompanionBleService::resetSessionState() {
   bluetoothSessionRenderBaseline_ = 0;
   hostStatus_ = HostStatus{};
   desktopStatus_ = DesktopStatus{};
+  meetingList_ = MeetingListProtocol::Page{};
+  meetingListReceiver_.reset();
   pendingButtons_ = PendingButtonStatus{};
   unlockState();
 }
@@ -1222,7 +1282,8 @@ void CompanionBleService::publishDeviceInfo() {
   deviceInfoCharacteristic_->setValue(payload, sizeof(payload));
 }
 
-bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, uint8_t argument, uint16_t* counter) {
+bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, uint8_t argument, uint16_t* counter,
+                                              uint16_t meetingRevision) {
   if (!buttonEventCharacteristic_) return false;
 
   lockState();
@@ -1272,6 +1333,8 @@ bool CompanionBleService::publishButtonEvent(uint8_t buttonId, uint8_t action, u
       static_cast<uint8_t>((uptimeMs >> 16) & 0xFF),
       static_cast<uint8_t>((uptimeMs >> 24) & 0xFF),
       argument,
+      static_cast<uint8_t>(meetingRevision & 0xFF),
+      static_cast<uint8_t>((meetingRevision >> 8) & 0xFF),
   };
   static_assert(sizeof(payload) == CompanionProtocol::BUTTON_EVENT_PAYLOAD_LEN, "button event payload size mismatch");
   logPrintf("Companion BLE: publishing button event id=%u action=%u seq=%u arg=%u uptimeMs=%lu\n",

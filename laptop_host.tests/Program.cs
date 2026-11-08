@@ -4,13 +4,14 @@ using System.Threading.Tasks;
 using System.Windows.Automation;
 using X3LaptopCompanion;
 
-internal static class Program
+internal static partial class Program
 {
     private static int assertions;
 
     [STAThread]
     private static void Main(string[] args)
     {
+        CheckMeetingFeatures();
         var cases = new (string Description, CompanionTriState Expected)[]
         {
             ("Raise your hand", CompanionTriState.Off),
@@ -44,11 +45,17 @@ internal static class Program
         AssertThrows<ArgumentException>(() => NativeUiAutomation.ReadFullDescription(new IntPtr(1), null));
         AssertThrows<ArgumentException>(() => NativeUiAutomation.ReadFullDescription(new IntPtr(1), Array.Empty<int>()));
 
-        if (args.Length != 0)
+        if (args.Length == 1 && args[0] == "--calendar")
+        {
+            var meetings = new MeetingCalendarService().ReadAsync(DateTimeOffset.Now,
+                System.Threading.CancellationToken.None).GetAwaiter().GetResult();
+            Console.WriteLine("Live Outlook calendar read succeeded. Nearby meeting count: " + meetings.Count);
+        }
+        else if (args.Length != 0)
         {
             if (args.Length != 3 || args[0] != "--live")
             {
-                throw new ArgumentException("Usage: [--live <Teams audio PID> <Teams window PID>]");
+                throw new ArgumentException("Usage: [--calendar | --live <Teams audio PID> <Teams window PID>]");
             }
 
             var audioProcessId = int.Parse(args[1]);

@@ -17,8 +17,9 @@ constexpr const char* HOST_HAND_STATE_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a0000
 constexpr const char* HOST_MEETING_NAME_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00000a";
 constexpr const char* CONNECTION_PARTICIPATION_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00000b";
 constexpr const char* HOST_DESKTOP_STATE_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00000c";
+constexpr const char* HOST_MEETING_LIST_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00000d";
 
-constexpr uint8_t PROTOCOL_VERSION = 4;
+constexpr uint8_t PROTOCOL_VERSION = 5;
 constexpr uint16_t STATE_COUNTER_MASK = 0x3FFF;
 
 // Virtual desktop state payload: [version][count][activeIndex][ackSeqLo][ackSeqHi] then, per
@@ -45,7 +46,7 @@ constexpr uint32_t STATE_PENDING_TIMEOUT_MS = 2000;
 // visible on a display that takes a moment to refresh.
 constexpr uint32_t REACTION_MIN_PRESSED_MS = 1000;
 
-constexpr size_t BUTTON_EVENT_PAYLOAD_LEN = 10;
+constexpr size_t BUTTON_EVENT_PAYLOAD_LEN = 12;
 
 enum class ButtonId : uint8_t {
   ToggleMute = 1,
@@ -57,6 +58,9 @@ enum class ButtonId : uint8_t {
   ReactLike = 5,
   ReactHeart = 6,
   ReactApplause = 7,
+  JoinMeeting = 8,
+  PreviousMeetings = 9,
+  NextMeetings = 10,
 };
 
 constexpr bool isReactionButton(uint8_t buttonId) {

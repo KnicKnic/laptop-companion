@@ -27,6 +27,7 @@ namespace X3LaptopCompanion
         private GattCharacteristic hostHandStateCharacteristic;
         private GattCharacteristic hostMeetingNameCharacteristic;
         private GattCharacteristic hostDesktopStateCharacteristic;
+        private GattCharacteristic hostMeetingListCharacteristic;
         private GattCharacteristic buttonEventCharacteristic;
         private GattCharacteristic participationCharacteristic;
         private GattCharacteristic deviceInfoCharacteristic;
@@ -313,6 +314,42 @@ namespace X3LaptopCompanion
                 ResetGattState();
                 RestartAdvertisementWatcherIfNeeded("desktop state write exception");
                 PublishStatus(false, "Desktop state write exception: " + ex.Message);
+                return false;
+            }
+            finally
+            {
+                hostStateWriteLock.Release();
+            }
+        }
+
+        public async Task<bool> SendMeetingListAsync(CompanionMeetingPage page)
+        {
+            if (!await hostStateWriteLock.WaitAsync(0)) return false;
+            try
+            {
+                var characteristic = hostMeetingListCharacteristic;
+                if (characteristic == null)
+                {
+                    HostLog.Write("Meeting list skipped; characteristic unavailable.");
+                    return false;
+                }
+                var payload = CompanionProtocol.EncodeMeetingPage(page);
+                foreach (var fragment in CompanionProtocol.MeetingFragments(payload, MaxWritePayloadBytes()))
+                {
+                    using var writer = new DataWriter();
+                    writer.WriteBytes(fragment);
+                    var status = await characteristic.WriteValueAsync(writer.DetachBuffer(), GattWriteOption.WriteWithResponse);
+                    if (status != GattCommunicationStatus.Success)
+                        throw new InvalidOperationException("Meeting list write failed: " + status);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                HostLog.Write("Meeting list write failed.", ex);
+                ResetGattState();
+                RestartAdvertisementWatcherIfNeeded("meeting list write failed");
+                PublishStatus(false, "Meeting list write failed: " + ex.Message);
                 return false;
             }
             finally
@@ -652,6 +689,7 @@ namespace X3LaptopCompanion
             hostHandStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostHandStateUuid, "host hand state");
             hostMeetingNameCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingNameUuid, "host meeting name");
             hostDesktopStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostDesktopStateUuid, "host desktop state");
+            hostMeetingListCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingListUuid, "host meeting list");
             buttonEventCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.ButtonEventUuid, "button event");
             participationCharacteristic = await GetCharacteristicAsync(service,
                 CompanionProtocol.ConnectionParticipationUuid, "connection participation");
@@ -660,7 +698,7 @@ namespace X3LaptopCompanion
             if (hostTeamsStateCharacteristic == null || hostMicrophoneStateCharacteristic == null ||
                 hostCameraStateCharacteristic == null || hostStatusMessageCharacteristic == null ||
                 hostMeetingStateCharacteristic == null || hostMeetingNameCharacteristic == null ||
-                hostDesktopStateCharacteristic == null ||
+                hostDesktopStateCharacteristic == null || hostMeetingListCharacteristic == null ||
                 hostHandStateCharacteristic == null || buttonEventCharacteristic == null ||
                 participationCharacteristic == null || deviceInfoCharacteristic == null)
             {
@@ -837,6 +875,7 @@ namespace X3LaptopCompanion
             hostHandStateCharacteristic = null;
             hostMeetingNameCharacteristic = null;
             hostDesktopStateCharacteristic = null;
+            hostMeetingListCharacteristic = null;
             companionService?.Dispose();
             companionService = null;
             if (gattSession != null)
@@ -943,6 +982,7 @@ namespace X3LaptopCompanion
             var sequence = reader.ReadUInt16();
             var uptimeMs = reader.ReadUInt32();
             var argument = reader.ReadByte();
+            var meetingRevision = reader.ReadUInt16();
 
             if (version != CompanionProtocol.ProtocolVersion)
             {
@@ -963,7 +1003,7 @@ namespace X3LaptopCompanion
                 " action=" + action + " argument=" + argument + " uptimeMs=" + uptimeMs +
                 " hostReceivedAt=" + DateTimeOffset.Now);
             ButtonEventReceived?.Invoke(this, new CompanionButtonEvent((CompanionButton)button,
-                (CompanionButtonAction)action, sequence, uptimeMs, argument));
+                (CompanionButtonAction)action, sequence, uptimeMs, argument, meetingRevision));
         }
 
         private void OnParticipationValueChanged(GattCharacteristic sender, GattValueChangedEventArgs args)
