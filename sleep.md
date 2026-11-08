@@ -81,6 +81,18 @@ disable it (the generated sdkconfig.x4pro still had it on). It is now explicitly
 * Baseline: PM + auto light sleep with CPU power-down still on (as previously shipped): 22 disconnects in
   3 minutes, ~every 17s (15s supervision timeout + reconnect); the device never reset. Every connection event
   is effectively being missed once light sleep starts.
+* After that test (and a failed flash attempt while it was light sleeping) the device stopped advertising and
+  stopped answering esptool; it needs a manual reset / BOOT+reset before the next flash.
+
+### Next steps
+1. Flash the current build (CPU power-down really off) and run
+   `dotnet run --project ble_sleep_soak -- --minutes 15 --set "pm=1 als=1"`. If the link holds, the BTW/RTC
+   numbers show how much margin is left.
+2. If it still drops, try the auto-tuned lead and the calibration filter, one at a time:
+   `--set "pm=1 als=1" --ab tune --phase-minutes 10`, then `--ab rtcf`.
+3. Config candidates if wake latency is the problem: `CONFIG_PM_SLP_IRAM_OPT=y` and `CONFIG_PM_RTOS_IDLE_OPT=y`
+   (sleep code runs from flash on the S3 by default; IDF's default S3 sleep-out overhead is 8628us in that case
+   vs 382us in IRAM).
 
 
 
