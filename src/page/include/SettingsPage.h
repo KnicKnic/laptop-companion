@@ -29,7 +29,9 @@ class SettingsPage final : public Page {
   static constexpr uint8_t kRowFrontlightBrightness = 6;
   static constexpr uint8_t kRowFrontlightColor = 7;
   static constexpr uint8_t kRowHomeKeySensitivity = 8;
-  static constexpr uint8_t kMaxRows = 9;
+  static constexpr uint8_t kRowBtWakeAutotune = 9;
+  static constexpr uint8_t kRowRtcCalFilter = 10;
+  static constexpr uint8_t kMaxRows = 11;
 
   // Fills `rows` with the row ids visible on this board, in display order,
   // and returns the count. Always includes the six fixed rows; the frontlight

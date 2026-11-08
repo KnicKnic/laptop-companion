@@ -18,6 +18,13 @@ constexpr const char* HOST_MEETING_NAME_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00
 constexpr const char* CONNECTION_PARTICIPATION_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00000b";
 constexpr const char* HOST_DESKTOP_STATE_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00000c";
 constexpr const char* HOST_MEETING_LIST_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a00000d";
+// Debug-only: READ returns space separated key=value sleep/BLE timing diagnostics
+// (refreshed every few seconds while connected); WRITE accepts "key=value"
+// commands (pm, als, tune, rtcf, reset) applied live without saving to SD.
+// Used by ble_sleep_soak/. Kept at 0xf0 so new protocol UUIDs can
+// keep taking the next sequential value.
+constexpr const char* SLEEP_DIAGNOSTICS_UUID = "7d2d5f00-778d-4df6-a6d5-7c4e7a0000f0";
+constexpr size_t SLEEP_DIAGNOSTICS_MAX_LEN = 512;
 
 constexpr uint8_t PROTOCOL_VERSION = 5;
 constexpr uint16_t STATE_COUNTER_MASK = 0x3FFF;

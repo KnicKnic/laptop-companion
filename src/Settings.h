@@ -16,6 +16,10 @@ struct CompanionSettings {
   struct PowerManagement {
     bool enable = false;
     bool autoLightSleep = false;
+    // Auto-tune the BLE controller's light-sleep wake lead (see BtSleepTiming.h).
+    bool btWakeAutotune = false;
+    // Low-pass filter IDF's per-light-sleep 10-cycle RTC slow clock calibration.
+    bool rtcCalFilter = false;
   };
 
   struct Page {

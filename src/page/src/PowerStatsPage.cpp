@@ -1,5 +1,6 @@
 #include "PowerStatsPage.h"
 
+#include "BtSleepTiming.h"
 #include "PageDrawing.h"
 #include "PageManager.h"
 #include "IsrInput.h"
@@ -121,6 +122,8 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   std::string pmLock6;
   std::string pmLock7;
   formatPmLockActivity(pmLock1, pmLock2, pmLock3, pmLock4, pmLock5, pmLock6, pmLock7);
+  const std::string btWakeLine = formatBtWakeLine();
+  const std::string rtcCalLine = formatRtcCalLine();
 
   const freeink::ui::Rect content = getPagePanel(target);
 
@@ -180,6 +183,8 @@ std::unique_ptr<RenderTransaction> PowerStatsPage::render(freeink::ui::DisplayTa
   addRow(totalLine.c_str());
   addRow(deltaLine.c_str());
   addRow(accountingLine.c_str());
+  addRow(btWakeLine.c_str());
+  addRow(rtcCalLine.c_str());
   // Wake-cause detail is still collected, but hidden from the stats page for now.
   // for (uint8_t i = 0; i < wakeLineCount; ++i) addRow(wakeLines[i].c_str());
   addRow(wakeBitsLine);

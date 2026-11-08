@@ -140,6 +140,8 @@ class CompanionBleService {
   void onHostMeetingListWritten(NimBLECharacteristic* characteristic);
   void onButtonEventSubscribed(bool subscribed);
   void onParticipationSubscribed(bool subscribed);
+  void onDisconnectReason(int reason);
+  void onSleepDiagnosticsCommand(const std::string& command);
 
  private:
   CompanionBleService() = default;
@@ -164,6 +166,8 @@ class CompanionBleService {
   void stopWorker();
   static void workerTrampoline(void* self);
   void workerLoop();
+  void publishSleepDiagnostics();
+  void applyPendingSleepDiagnosticsCommand();
 
   NimBLEServer* server_ = nullptr;
   NimBLECharacteristic* hostTeamsStateCharacteristic_ = nullptr;
@@ -178,6 +182,11 @@ class CompanionBleService {
   NimBLECharacteristic* buttonEventCharacteristic_ = nullptr;
   NimBLECharacteristic* participationCharacteristic_ = nullptr;
   NimBLECharacteristic* deviceInfoCharacteristic_ = nullptr;
+  NimBLECharacteristic* sleepDiagnosticsCharacteristic_ = nullptr;
+  std::string pendingSleepDiagnosticsCommand_;
+  unsigned long lastSleepDiagnosticsAtMs_ = 0;
+  int lastDisconnectReason_ = 0;
+  uint32_t supervisionTimeouts_ = 0;
   TaskHandle_t workerTask_ = nullptr;
   mutable SemaphoreHandle_t stateMutex_ = nullptr;
   bool workerStopRequested_ = false;

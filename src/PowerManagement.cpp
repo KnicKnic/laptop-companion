@@ -1,6 +1,7 @@
 #include "PowerManagement.h"
 
 #include "AppLog.h"
+#include "BtSleepTiming.h"
 #include "Settings.h"
 
 #include <BoardConfig.h>
@@ -103,6 +104,8 @@ uint64_t TimedPowerManagementLock::nowMs() {
 
 bool configurePowerManagementFromSettings() {
   const CompanionSettings settings = copySettings();
+  setBtWakeAutotuneEnabled(settings.system.powerManagement.btWakeAutotune);
+  setRtcCalFilterEnabled(settings.system.powerManagement.rtcCalFilter);
   state.enabledBySettings = settings.system.powerManagement.enable;
   state.configured = false;
   state.autoLightSleep = settings.system.powerManagement.autoLightSleep;
@@ -140,9 +143,10 @@ bool configurePowerManagementFromSettings() {
     state.autoLightSleep = pmConfig.light_sleep_enable && configResult == ESP_OK;
   }
 
-  logPrintf("Power management: %s, DFS %d->%d MHz, auto light sleep %s\n",
+  logPrintf("Power management: %s, DFS %d->%d MHz, auto light sleep %s, bt wake autotune %s, rtc cal filter %s\n",
             configResult == ESP_OK ? "enabled" : esp_err_to_name(configResult), state.maxFreqMhz, state.minFreqMhz,
-            state.autoLightSleep ? "on" : "off");
+            state.autoLightSleep ? "on" : "off", settings.system.powerManagement.btWakeAutotune ? "on" : "off",
+            settings.system.powerManagement.rtcCalFilter ? "on" : "off");
   return configResult == ESP_OK;
 }
 
