@@ -68,6 +68,10 @@ constexpr PageId kOtherErrorRoute = PageId::CompanionSettingsWarning;
 constexpr PageId kInputDiagnosticsRoute = PageId::InputDiagnostics;
 
 SemaphoreHandle_t pageMutex = nullptr;
+// Set when the active page changes; the next active-page render is forced to
+// a full refresh so the previous page's pixels and ghosting are cleaned up,
+// even if a later fast-refresh request coalesces over the navigation render.
+bool fullRefreshPending = false;
 PageId currentPage = PageId::Companion;
 uint8_t rootNavIndex = 0;
 uint8_t companionNavIndex = 0;
@@ -268,6 +272,7 @@ PageId setCurrentPage(PageId page) {
   previous = currentPage;
   if (currentPage != entering->id()) {
     leaving = &pageFor(currentPage);
+    fullRefreshPending = true;
   }
   currentPage = entering->id();
   syncNavSelection(currentPage);
@@ -567,7 +572,7 @@ PageButtonResult handlePageButton(ButtonPressKind kind) {
         directoryOpenedByHomeKey = false;
         xSemaphoreGive(pageMutex);
         logPrintf("Directory selected: %s\n", routeFor(selected).path);
-        return PageButtonResult{setCurrentPage(selected), true, false};
+        return PageButtonResult{setCurrentPage(selected), true, false, true};
       }
       case ButtonPressKind::Up:
         xSemaphoreTake(pageMutex, portMAX_DELAY);
@@ -633,7 +638,7 @@ PageButtonResult handlePageTouch(float panelX, float panelY) {
       const PageId selected = routes[hit].id;
       directoryOpen = false;
       xSemaphoreGive(pageMutex);
-      return PageButtonResult{setCurrentPage(selected), true, false};
+      return PageButtonResult{setCurrentPage(selected), true, false, true};
     }
     directoryOpen = false;
     xSemaphoreGive(pageMutex);
@@ -692,6 +697,10 @@ void renderActivePage(EInkDisplay::RefreshMode mode) {
 
   refreshBatteryForRender();
   xSemaphoreTake(pageMutex, portMAX_DELAY);
+  if (fullRefreshPending) {
+    mode = EInkDisplay::FULL_REFRESH;
+    fullRefreshPending = false;
+  }
   Page& page = pageFor(currentPage);
   constexpr bool forceDraw = true;
   pageTarget->setOrientation(freeink::ui::Orientation::Portrait);
