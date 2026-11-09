@@ -39,8 +39,8 @@ constexpr uint32_t kButtonMaxPowerMs = 1000;
 constexpr uint32_t kPmStatsDumpPeriodMs = 15000;
 // The page chrome's battery is otherwise only re-read when something else
 // triggers a render, so an idle device could show a stale percentage for
-// hours. Poll on a fixed cadence and redraw only when the shown value changes.
-constexpr uint32_t kBatteryPollPeriodMs = 60UL * 1000UL;
+// hours. Every 15 minutes, force a fresh gauge read and redraw the page.
+constexpr uint32_t kBatteryPollPeriodMs = 15UL * 60UL * 1000UL;
 uint32_t nextBatteryPollMs = 0;
 
 #if CONFIG_PM_PROFILING
@@ -179,10 +179,10 @@ void pollBatteryIfDue() {
   const uint32_t now = millis();
   if (static_cast<int32_t>(now - nextBatteryPollMs) < 0) return;
   nextBatteryPollMs = now + kBatteryPollPeriodMs;
-  if (!pollBatteryForChrome()) return;
+  requestBatteryRefresh();
 
   const uint32_t seq = requestRender(RenderKind::ActivePage, refreshModeFromSettings(copySettings()));
-  logPrintf("Queued battery update render request %lu\n", static_cast<unsigned long>(seq));
+  logPrintf("Queued periodic battery render request %lu\n", static_cast<unsigned long>(seq));
 }
 
 }  // namespace

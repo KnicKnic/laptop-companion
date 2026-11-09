@@ -20,10 +20,9 @@ bool beginPageManager(EInkDisplay& display, PageId initialPage = PageId::Compani
 freeink::ui::DisplayTarget* pageDisplayTarget();
 PageId activePage();
 void drawPageChrome(freeink::ui::DisplayTarget& target);
-// Re-reads the battery outside of a render. Returns true when the value now
-// cached differs from what the page chrome last drew, so the caller should
-// queue an active-page render to keep the on-screen battery current.
-bool pollBatteryForChrome();
+// Makes the next active-page render re-read the battery instead of using the
+// cached value. Safe to call from any task.
+void requestBatteryRefresh();
 PageId showPage(PageId page);
 PageId showNextPage();
 PageId showPreviousPage();
