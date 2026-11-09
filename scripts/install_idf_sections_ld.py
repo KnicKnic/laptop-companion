@@ -9,8 +9,9 @@ ignored: CONFIG_PM_SLP_IRAM_OPT, CONFIG_PM_RTOS_IDLE_OPT, *_IN_IRAM, etc.
 
 This post: script copies $BUILD_DIR/sections.ld into the memory-type folder the
 Arduino link uses as soon as the IDF phase generates it, before pioarduino
-deletes the build directory. In the Arduino phase there is no sections.ld target
-and the script does nothing.
+deletes the build directory. In the Arduino phase there is no sections.ld target;
+there it instead checks that the linked IDF libraries were really built from
+this environment's custom_sdkconfig, and fails the build if not.
 """
 
 import shutil
@@ -35,6 +36,53 @@ def install_sections_ld(target, source, env):
     print(f"*** Installed generated sections.ld into {destination_dir} ***")
 
 
+def missing_custom_options(custom_sdkconfig, linked_sdkconfig_text):
+    """Enabled `custom_sdkconfig` options that the linked IDF libraries were built without.
+
+    Options the linked sdkconfig does not mention at all (not a Kconfig symbol in this
+    framework version, or hidden by an unmet dependency that is itself checked) are skipped.
+    """
+    lines = [line.strip() for line in linked_sdkconfig_text.splitlines()]
+    linked = set(lines)
+    known = set()
+    for line in lines:
+        if line.startswith("CONFIG_"):
+            known.add(line.split("=", 1)[0])
+        elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
+            known.add(line[2:-len(" is not set")])
+    required = []
+    for line in custom_sdkconfig.splitlines():
+        option = line.strip().strip("'\"")
+        if option.startswith("CONFIG_") and option.endswith("=y"):
+            required.append(option)
+    return [option for option in required if option.split("=", 1)[0] in known and option not in linked]
+
+
+def verify_linked_idf_config():
+    # The ESP-IDF libraries live in one shared package per machine. Building another
+    # environment (e.g. xteink) reinstalls that package, which silently replaces the
+    # custom esp32s3 libraries with stock ones; the custom_sdkconfig hash in
+    # sdkconfig.defaults still matches, so pioarduino does not rebuild them and the
+    # firmware links without PM, light sleep, single core, etc.
+    custom = env.GetProjectOption("custom_sdkconfig", "")
+    libs_dir = env.PioPlatform().get_package_dir("framework-arduinoespressif32-libs")
+    if not custom or not libs_dir:
+        return
+    mcu = env.BoardConfig().get("build.mcu", "esp32s3")
+    linked_sdkconfig = Path(libs_dir) / mcu / "sdkconfig"
+    if not linked_sdkconfig.exists():
+        return
+    missing = missing_custom_options(custom, linked_sdkconfig.read_text(encoding="utf-8", errors="replace"))
+    if missing:
+        print("*** The linked ESP-IDF libraries do not match custom_sdkconfig ***")
+        print(f"    {linked_sdkconfig} lacks: {', '.join(missing[:8])}{' ...' if len(missing) > 8 else ''}")
+        print("    Force the IDF rebuild: change the first line (# TASMOTA__<hash>) of sdkconfig.defaults,")
+        print("    build this environment again, then restore that line. See sleep.md.")
+        env.Exit(1)
+
+
 sections_ld = env.File(str(Path(env.subst("$BUILD_DIR")) / "sections.ld"))
 if sections_ld.has_builder():
     env.AddPostAction(sections_ld, install_sections_ld)
+else:
+    verify_linked_idf_config()

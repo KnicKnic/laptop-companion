@@ -58,6 +58,14 @@ implemented through linker fragments was silently ignored. `scripts/install_idf_
 the x4pro env) installs the generated `sections.ld` during the IDF phase. To force that phase after changing the
 script, change `custom_sdkconfig` or the `# TASMOTA__<hash>` first line of sdkconfig.defaults.
 
+**Building another environment wipes the custom libs.** The ESP-IDF libs are one shared package per machine.
+Building `xteink` reinstalls it, which silently puts stock esp32s3 libs back (PM off, dual core, RC slow clock).
+The x4pro hash in sdkconfig.defaults still matches, so pioarduino does not rebuild them, and the firmware then
+links without power management: auto light sleep never happens and the sleep stats stay 0 (a ` RC` on the RTC
+line is the tell). `scripts/install_idf_sections_ld.py` now fails the x4pro build when the linked libs lack any
+enabled `custom_sdkconfig` option. To fix it, change the `# TASMOTA__<hash>` line, build x4pro (20+ min), then
+restore the line.
+
 ### Instrumentation (`src/BtSleepTiming.*`, linker `--wrap` of esp_timer_create/start_once/stop and rtc_clk_cal)
 * **BTW line** (power stats page, serial, BLE): for every `btSlp`-scheduled wake, the margin between the CPU
   taking the `bt` lock and the controller's wake. `late` = margin < 0, `miss` = margin < -2.5ms (past the modem
