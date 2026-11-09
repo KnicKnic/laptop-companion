@@ -80,6 +80,9 @@ bool directoryOpen = false;
 bool directoryOpenedByHomeKey = false;
 uint8_t directoryIndex = 1;
 
+// Guards the battery cache below: it is refreshed by the display task during
+// renders and by the main loop's periodic poll.
+SemaphoreHandle_t batteryMutex = nullptr;
 bool batteryCached = false;
 bool batteryKnown = false;
 bool batteryCharging = false;
@@ -94,6 +97,12 @@ constexpr unsigned long kBatteryRetryMs = 2UL * 1000UL;
 // five-minute percentage cache; it gets its own short interval, which still
 // coalesces the I2C read across a burst of renders.
 constexpr unsigned long kChargingRefreshMs = 5UL * 1000UL;
+// What the page chrome last put on the panel, so the periodic poll only asks
+// for a redraw when the visible battery state actually changed.
+bool chromeDrawn = false;
+bool chromeBatteryKnown = false;
+bool chromeBatteryCharging = false;
+uint16_t chromeBatteryPercent = 0;
 
 constexpr size_t pageCount() {
   return sizeof(pages) / sizeof(pages[0]);
@@ -132,25 +141,31 @@ bool isCompanionRoute(PageId page) {
   return routeFor(page).companionSubtree;
 }
 
+// Caller must hold batteryMutex.
+void readBatteryStatusLocked(unsigned long now) {
+  BatteryMonitor battery;
+  const BatteryMonitor::Status status = battery.readStatus();
+  batteryKnown = status.percentageKnown;
+  batteryPercent = status.percentage > 100 ? 100 : status.percentage;
+  batteryCharging = status.chargingKnown && status.charging;
+  batteryReadAtMs = now;
+  chargingReadAtMs = now;
+  batteryCached = true;
+  setBootBatteryPercentage(batteryKnown, batteryPercent);
+}
+
 void refreshBatteryForRender() {
+  xSemaphoreTake(batteryMutex, portMAX_DELAY);
   const unsigned long now = millis();
   const unsigned long refreshInterval = (batteryKnown && batteryPercent > 0) ? kBatteryRefreshMs : kBatteryRetryMs;
   if (!batteryCached || now - batteryReadAtMs >= refreshInterval) {
+    readBatteryStatusLocked(now);
+  } else if (now - chargingReadAtMs >= kChargingRefreshMs) {
     BatteryMonitor battery;
-    const BatteryMonitor::Status status = battery.readStatus();
-    batteryKnown = status.percentageKnown;
-    batteryPercent = status.percentage > 100 ? 100 : status.percentage;
-    batteryCharging = status.chargingKnown && status.charging;
-    batteryReadAtMs = now;
+    batteryCharging = battery.isCharging();
     chargingReadAtMs = now;
-    batteryCached = true;
-    setBootBatteryPercentage(batteryKnown, batteryPercent);
-    return;
   }
-  if (now - chargingReadAtMs < kChargingRefreshMs) return;
-  BatteryMonitor battery;
-  batteryCharging = battery.isCharging();
-  chargingReadAtMs = now;
+  xSemaphoreGive(batteryMutex);
 }
 
 PageId rootNavPage(uint8_t index) {
@@ -480,6 +495,10 @@ bool beginPageManager(EInkDisplay& display, PageId initialPage) {
     pageMutex = xSemaphoreCreateMutex();
   }
   if (pageMutex == nullptr) return false;
+  if (batteryMutex == nullptr) {
+    batteryMutex = xSemaphoreCreateMutex();
+  }
+  if (batteryMutex == nullptr) return false;
 
   if (pageTarget == nullptr) {
     pageTarget = new (std::nothrow) freeink::ui::DisplayTarget(
@@ -654,12 +673,40 @@ const char* pageName(PageId page) {
   return routeFor(page).path;
 }
 
+bool pollBatteryForChrome() {
+  if (batteryMutex == nullptr) return false;
+
+  xSemaphoreTake(batteryMutex, portMAX_DELAY);
+  readBatteryStatusLocked(millis());
+  const bool changed = !chromeDrawn || chromeBatteryKnown != batteryKnown ||
+                       chromeBatteryCharging != batteryCharging ||
+                       (batteryKnown && chromeBatteryPercent != batteryPercent);
+  if (changed) {
+    logPrintf("Battery poll: %s%u%%%s (shown %s%u%%%s); redraw needed.\n", batteryKnown ? "" : "unknown ",
+              static_cast<unsigned>(batteryPercent), batteryCharging ? " charging" : "",
+              chromeBatteryKnown ? "" : "unknown ", static_cast<unsigned>(chromeBatteryPercent),
+              chromeBatteryCharging ? " charging" : "");
+  }
+  xSemaphoreGive(batteryMutex);
+  return changed;
+}
+
 void drawPageChrome(freeink::ui::DisplayTarget& target) {
   const int16_t width = target.logicalWidth();
 
+  xSemaphoreTake(batteryMutex, portMAX_DELAY);
+  const bool known = batteryCached && batteryKnown;
+  const uint16_t percent = batteryPercent;
+  const bool charging = batteryCharging;
+  chromeDrawn = true;
+  chromeBatteryKnown = known;
+  chromeBatteryCharging = charging;
+  chromeBatteryPercent = percent;
+  xSemaphoreGive(batteryMutex);
+
   char battery[20];
-  if (batteryCached && batteryKnown) {
-    snprintf(battery, sizeof(battery), "%u%%", batteryPercent);
+  if (known) {
+    snprintf(battery, sizeof(battery), "%u%%", percent);
   } else {
     snprintf(battery, sizeof(battery), "--%%");
   }
@@ -679,8 +726,8 @@ void drawPageChrome(freeink::ui::DisplayTarget& target) {
   freeink::ui::statusBar(frame, freeink::ui::Rect{0, 0, width, 38}, status);
 
   freeink::ui::BatteryIndicatorProps batteryProps;
-  batteryProps.percent = batteryKnown ? static_cast<uint8_t>(batteryPercent) : 0;
-  batteryProps.charging = batteryCharging;
+  batteryProps.percent = known ? static_cast<uint8_t>(percent) : 0;
+  batteryProps.charging = charging;
   batteryProps.label = battery;
   batteryProps.text.align = freeink::ui::TextAlign::Right;
   batteryProps.text.maxLines = 1;

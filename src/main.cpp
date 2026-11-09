@@ -37,6 +37,11 @@ constexpr uint32_t kMissingSettingsDelayMs = 20000;
 constexpr uint32_t kBootMaxPowerMs = 10000;
 constexpr uint32_t kButtonMaxPowerMs = 1000;
 constexpr uint32_t kPmStatsDumpPeriodMs = 15000;
+// The page chrome's battery is otherwise only re-read when something else
+// triggers a render, so an idle device could show a stale percentage for
+// hours. Poll on a fixed cadence and redraw only when the shown value changes.
+constexpr uint32_t kBatteryPollPeriodMs = 60UL * 1000UL;
+uint32_t nextBatteryPollMs = 0;
 
 #if CONFIG_PM_PROFILING
 void pmStatsDumpTask(void*) {
@@ -158,6 +163,28 @@ TickType_t inputWaitTicksForMaxPowerWindow(uint32_t millisecondsLeft) {
   return ticks > 0 ? ticks : 1;
 }
 
+uint32_t millisecondsUntilBatteryPoll() {
+  const int32_t remaining = static_cast<int32_t>(nextBatteryPollMs - millis());
+  return remaining > 0 ? static_cast<uint32_t>(remaining) : 1;
+}
+
+TickType_t inputWaitTicks(uint32_t maxPowerLeftMs) {
+  const uint32_t untilPollMs = millisecondsUntilBatteryPoll();
+  const uint32_t waitMs = (maxPowerLeftMs == 0 || untilPollMs < maxPowerLeftMs) ? untilPollMs : maxPowerLeftMs;
+  return inputWaitTicksForMaxPowerWindow(waitMs);
+}
+
+void pollBatteryIfDue() {
+  if (appIsSleeping()) return;
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - nextBatteryPollMs) < 0) return;
+  nextBatteryPollMs = now + kBatteryPollPeriodMs;
+  if (!pollBatteryForChrome()) return;
+
+  const uint32_t seq = requestRender(RenderKind::ActivePage, refreshModeFromSettings(copySettings()));
+  logPrintf("Queued battery update render request %lu\n", static_cast<unsigned long>(seq));
+}
+
 }  // namespace
 
 void setup() {
@@ -241,6 +268,7 @@ void setup() {
 
   const uint32_t bootRender = requestRender(RenderKind::ActivePage, EInkDisplay::FULL_REFRESH);
   waitForRender(bootRender, portMAX_DELAY);
+  nextBatteryPollMs = millis() + kBatteryPollPeriodMs;
 
   const AppState bootState = copyAppState();
   logPrintf("FreeInk hello world displayed on %s (%dx%d), SD %s\n", BoardConfig::ACTIVE.name,
@@ -248,9 +276,11 @@ void setup() {
 }
 
 void loop() {
+  pollBatteryIfDue();
+
   ButtonPress press;
   const uint32_t maxPowerLeftMs = maxPowerMillisecondsLeft();
-  const TickType_t inputTimeoutTicks = inputWaitTicksForMaxPowerWindow(maxPowerLeftMs);
+  const TickType_t inputTimeoutTicks = inputWaitTicks(maxPowerLeftMs);
 
   if (!consumeInputEvents(press, inputTimeoutTicks)) {
     return;
