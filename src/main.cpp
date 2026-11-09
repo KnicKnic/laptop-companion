@@ -18,6 +18,7 @@
 #include "AppLog.h"
 #include "AppSdBus.h"
 #include "AppState.h"
+#include "BtSleepTiming.h"
 #include "DisplayWorker.h"
 #include "Frontlight.h"
 #include "IsrInput.h"
@@ -46,6 +47,7 @@ void pmStatsDumpTask(void*) {
   bool havePreviousInterruptStats = false;
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(kPmStatsDumpPeriodMs));
+    if (!pmStatsDumpIsEnabled()) continue;
     const InterruptStatsSnapshot interruptStats = copyInterruptStats();
     const uint32_t touchIrqCount = inputTouchInterruptCount();
     const uint32_t buttonIrqCount = inputButtonInterruptCount();
@@ -73,6 +75,8 @@ void pmStatsDumpTask(void*) {
     previousButtonIrqCount = buttonIrqCount;
     previousEpdBusyIrqCount = epdBusyIrqCount;
     havePreviousInterruptStats = true;
+    Serial.println(formatBtWakeLine().c_str());
+    Serial.println(formatRtcCalLine().c_str());
     Serial.println("\n--- esp_pm_impl_dump_stats ---");
     esp_pm_impl_dump_stats(stdout);
     fflush(stdout);
@@ -184,6 +188,7 @@ void setup() {
   const bool companionSettingsValid = settingsResult == SettingsLoadResult::Loaded;
   setCompanionSettingsStatus(true, companionSettingsPresent, companionSettingsValid);
   setSerialLoggingEnabled(copySettings().system.debug.serialLogging);
+  logPrintf("Reset reason: %d\n", static_cast<int>(esp_reset_reason()));
 
   PageId bootPage = PageId::Companion;
   if (companionSettingsValid) {
@@ -201,6 +206,8 @@ void setup() {
     dumpSdDirectory("/sleep");
   }
 
+  beginBtSleepTiming();
+  holdLightSleepOffAfterBoot();
   configurePowerManagementFromSettings();
   armMaxPowerIfConfigured(kBootMaxPowerMs);
   beginPowerStats();

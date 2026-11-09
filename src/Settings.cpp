@@ -93,6 +93,10 @@ bool CompanionSettings::deserialize(const String& json, char* error, size_t erro
       jsonBoolOrDefault(power, "enable", parsed.system.powerManagement.enable);
   parsed.system.powerManagement.autoLightSleep =
       jsonBoolOrDefault(power, "auto_light_sleep", parsed.system.powerManagement.autoLightSleep);
+  parsed.system.powerManagement.btWakeAutotune =
+      jsonBoolOrDefault(power, "bt_wake_autotune", parsed.system.powerManagement.btWakeAutotune);
+  parsed.system.powerManagement.rtcCalFilter =
+      jsonBoolOrDefault(power, "rtc_cal_filter", parsed.system.powerManagement.rtcCalFilter);
 
   const cJSON* page = objectItem(systemObj, "page");
   const String startup = jsonStringOrDefault(page, "startup", parsed.system.page.startup);
@@ -144,6 +148,8 @@ String CompanionSettings::serialize() const {
   cJSON* power = addObject(systemObj, "power_management");
   cJSON_AddBoolToObject(power, "enable", system.powerManagement.enable);
   cJSON_AddBoolToObject(power, "auto_light_sleep", system.powerManagement.autoLightSleep);
+  cJSON_AddBoolToObject(power, "bt_wake_autotune", system.powerManagement.btWakeAutotune);
+  cJSON_AddBoolToObject(power, "rtc_cal_filter", system.powerManagement.rtcCalFilter);
 
   cJSON* page = addObject(systemObj, "page");
   cJSON_AddStringToObject(page, "startup", system.page.startup.c_str());

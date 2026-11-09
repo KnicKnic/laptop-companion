@@ -15,3 +15,5 @@ laptop_host/obj/
 laptop_host/.vs/
 laptop_host.tests/bin/
 laptop_host.tests/obj/
+ble_sleep_soak/bin/
+ble_sleep_soak/obj/

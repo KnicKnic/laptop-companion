@@ -82,6 +82,8 @@ uint8_t SettingsPage::activeRows(uint8_t* rows) {
   uint8_t count = 0;
   rows[count++] = kRowPowerManagement;
   rows[count++] = kRowAutoLightSleep;
+  rows[count++] = kRowBtWakeAutotune;
+  rows[count++] = kRowRtcCalFilter;
   rows[count++] = kRowStartupPage;
   rows[count++] = kRowRefreshMode;
   rows[count++] = kRowSerialLogging;
@@ -189,6 +191,8 @@ void SettingsPage::onLeave() {
   // Re-apply the live settings now rather than waiting for a reboot: power
   // management (DFS/light-sleep) is normally configured once at boot, so a
   // change made on this page would otherwise sit unused until next boot.
+  // On-device choices win over any live BLE test overrides.
+  clearPowerManagementOverrides();
   configurePowerManagementFromSettings();
   dirty_ = false;
 }
@@ -213,10 +217,14 @@ std::unique_ptr<RenderTransaction> SettingsPage::render(freeink::ui::DisplayTarg
 
   char pmEnable[16];
   char autoSleep[16];
+  char btWakeAutotune[16];
+  char rtcCalFilter[16];
   char logging[16];
   char powerStats[16];
   snprintf(pmEnable, sizeof(pmEnable), "%s", boolText(settings.system.powerManagement.enable));
   snprintf(autoSleep, sizeof(autoSleep), "%s", boolText(settings.system.powerManagement.autoLightSleep));
+  snprintf(btWakeAutotune, sizeof(btWakeAutotune), "%s", boolText(settings.system.powerManagement.btWakeAutotune));
+  snprintf(rtcCalFilter, sizeof(rtcCalFilter), "%s", boolText(settings.system.powerManagement.rtcCalFilter));
   snprintf(logging, sizeof(logging), "%s", boolText(settings.system.debug.serialLogging));
   snprintf(powerStats, sizeof(powerStats), "%s", boolText(settings.system.debug.showPowerStatsPage));
 
@@ -237,6 +245,12 @@ std::unique_ptr<RenderTransaction> SettingsPage::render(freeink::ui::DisplayTarg
         break;
       case kRowAutoLightSleep:
         drawSettingRow(target, row, "Auto light sleep", autoSleep, selected);
+        break;
+      case kRowBtWakeAutotune:
+        drawSettingRow(target, row, "BT wake autotune", btWakeAutotune, selected);
+        break;
+      case kRowRtcCalFilter:
+        drawSettingRow(target, row, "RTC cal filter", rtcCalFilter, selected);
         break;
       case kRowStartupPage:
         drawSettingRow(target, row, "Startup page", settings.system.page.startup.c_str(), selected);
@@ -289,6 +303,12 @@ void SettingsPage::toggleSelectedSetting() {
       break;
     case kRowAutoLightSleep:
       settings.system.powerManagement.autoLightSleep = !settings.system.powerManagement.autoLightSleep;
+      break;
+    case kRowBtWakeAutotune:
+      settings.system.powerManagement.btWakeAutotune = !settings.system.powerManagement.btWakeAutotune;
+      break;
+    case kRowRtcCalFilter:
+      settings.system.powerManagement.rtcCalFilter = !settings.system.powerManagement.rtcCalFilter;
       break;
     case kRowStartupPage:
       settings.system.page.startup = nextStartupPage(settings.system.page.startup);

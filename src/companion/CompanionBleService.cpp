@@ -1,13 +1,18 @@
 #include "CompanionBleService.h"
 
 #include "AppLog.h"
+#include "BtSleepTiming.h"
 #include "CompanionProtocol.h"
 #include "DisplayWorker.h"
+#include "PowerManagement.h"
 #include "PowerStats.h"
+#include "Settings.h"
 
 #include <NimBLEDevice.h>
 #include <NimBLEUtils.h>
 #include <esp_bt.h>
+#include <esp_system.h>
+#include <esp_system.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -22,6 +27,10 @@ constexpr unsigned long kButtonResponsiveWindowMs = 5000;
 constexpr unsigned long kParticipationWindowMs = 5000;
 constexpr unsigned long kWorkerPollMs = 500;
 constexpr unsigned long kWorkerPollActiveMs = 25;
+constexpr unsigned long kSleepDiagnosticsPeriodMs = 5000;
+// Auto light sleep enabled over BLE turns itself off unless the test host
+// sends "ka=1" at least this often (see armLightSleepDeadman()).
+constexpr uint32_t kLightSleepDeadmanMs = 90000;
 constexpr size_t kStatusMessageMaxLen = 48;
 constexpr size_t kEncodedStateLen = 2;
 
@@ -209,6 +218,7 @@ class CompanionServerCallbacks : public NimBLEServerCallbacks {
     logPrintf("Companion host disconnected handle=%u reason=%d\n",
               static_cast<unsigned>(connInfo.getConnHandle()), reason);
     if (g_service) {
+      g_service->onDisconnectReason(reason);
       g_service->onHostDisconnected();
     }
   }
@@ -289,6 +299,13 @@ HostStateCallbacks desktopStateCallbacks(HostStateField::Desktops);
 HostStateCallbacks meetingListCallbacks(HostStateField::MeetingList);
 ButtonEventCallbacks buttonEventCallbacks;
 ParticipationCallbacks participationCallbacks;
+
+class SleepDiagnosticsCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
+    if (g_service && characteristic) g_service->onSleepDiagnosticsCommand(characteristic->getValue());
+  }
+};
+SleepDiagnosticsCallbacks sleepDiagnosticsCallbacks;
 }  // namespace
 
 CompanionBleService& CompanionBleService::getInstance() {
@@ -366,6 +383,9 @@ bool CompanionBleService::begin() {
                                     NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY, 5);
   deviceInfoCharacteristic_ =
       service->createCharacteristic(CompanionProtocol::DEVICE_INFO_UUID, NIMBLE_PROPERTY::READ, 2);
+  sleepDiagnosticsCharacteristic_ = service->createCharacteristic(
+      CompanionProtocol::SLEEP_DIAGNOSTICS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE,
+      CompanionProtocol::SLEEP_DIAGNOSTICS_MAX_LEN);
 
   if (!hostTeamsStateCharacteristic_ || !hostMeetingStateCharacteristic_ || !hostMeetingNameCharacteristic_ ||
       !hostMicrophoneStateCharacteristic_ || !hostCameraStateCharacteristic_ || !hostHandStateCharacteristic_ ||
@@ -387,6 +407,7 @@ bool CompanionBleService::begin() {
   hostMeetingListCharacteristic_->setCallbacks(&meetingListCallbacks);
   buttonEventCharacteristic_->setCallbacks(&buttonEventCallbacks);
   participationCharacteristic_->setCallbacks(&participationCallbacks);
+  if (sleepDiagnosticsCharacteristic_) sleepDiagnosticsCharacteristic_->setCallbacks(&sleepDiagnosticsCallbacks);
 
   if (!server_->start()) {
     logPrintf("Companion BLE: failed to start GATT server\n");
@@ -456,6 +477,7 @@ void CompanionBleService::end() {
   buttonEventCharacteristic_ = nullptr;
   participationCharacteristic_ = nullptr;
   deviceInfoCharacteristic_ = nullptr;
+  sleepDiagnosticsCharacteristic_ = nullptr;
   ownsBluetoothStack_ = false;
 }
 
@@ -1570,7 +1592,7 @@ void CompanionBleService::unlockState() const {
 void CompanionBleService::startWorker() {
   if (workerTask_) return;
   workerStopRequested_ = false;
-  xTaskCreate(workerTrampoline, "companion_ble", 4096, this, 2, &workerTask_);
+  xTaskCreate(workerTrampoline, "companion_ble", 6144, this, 2, &workerTask_);
 }
 
 void CompanionBleService::stopWorker() {
@@ -1588,10 +1610,171 @@ void CompanionBleService::workerTrampoline(void* self) {
 void CompanionBleService::workerLoop() {
   while (!workerStopRequested_) {
     update();
+    applyPendingSleepDiagnosticsCommand();
+    revertCommandedLightSleepIfLinkUnhealthy();
     lockState();
     const bool participationActive = hostConnected_ && participationSubscribed_ && participationUntilMs_ != 0;
+    const bool connected = hostConnected_;
     unlockState();
+    const unsigned long now = millis();
+    if (connected && (lastSleepDiagnosticsAtMs_ == 0 || now - lastSleepDiagnosticsAtMs_ >= kSleepDiagnosticsPeriodMs)) {
+      lastSleepDiagnosticsAtMs_ = now;
+      publishSleepDiagnostics();
+    }
     vTaskDelay(pdMS_TO_TICKS(participationActive ? kWorkerPollActiveMs : kWorkerPollMs));
   }
   vTaskDelete(nullptr);
+}
+
+void CompanionBleService::onDisconnectReason(int reason) {
+  lockState();
+  lastDisconnectReason_ = reason;
+  // NimBLE reports HCI reasons as BLE_HS_ERR_HCI_BASE (0x200) + code; 0x08 is
+  // connection (supervision) timeout, i.e. too many consecutive missed events.
+  if (reason == 0x208) supervisionTimeouts_++;
+  unlockState();
+}
+
+void CompanionBleService::onSleepDiagnosticsCommand(const std::string& command) {
+  lockState();
+  pendingSleepDiagnosticsCommand_ = command;
+  unlockState();
+}
+
+void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
+  lockState();
+  std::string command;
+  command.swap(pendingSleepDiagnosticsCommand_);
+  unlockState();
+  if (command.empty()) return;
+
+  PowerManagementOverrides overrides = powerManagementOverrides();
+  bool settingsChanged = false;
+  size_t pos = 0;
+  while (pos < command.size()) {
+    const size_t end = command.find_first_of(" ;,\n", pos);
+    const std::string token = command.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    pos = end == std::string::npos ? command.size() : end + 1;
+    const size_t eq = token.find('=');
+    if (eq == std::string::npos) continue;
+    const std::string key = token.substr(0, eq);
+    const bool on = token.substr(eq + 1) == "1";
+    const int8_t forced = on ? 1 : 0;
+    if (key == "pm") {
+      overrides.enable = forced;
+      settingsChanged = true;
+    } else if (key == "als") {
+      overrides.autoLightSleep = forced;
+      settingsChanged = true;
+      lockState();
+      alsEnabledByCommand_ = on;
+      disconnectsAtAlsCommand_ = activityStats_.gapDisconnects;
+      disconnectedSinceMs_ = 0;
+      unlockState();
+      if (on) {
+        armLightSleepDeadman(kLightSleepDeadmanMs);
+      } else {
+        disarmLightSleepDeadman();
+      }
+    } else if (key == "ka" && on) {
+      lockState();
+      const bool commanded = alsEnabledByCommand_;
+      unlockState();
+      if (commanded) armLightSleepDeadman(kLightSleepDeadmanMs);
+      continue;
+    } else if (key == "tune") {
+      overrides.btWakeAutotune = forced;
+      settingsChanged = true;
+    } else if (key == "rtcf") {
+      overrides.rtcCalFilter = forced;
+      settingsChanged = true;
+    } else if (key == "minf") {
+      setPowerManagementMinFreqMhz(atoi(token.c_str() + eq + 1));
+      settingsChanged = true;
+    } else if (key == "dump") {
+      setPmStatsDumpEnabled(on);
+    } else if (key == "reset" && on) {
+      resetBtSleepTimingStats();
+    }
+  }
+  if (command != "ka=1") logPrintf("Companion BLE: sleep diagnostics command '%s'\n", command.c_str());
+  if (settingsChanged) {
+    setPowerManagementOverrides(overrides);
+    configurePowerManagementFromSettings();
+  }
+  publishSleepDiagnostics();
+}
+
+void CompanionBleService::revertCommandedLightSleepIfLinkUnhealthy() {
+  constexpr uint32_t kMaxDisconnects = 3;
+  constexpr unsigned long kMaxDisconnectedMs = 120000;
+
+  lockState();
+  if (!alsEnabledByCommand_) {
+    unlockState();
+    return;
+  }
+  const unsigned long now = millis();
+  if (hostConnected_) {
+    disconnectedSinceMs_ = 0;
+  } else if (disconnectedSinceMs_ == 0) {
+    disconnectedSinceMs_ = now;
+  }
+  const uint32_t disconnects = activityStats_.gapDisconnects - disconnectsAtAlsCommand_;
+  const bool longDisconnect = disconnectedSinceMs_ != 0 && now - disconnectedSinceMs_ >= kMaxDisconnectedMs;
+  if (disconnects < kMaxDisconnects && !longDisconnect) {
+    unlockState();
+    return;
+  }
+  alsEnabledByCommand_ = false;
+  alsSafetyReverts_++;
+  unlockState();
+  disarmLightSleepDeadman();
+
+  logPrintf("Companion BLE: clearing BLE auto light sleep override (%lu disconnects%s)\n",
+            static_cast<unsigned long>(disconnects), longDisconnect ? ", link down" : "");
+  PowerManagementOverrides overrides = powerManagementOverrides();
+  overrides.autoLightSleep = -1;
+  setPowerManagementOverrides(overrides);
+  configurePowerManagementFromSettings();
+}
+
+void CompanionBleService::publishSleepDiagnostics() {
+  if (!sleepDiagnosticsCharacteristic_) return;
+
+  const PowerStatsSnapshot power = copyPowerStats();
+  const PowerManagementState pmState = copyPowerManagementState();
+  const PowerManagementOverrides pmOverrides = powerManagementOverrides();
+  lockState();
+  const uint16_t interval = negotiatedConnInterval_;
+  const uint16_t latency = negotiatedConnLatency_;
+  const uint32_t disconnects = activityStats_.gapDisconnects;
+  const int lastReason = lastDisconnectReason_;
+  const uint32_t supervisionTimeouts = supervisionTimeouts_;
+  const uint32_t safetyReverts = alsSafetyReverts_;
+  const unsigned long connectedForMs = hostConnected_ ? millis() - hostConnectedAtMs_ : 0;
+  unlockState();
+
+  const unsigned sleepPermille =
+      power.wallUptimeUs > 0 ? static_cast<unsigned>((power.lightSleepUs * 1000ULL) / power.wallUptimeUs) : 0;
+  char head[240];
+  snprintf(head, sizeof(head),
+           "up_s=%llu conn_s=%lu sleep_pm=%u ls_n=%llu ls_rej=%llu pm=%u als=%u minf=%d dump=%u itvl=%u lat=%u "
+           "ovr_als=%d gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d rev=%lu deadman=%lu grace=%u ",
+           static_cast<unsigned long long>(power.wallUptimeUs / 1000000ULL),
+           static_cast<unsigned long>(connectedForMs / 1000UL), sleepPermille,
+           static_cast<unsigned long long>(power.lightSleepEntries),
+           static_cast<unsigned long long>(power.lightSleepRejects), pmState.enabledBySettings ? 1U : 0U,
+           power.autoLightSleep ? 1U : 0U, powerManagementMinFreqMhz(), pmStatsDumpIsEnabled() ? 1U : 0U,
+           static_cast<unsigned>(interval), static_cast<unsigned>(latency), static_cast<int>(pmOverrides.autoLightSleep),
+           static_cast<unsigned long>(disconnects),
+           static_cast<unsigned>(lastReason), static_cast<unsigned long>(supervisionTimeouts),
+           static_cast<int>(esp_reset_reason()), static_cast<unsigned long>(safetyReverts),
+           static_cast<unsigned long>(lightSleepDeadmanTrips()), lightSleepBootGraceActive() ? 1U : 0U);
+  std::string report = head;
+  report += formatBtSleepTimingKv();
+  if (report.size() > CompanionProtocol::SLEEP_DIAGNOSTICS_MAX_LEN) {
+    report.resize(CompanionProtocol::SLEEP_DIAGNOSTICS_MAX_LEN);
+  }
+  sleepDiagnosticsCharacteristic_->setValue(report);
 }

@@ -1,6 +1,7 @@
 #include "PowerStats.h"
 
 #include "AppLog.h"
+#include "BtSleepTiming.h"
 #include "DisplayWorker.h"
 #include "PowerManagement.h"
 
@@ -204,6 +205,7 @@ esp_err_t onLightSleepEnter(int64_t sleepTimeUs, void*) {
 }
 
 esp_err_t onLightSleepExit(int64_t sleptUsFromPm, void*) {
+  btSleepTimingOnLightSleepExit(esp_timer_get_time());
   portENTER_CRITICAL(&lightSleepStatsMux);
   if (lightSleepEnteredAtUs > 0) {
     const uint64_t sleptUs = sleptUsFromPm > 0 ? static_cast<uint64_t>(sleptUsFromPm) : 0;
@@ -651,6 +653,7 @@ void recordBtLockAcquire(esp_pm_lock_handle_t handle, esp_err_t err) {
     portEXIT_CRITICAL(&btLockMux);
     return;
   }
+  const bool btWake = lock->depth == 0;
   if (lock->depth == 0) {
     lock->acquiredAtUs = nowUs;
     lock->sleepGapBeforeAcquireUs =
@@ -665,6 +668,7 @@ void recordBtLockAcquire(esp_pm_lock_handle_t handle, esp_err_t err) {
   }
   lock->depth++;
   portEXIT_CRITICAL(&btLockMux);
+  if (btWake) btSleepTimingOnBtLockAcquired(nowUs);
 }
 
 void recordBtLockRelease(esp_pm_lock_handle_t handle, esp_err_t err) {
@@ -686,6 +690,7 @@ void recordBtLockRelease(esp_pm_lock_handle_t handle, esp_err_t err) {
           ? static_cast<uint64_t>(nowUs) - btLastReleaseAtUs
           : 0;
   lock->depth--;
+  const bool btSleep = lock->depth == 0;
   if (lock->depth == 0) {
     lock->acquiredAtUs = 0;
     btLastReleaseAtUs = nowUs > 0 ? static_cast<uint64_t>(nowUs) : 0;
@@ -701,6 +706,7 @@ void recordBtLockRelease(esp_pm_lock_handle_t handle, esp_err_t err) {
     }
   }
   portEXIT_CRITICAL(&btLockMux);
+  if (btSleep) btSleepTimingOnBtLockReleased(nowUs);
 }
 
 const char* wakeCauseName(uint8_t causeIndex) {
