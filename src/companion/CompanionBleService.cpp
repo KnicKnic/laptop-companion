@@ -19,15 +19,16 @@
 #include <cstring>
 
 namespace {
-constexpr unsigned long kMaintenanceIntervalMs = 2000;
 constexpr unsigned long kHandshakeTimeoutMs = 15000;
 constexpr unsigned long kAdvertisingRestartIntervalMs = 5000;
 constexpr unsigned long kConnParamRequestMinIntervalMs = 2500;
 constexpr unsigned long kButtonResponsiveWindowMs = 5000;
 constexpr unsigned long kParticipationWindowMs = 5000;
-constexpr unsigned long kWorkerPollMs = 500;
-constexpr unsigned long kWorkerPollActiveMs = 25;
+// The worker sleeps until its next deadline or until an event wakes it; this
+// is only a backstop in case a wake is ever missed.
+constexpr unsigned long kWorkerMaxSleepMs = 60000;
 constexpr unsigned long kSleepDiagnosticsPeriodMs = 5000;
+constexpr unsigned long kMaxCommandedLightSleepDisconnectedMs = 120000;
 // Auto light sleep enabled over BLE turns itself off unless the test host
 // sends "ka=1" at least this often (see armLightSleepDeadman()).
 constexpr uint32_t kLightSleepDeadmanMs = 90000;
@@ -1120,11 +1121,6 @@ void CompanionBleService::update() {
   }
 
   const unsigned long now = millis();
-  if (lastMaintenanceAtMs_ != 0 && now - lastMaintenanceAtMs_ < kMaintenanceIntervalMs) {
-    unlockState();
-    return;
-  }
-
   lastMaintenanceAtMs_ = now;
   activityStats_.maintenanceRuns++;
   const bool connected = hostConnected_;
@@ -1140,7 +1136,9 @@ void CompanionBleService::update() {
   // tick by settlePendingButtonsLocked().
   const bool hostSubscribed = buttonEventSubscribed_ || participationSubscribed_;
   const bool staleHandshake = hostConnectedAtMs_ != 0 && !hostStateReceived_ && !hostSubscribed &&
+                              !staleHandshakeDisconnectRequested_ &&
                               now - hostConnectedAtMs_ > kHandshakeTimeoutMs && server_;
+  if (staleHandshake) staleHandshakeDisconnectRequested_ = true;
   const uint16_t staleHandle = hostConnHandle_;
   const StatusChangedCallback timeoutCallback = desktopSwitchTimedOut ? markStatusChangedLocked() : nullptr;
   unlockState();
@@ -1192,6 +1190,9 @@ void CompanionBleService::resetSessionState() {
   responsiveUntilMs_ = 0;
   participationUntilMs_ = 0;
   lastParticipationNotifyAtMs_ = 0;
+  staleHandshakeDisconnectRequested_ = false;
+  sleepDiagnosticsActive_ = false;
+  lastSleepDiagnosticsAtMs_ = 0;
   hasNegotiatedConnParams_ = false;
   bluetoothSessionRenderBaseline_ = 0;
   hostStatus_ = HostStatus{};
@@ -1392,20 +1393,14 @@ void CompanionBleService::publishParticipationEventIfDue() {
   uint32_t counter = 0;
   unsigned long now = 0;
   unsigned long untilMs = 0;
-  unsigned long sinceLastMs = 0;
   unsigned long notifyPeriodMs = 0;
   uint16_t interval = 0;
-  uint16_t negotiatedInterval = 0;
-  uint16_t requestedMax = 0;
   uint16_t connHandle = 0xFFFF;
   lockState();
   now = millis();
   activityStats_.participationTimerChecks++;
   if (!hostConnected_ || !participationSubscribed_ || participationUntilMs_ == 0) {
     unlockState();
-    logPrintf("Companion BLE: participation timer inactive connected=%d subscribed=%d untilMs=%lu nowMs=%lu\n",
-              hostConnected_ ? 1 : 0, participationSubscribed_ ? 1 : 0,
-              static_cast<unsigned long>(participationUntilMs_), static_cast<unsigned long>(now));
     return;
   }
 
@@ -1419,20 +1414,11 @@ void CompanionBleService::publishParticipationEventIfDue() {
     return;
   }
 
-  negotiatedInterval = negotiatedConnInterval_;
-  requestedMax = requestedConnIntervalMax_;
-  interval = negotiatedInterval != 0 ? negotiatedInterval : requestedMax;
+  interval = negotiatedConnInterval_ != 0 ? negotiatedConnInterval_ : requestedConnIntervalMax_;
   if (interval == 0) interval = kConnIntervalIdleMax;
   notifyPeriodMs = std::max(20UL, static_cast<unsigned long>(interval));
-  sinceLastMs = lastParticipationNotifyAtMs_ == 0 ? 0 : now - lastParticipationNotifyAtMs_;
   if (lastParticipationNotifyAtMs_ != 0 && now - lastParticipationNotifyAtMs_ < notifyPeriodMs) {
     unlockState();
-    logPrintf("Companion BLE: participation timer tick waiting nowMs=%lu untilMs=%lu sinceLastMs=%lu periodMs=%lu "
-              "interval=%u negotiated=%u requestedMax=%u\n",
-              static_cast<unsigned long>(now), static_cast<unsigned long>(untilMs),
-              static_cast<unsigned long>(sinceLastMs), static_cast<unsigned long>(notifyPeriodMs),
-              static_cast<unsigned>(interval), static_cast<unsigned>(negotiatedInterval),
-              static_cast<unsigned>(requestedMax));
     return;
   }
 
@@ -1459,13 +1445,11 @@ void CompanionBleService::publishParticipationEventIfDue() {
     activityStats_.participationNotificationFailures++;
   }
   unlockState();
-  logPrintf("Companion BLE: participation notify %s counter=%lu handle=%u nowMs=%lu untilMs=%lu sinceLastMs=%lu "
-            "periodMs=%lu interval=%u negotiated=%u requestedMax=%u\n",
-            sent ? "sent" : "failed", static_cast<unsigned long>(counter), static_cast<unsigned>(connHandle),
-            static_cast<unsigned long>(now), static_cast<unsigned long>(untilMs),
-            static_cast<unsigned long>(sinceLastMs), static_cast<unsigned long>(notifyPeriodMs),
-            static_cast<unsigned>(interval), static_cast<unsigned>(negotiatedInterval),
-            static_cast<unsigned>(requestedMax));
+  if (!sent) {
+    logPrintf("Companion BLE: participation notify failed counter=%lu handle=%u periodMs=%lu\n",
+              static_cast<unsigned long>(counter), static_cast<unsigned>(connHandle),
+              static_cast<unsigned long>(notifyPeriodMs));
+  }
 }
 
 std::string CompanionBleService::formatTimingDiagnostics() const {
@@ -1555,6 +1539,8 @@ std::string CompanionBleService::formatActivityDeltaDiagnostics() {
 
 CompanionBleService::StatusChangedCallback CompanionBleService::markStatusChangedLocked() {
   statusChanged_ = true;
+  // Any state change can move one of the worker's deadlines.
+  wakeWorker();
   return statusChangedCallback_;
 }
 
@@ -1607,21 +1593,86 @@ void CompanionBleService::workerTrampoline(void* self) {
   static_cast<CompanionBleService*>(self)->workerLoop();
 }
 
+void CompanionBleService::wakeWorker() {
+  const TaskHandle_t task = workerTask_;
+  if (task && task != xTaskGetCurrentTaskHandle()) xTaskNotifyGive(task);
+}
+
+unsigned long CompanionBleService::workerSleepMsLocked(unsigned long now) const {
+  unsigned long sleepMs = kWorkerMaxSleepMs;
+  const auto dueAt = [&](unsigned long atMs) {
+    const long remaining = static_cast<long>(atMs - now);
+    const unsigned long ms = remaining <= 0 ? 0 : static_cast<unsigned long>(remaining);
+    if (ms < sleepMs) sleepMs = ms;
+  };
+
+  if (pendingButtons_.mutePending) dueAt(pendingButtons_.mutePressedAtMs + CompanionProtocol::STATE_PENDING_TIMEOUT_MS + 1);
+  if (pendingButtons_.cameraPending) {
+    dueAt(pendingButtons_.cameraPressedAtMs + CompanionProtocol::STATE_PENDING_TIMEOUT_MS + 1);
+  }
+  if (pendingButtons_.handPending) dueAt(pendingButtons_.handPressedAtMs + CompanionProtocol::STATE_PENDING_TIMEOUT_MS + 1);
+  if (pendingButtons_.reactionPending) {
+    dueAt(pendingButtons_.reactionPressedAtMs + (pendingButtons_.reactionTransmitted
+                                                     ? CompanionProtocol::REACTION_MIN_PRESSED_MS
+                                                     : CompanionProtocol::STATE_PENDING_TIMEOUT_MS + 1));
+  }
+
+  if (!hostConnected_) {
+    // Advertising watchdog; restartAdvertising() is rate limited to the same period.
+    dueAt(lastMaintenanceAtMs_ + kAdvertisingRestartIntervalMs);
+    if (alsEnabledByCommand_) {
+      dueAt(disconnectedSinceMs_ == 0 ? now : disconnectedSinceMs_ + kMaxCommandedLightSleepDisconnectedMs);
+    }
+    return sleepMs;
+  }
+
+  if (pendingButtons_.desktopPending) {
+    dueAt(pendingButtons_.desktopPressedAtMs + CompanionProtocol::DESKTOP_SWITCH_TIMEOUT_MS + 1);
+  }
+  if (responsiveUntilMs_ != 0) dueAt(responsiveUntilMs_);
+  const bool hostSubscribed = buttonEventSubscribed_ || participationSubscribed_;
+  if (hostConnectedAtMs_ != 0 && !hostStateReceived_ && !hostSubscribed && !staleHandshakeDisconnectRequested_) {
+    dueAt(hostConnectedAtMs_ + kHandshakeTimeoutMs + 1);
+  }
+  if (participationSubscribed_ && participationUntilMs_ != 0) {
+    const uint16_t interval = negotiatedConnInterval_ != 0 ? negotiatedConnInterval_
+                              : requestedConnIntervalMax_ != 0 ? requestedConnIntervalMax_
+                                                               : kConnIntervalIdleMax;
+    const unsigned long periodMs = std::max(20UL, static_cast<unsigned long>(interval));
+    dueAt(lastParticipationNotifyAtMs_ == 0 ? now : lastParticipationNotifyAtMs_ + periodMs);
+    dueAt(participationUntilMs_);
+  }
+  if (lastSleepDiagnosticsAtMs_ == 0) {
+    dueAt(now);
+  } else if (sleepDiagnosticsActive_) {
+    dueAt(lastSleepDiagnosticsAtMs_ + kSleepDiagnosticsPeriodMs);
+  }
+  return sleepMs;
+}
+
 void CompanionBleService::workerLoop() {
   while (!workerStopRequested_) {
     update();
     applyPendingSleepDiagnosticsCommand();
     revertCommandedLightSleepIfLinkUnhealthy();
+
     lockState();
-    const bool participationActive = hostConnected_ && participationSubscribed_ && participationUntilMs_ != 0;
-    const bool connected = hostConnected_;
+    unsigned long now = millis();
+    // Sleep diagnostics are built once per connection, then refreshed only
+    // while a client (ble_sleep_soak) is actively using the characteristic.
+    const bool publishDiagnostics =
+        hostConnected_ && (lastSleepDiagnosticsAtMs_ == 0 ||
+                           (sleepDiagnosticsActive_ && now - lastSleepDiagnosticsAtMs_ >= kSleepDiagnosticsPeriodMs));
+    if (publishDiagnostics) lastSleepDiagnosticsAtMs_ = now;
     unlockState();
-    const unsigned long now = millis();
-    if (connected && (lastSleepDiagnosticsAtMs_ == 0 || now - lastSleepDiagnosticsAtMs_ >= kSleepDiagnosticsPeriodMs)) {
-      lastSleepDiagnosticsAtMs_ = now;
-      publishSleepDiagnostics();
-    }
-    vTaskDelay(pdMS_TO_TICKS(participationActive ? kWorkerPollActiveMs : kWorkerPollMs));
+    if (publishDiagnostics) publishSleepDiagnostics();
+
+    lockState();
+    now = millis();
+    const unsigned long sleepMs = workerSleepMsLocked(now);
+    unlockState();
+    // +1 tick so a deadline is never observed a tick early, which would just loop again.
+    ulTaskNotifyTake(pdTRUE, sleepMs == 0 ? 0 : pdMS_TO_TICKS(sleepMs) + 1);
   }
   vTaskDelete(nullptr);
 }
@@ -1638,7 +1689,9 @@ void CompanionBleService::onDisconnectReason(int reason) {
 void CompanionBleService::onSleepDiagnosticsCommand(const std::string& command) {
   lockState();
   pendingSleepDiagnosticsCommand_ = command;
+  sleepDiagnosticsActive_ = true;
   unlockState();
+  wakeWorker();
 }
 
 void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
@@ -1707,7 +1760,6 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
 
 void CompanionBleService::revertCommandedLightSleepIfLinkUnhealthy() {
   constexpr uint32_t kMaxDisconnects = 3;
-  constexpr unsigned long kMaxDisconnectedMs = 120000;
 
   lockState();
   if (!alsEnabledByCommand_) {
@@ -1721,7 +1773,8 @@ void CompanionBleService::revertCommandedLightSleepIfLinkUnhealthy() {
     disconnectedSinceMs_ = now;
   }
   const uint32_t disconnects = activityStats_.gapDisconnects - disconnectsAtAlsCommand_;
-  const bool longDisconnect = disconnectedSinceMs_ != 0 && now - disconnectedSinceMs_ >= kMaxDisconnectedMs;
+  const bool longDisconnect =
+      disconnectedSinceMs_ != 0 && now - disconnectedSinceMs_ >= kMaxCommandedLightSleepDisconnectedMs;
   if (disconnects < kMaxDisconnects && !longDisconnect) {
     unlockState();
     return;

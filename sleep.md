@@ -136,7 +136,7 @@ script, change `custom_sdkconfig` or the `# TASMOTA__<hash>` first line of sdkco
   switch, PLL ramp to 240 MHz all at 10 MHz). The DFS floor is now 40 MHz (XTAL, no divider), as in IDF's
   BLE power-save example. Live A/B over BLE: `minf=10|20|40|80`.
 * The 15 s PM-stats dump task (formats PM/timer tables, writes to the dead USB console) costs ~0.3 ms of the
-  tail; `dump=0` disables it live.
+  tail. It is now off by default (the task blocks until enabled); `dump=1` turns it on live.
 * The 8MD256 calibration error (-600..+1000 ppm here, ~1 ms at 1.3 s sleeps) is invisible to these margins
   (esp_timer is corrected with the same calibration). `tune=1` keeps a guard for it; with `tune=0` the link held
   for 14 minutes but has no margin for it.
@@ -152,8 +152,12 @@ To use it day to day, turn on "Auto light sleep" on the Settings page (saved to 
 sleeping: twice it left the device unreachable (no advertising, no ROM response) until a manual reset.
 
 ### Possible follow-ups
-* Turn the PM-stats dump task and PM/esp_timer profiling off by default for normal use.
-* The companion BLE worker polls every 500 ms (~2 wakes/s, more than BLE itself); make it event-driven.
+* Done: the PM-stats dump task is off by default (`dump=1` enables it). Still open: turn PM/esp_timer
+  profiling (`CONFIG_PM_PROFILING`, `CONFIG_ESP_TIMER_PROFILING`) and the stats `--wrap` hooks off for normal use.
+* Done: the companion BLE worker is event-driven. It sleeps until its next deadline (pending-button settle,
+  participation pulse, handshake/responsive timeouts, 5 s advertising watchdog while disconnected) or until a
+  BLE event wakes it, instead of polling every 500 ms. Sleep diagnostics are built once per connection and
+  refreshed every 5 s only after a client writes the characteristic (ble_sleep_soak does on every read).
 * Debounce the X4 Pro power button (single `digitalRead` edge) in case a wake glitch caused the earlier
   "device unreachable" episodes.
 * Settings page: 11 rows fit with 16 px to spare on the 480x800 portrait layout and there is no scrolling;

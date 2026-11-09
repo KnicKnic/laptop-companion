@@ -166,6 +166,8 @@ class CompanionBleService {
   void stopWorker();
   static void workerTrampoline(void* self);
   void workerLoop();
+  void wakeWorker();
+  unsigned long workerSleepMsLocked(unsigned long now) const;
   void publishSleepDiagnostics();
   void applyPendingSleepDiagnosticsCommand();
   void revertCommandedLightSleepIfLinkUnhealthy();
@@ -186,6 +188,10 @@ class CompanionBleService {
   NimBLECharacteristic* sleepDiagnosticsCharacteristic_ = nullptr;
   std::string pendingSleepDiagnosticsCommand_;
   unsigned long lastSleepDiagnosticsAtMs_ = 0;
+  // Set once a client writes the sleep diagnostics characteristic on this
+  // connection; until then the value is only built once per connection.
+  bool sleepDiagnosticsActive_ = false;
+  bool staleHandshakeDisconnectRequested_ = false;
   int lastDisconnectReason_ = 0;
   uint32_t supervisionTimeouts_ = 0;
   // Safety net for live "als=1" commands: auto light sleep that was switched on

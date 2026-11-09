@@ -65,6 +65,12 @@ namespace X3LaptopCompanion
         private bool isExiting;
         private bool statusRefreshInFlight;
         private bool teamsCommandRefreshInFlight;
+        // The Teams snapshot (UI Automation + WASAPI) is the most expensive periodic read, so it
+        // only runs every second during a meeting and backs off when nothing time-critical is shown.
+        private static readonly System.TimeSpan TeamsRefreshInMeeting = System.TimeSpan.FromSeconds(1);
+        private static readonly System.TimeSpan TeamsRefreshTeamsRunning = System.TimeSpan.FromSeconds(3);
+        private static readonly System.TimeSpan TeamsRefreshTeamsNotRunning = System.TimeSpan.FromSeconds(5);
+        private System.DateTime nextLiveTeamsRefreshUtc = System.DateTime.MinValue;
         private HostStatePayload lastSentHostState;
         private HostStatePayload pendingHostState;
         private string pendingHostStateReason;
@@ -573,6 +579,11 @@ namespace X3LaptopCompanion
                 return;
             }
 
+            if (System.DateTime.UtcNow < nextLiveTeamsRefreshUtc)
+            {
+                return;
+            }
+
             statusRefreshInFlight = true;
             _ = RefreshLiveTeamsStatusAsync(ParseCommandTargetProcessId());
         }
@@ -593,6 +604,10 @@ namespace X3LaptopCompanion
                     {
                         return;
                     }
+
+                    nextLiveTeamsRefreshUtc = System.DateTime.UtcNow + (snapshot.MeetingDetected
+                        ? TeamsRefreshInMeeting
+                        : snapshot.TeamsDetected ? TeamsRefreshTeamsRunning : TeamsRefreshTeamsNotRunning);
 
                     if (teamsCommandRefreshInFlight)
                     {
@@ -1442,7 +1457,12 @@ namespace X3LaptopCompanion
 
             if (!wasBleConnected)
             {
-                HostLog.Write("Host state write skipped while BLE is disconnected. reason=" + reason);
+                // The periodic refresh ("current") would log this every tick while disconnected.
+                if (reason != "current")
+                {
+                    HostLog.Write("Host state write skipped while BLE is disconnected. reason=" + reason);
+                }
+
                 return;
             }
 
@@ -1450,7 +1470,6 @@ namespace X3LaptopCompanion
                 message, cameraLocked, handLocked);
             if (!force && payload.SameAs(lastSentHostState))
             {
-                HostLog.Write("Host state unchanged; BLE write skipped. reason=" + reason);
                 return;
             }
 

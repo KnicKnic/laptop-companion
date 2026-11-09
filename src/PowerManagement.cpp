@@ -18,7 +18,10 @@ constexpr int kDefaultMinCpuMhz = 40;
 constexpr uint64_t kBootNoLightSleepUs = 60ULL * 1000ULL * 1000ULL;
 
 int minCpuMhz = kDefaultMinCpuMhz;
-bool pmStatsDumpEnabled = true;
+// Off by default: the periodic dump wakes the CPU and formats PM/timer tables
+// for a USB console that light sleep disables anyway. "dump=1" over BLE turns it on.
+bool pmStatsDumpEnabled = false;
+TaskHandle_t pmStatsDumpTask = nullptr;
 PowerManagementOverrides overrides;
 
 PowerManagementState state;
@@ -277,8 +280,13 @@ void clearPowerManagementOverrides() {
 
 void setPmStatsDumpEnabled(bool enabled) {
   pmStatsDumpEnabled = enabled;
+  if (enabled && pmStatsDumpTask) xTaskNotifyGive(pmStatsDumpTask);
 }
 
 bool pmStatsDumpIsEnabled() {
   return pmStatsDumpEnabled;
+}
+
+void setPmStatsDumpTask(TaskHandle_t task) {
+  pmStatsDumpTask = task;
 }

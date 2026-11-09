@@ -101,6 +101,11 @@ hand state comes from the hand button's native `FullDescription`. For example,
 WASAPI is still sampled to discover the Teams audio
 process that leads to the right hosted meeting window.
 
+Live Teams state is read every second during a meeting, every 3 seconds while
+Teams runs without a meeting, and every 5 seconds while Teams is not running.
+Device button presses still refresh Teams immediately. Virtual desktops are
+read every second, and the calendar every 30 seconds.
+
 ## Build
 
 ```powershell
