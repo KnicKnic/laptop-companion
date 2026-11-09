@@ -19,6 +19,7 @@ constexpr uint64_t kBootNoLightSleepUs = 60ULL * 1000ULL * 1000ULL;
 
 int minCpuMhz = kDefaultMinCpuMhz;
 bool pmStatsDumpEnabled = true;
+PowerManagementOverrides overrides;
 
 PowerManagementState state;
 TimedPowerManagementLock maxPower(ESP_PM_CPU_FREQ_MAX, "max-power");
@@ -121,7 +122,14 @@ uint64_t TimedPowerManagementLock::nowMs() {
 }
 
 bool configurePowerManagementFromSettings() {
-  const CompanionSettings settings = copySettings();
+  CompanionSettings settings = copySettings();
+  // Live BLE test overrides apply on top of the saved settings without ever
+  // being written into them (so the Settings page can never persist them).
+  auto& pm = settings.system.powerManagement;
+  if (overrides.enable >= 0) pm.enable = overrides.enable != 0;
+  if (overrides.autoLightSleep >= 0) pm.autoLightSleep = overrides.autoLightSleep != 0;
+  if (overrides.btWakeAutotune >= 0) pm.btWakeAutotune = overrides.btWakeAutotune != 0;
+  if (overrides.rtcCalFilter >= 0) pm.rtcCalFilter = overrides.rtcCalFilter != 0;
   setBtWakeAutotuneEnabled(settings.system.powerManagement.btWakeAutotune);
   setRtcCalFilterEnabled(settings.system.powerManagement.rtcCalFilter);
   state.enabledBySettings = settings.system.powerManagement.enable;
@@ -211,11 +219,10 @@ volatile uint32_t deadmanTrips = 0;
 
 void onLightSleepDeadman(void*) {
   deadmanTrips++;
-  CompanionSettings settings = copySettings();
-  settings.system.powerManagement.autoLightSleep = false;
-  updateSettings(settings);
+  // Drop only the BLE override; the saved setting decides from here on.
+  overrides.autoLightSleep = -1;
   configurePowerManagementFromSettings();
-  logPrintf("Light-sleep dead-man switch tripped: auto light sleep disabled.\n");
+  logPrintf("Light-sleep dead-man switch tripped: BLE auto light sleep override cleared.\n");
 }
 }  // namespace
 
@@ -253,6 +260,19 @@ void setPowerManagementMinFreqMhz(int mhz) {
 
 int powerManagementMinFreqMhz() {
   return minCpuMhz;
+}
+
+void setPowerManagementOverrides(const PowerManagementOverrides& next) {
+  overrides = next;
+}
+
+PowerManagementOverrides powerManagementOverrides() {
+  return overrides;
+}
+
+void clearPowerManagementOverrides() {
+  overrides = PowerManagementOverrides{};
+  disarmLightSleepDeadman();
 }
 
 void setPmStatsDumpEnabled(bool enabled) {

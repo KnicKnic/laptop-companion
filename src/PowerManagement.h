@@ -58,6 +58,18 @@ uint32_t lightSleepDeadmanTrips();
 
 // Live (unsaved) experiment knobs, driven over BLE by ble_sleep_soak.
 // Takes effect on the next configurePowerManagementFromSettings().
+// Each field: -1 = use the saved setting, 0 = force off, 1 = force on.
+struct PowerManagementOverrides {
+  int8_t enable = -1;
+  int8_t autoLightSleep = -1;
+  int8_t btWakeAutotune = -1;
+  int8_t rtcCalFilter = -1;
+};
+void setPowerManagementOverrides(const PowerManagementOverrides& overrides);
+PowerManagementOverrides powerManagementOverrides();
+// Also disarms the light-sleep dead-man timer. Called when the user changes
+// settings on the device, so on-device choices always win.
+void clearPowerManagementOverrides();
 void setPowerManagementMinFreqMhz(int mhz);
 int powerManagementMinFreqMhz();
 void setPmStatsDumpEnabled(bool enabled);

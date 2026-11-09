@@ -1648,7 +1648,7 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
   unlockState();
   if (command.empty()) return;
 
-  CompanionSettings settings = copySettings();
+  PowerManagementOverrides overrides = powerManagementOverrides();
   bool settingsChanged = false;
   size_t pos = 0;
   while (pos < command.size()) {
@@ -1659,11 +1659,12 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
     if (eq == std::string::npos) continue;
     const std::string key = token.substr(0, eq);
     const bool on = token.substr(eq + 1) == "1";
+    const int8_t forced = on ? 1 : 0;
     if (key == "pm") {
-      settings.system.powerManagement.enable = on;
+      overrides.enable = forced;
       settingsChanged = true;
     } else if (key == "als") {
-      settings.system.powerManagement.autoLightSleep = on;
+      overrides.autoLightSleep = forced;
       settingsChanged = true;
       lockState();
       alsEnabledByCommand_ = on;
@@ -1682,10 +1683,10 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
       if (commanded) armLightSleepDeadman(kLightSleepDeadmanMs);
       continue;
     } else if (key == "tune") {
-      settings.system.powerManagement.btWakeAutotune = on;
+      overrides.btWakeAutotune = forced;
       settingsChanged = true;
     } else if (key == "rtcf") {
-      settings.system.powerManagement.rtcCalFilter = on;
+      overrides.rtcCalFilter = forced;
       settingsChanged = true;
     } else if (key == "minf") {
       setPowerManagementMinFreqMhz(atoi(token.c_str() + eq + 1));
@@ -1698,7 +1699,7 @@ void CompanionBleService::applyPendingSleepDiagnosticsCommand() {
   }
   if (command != "ka=1") logPrintf("Companion BLE: sleep diagnostics command '%s'\n", command.c_str());
   if (settingsChanged) {
-    updateSettings(settings);
+    setPowerManagementOverrides(overrides);
     configurePowerManagementFromSettings();
   }
   publishSleepDiagnostics();
@@ -1730,11 +1731,11 @@ void CompanionBleService::revertCommandedLightSleepIfLinkUnhealthy() {
   unlockState();
   disarmLightSleepDeadman();
 
-  logPrintf("Companion BLE: reverting BLE-commanded auto light sleep (%lu disconnects%s)\n",
+  logPrintf("Companion BLE: clearing BLE auto light sleep override (%lu disconnects%s)\n",
             static_cast<unsigned long>(disconnects), longDisconnect ? ", link down" : "");
-  CompanionSettings settings = copySettings();
-  settings.system.powerManagement.autoLightSleep = false;
-  updateSettings(settings);
+  PowerManagementOverrides overrides = powerManagementOverrides();
+  overrides.autoLightSleep = -1;
+  setPowerManagementOverrides(overrides);
   configurePowerManagementFromSettings();
 }
 
@@ -1742,7 +1743,8 @@ void CompanionBleService::publishSleepDiagnostics() {
   if (!sleepDiagnosticsCharacteristic_) return;
 
   const PowerStatsSnapshot power = copyPowerStats();
-  const CompanionSettings settings = copySettings();
+  const PowerManagementState pmState = copyPowerManagementState();
+  const PowerManagementOverrides pmOverrides = powerManagementOverrides();
   lockState();
   const uint16_t interval = negotiatedConnInterval_;
   const uint16_t latency = negotiatedConnLatency_;
@@ -1758,13 +1760,14 @@ void CompanionBleService::publishSleepDiagnostics() {
   char head[240];
   snprintf(head, sizeof(head),
            "up_s=%llu conn_s=%lu sleep_pm=%u ls_n=%llu ls_rej=%llu pm=%u als=%u minf=%d dump=%u itvl=%u lat=%u "
-           "gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d rev=%lu deadman=%lu grace=%u ",
+           "ovr_als=%d gap_disc=%lu disc_reason=0x%x sto=%lu rst=%d rev=%lu deadman=%lu grace=%u ",
            static_cast<unsigned long long>(power.wallUptimeUs / 1000000ULL),
            static_cast<unsigned long>(connectedForMs / 1000UL), sleepPermille,
            static_cast<unsigned long long>(power.lightSleepEntries),
-           static_cast<unsigned long long>(power.lightSleepRejects), settings.system.powerManagement.enable ? 1U : 0U,
+           static_cast<unsigned long long>(power.lightSleepRejects), pmState.enabledBySettings ? 1U : 0U,
            power.autoLightSleep ? 1U : 0U, powerManagementMinFreqMhz(), pmStatsDumpIsEnabled() ? 1U : 0U,
-           static_cast<unsigned>(interval), static_cast<unsigned>(latency), static_cast<unsigned long>(disconnects),
+           static_cast<unsigned>(interval), static_cast<unsigned>(latency), static_cast<int>(pmOverrides.autoLightSleep),
+           static_cast<unsigned long>(disconnects),
            static_cast<unsigned>(lastReason), static_cast<unsigned long>(supervisionTimeouts),
            static_cast<int>(esp_reset_reason()), static_cast<unsigned long>(safetyReverts),
            static_cast<unsigned long>(lightSleepDeadmanTrips()), lightSleepBootGraceActive() ? 1U : 0U);

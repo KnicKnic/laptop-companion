@@ -35,8 +35,13 @@ Also need to mess with
 * The CPU's light-sleep wake is timed by the RTC slow clock. With PM enabled IDF re-calibrates it on every
   light sleep (`CONFIG_PM_LIGHTSLEEP_RTC_OSC_CAL_INTERVAL=1`) using only 10 slow-clock cycles
   (`RTC_CLK_SRC_CAL_CYCLES` in sleep_modes.c). `CONFIG_RTC_CLK_CAL_CYCLES=3000` only affects the boot calibration.
-* On the S3 the light-sleep exit overhead is much larger than the C3 (IDF default 8628us vs 105us when
-  `CONFIG_PM_SLP_IRAM_OPT` is off; IDF measures it once after the first wake).
+* IDF's assumed light-sleep exit overhead (`DEFAULT_SLEEP_OUT_OVERHEAD_US`) is much larger on the S3:
+  8628us when `CONFIG_PM_SLP_IRAM_OPT` is off and 382us when it is on, vs 105us on the C3. It is only the
+  starting estimate: after the first real wake IDF measures the exit time and uses that instead.
+  Source: ESP-IDF v5.5 `components/esp_hw_support/sleep_modes.c` (in pioarduino's
+  `framework-espidf` v5.5.2: defaults at lines 172-180, measurement at lines 1473 and 1652-1653;
+  [upstream](https://github.com/espressif/esp-idf/blob/release/v5.5/components/esp_hw_support/sleep_modes.c)).
+  IDF wakes early by this amount, so it shifts the wake, it does not make it late.
 * S3 USB-Serial-JTAG does not survive light sleep (pads are disabled every sleep), so serial logs are not
   usable while auto light sleep is on. Use the BLE diagnostics characteristic instead (below).
 

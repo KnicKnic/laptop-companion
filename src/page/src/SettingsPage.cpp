@@ -191,6 +191,8 @@ void SettingsPage::onLeave() {
   // Re-apply the live settings now rather than waiting for a reboot: power
   // management (DFS/light-sleep) is normally configured once at boot, so a
   // change made on this page would otherwise sit unused until next boot.
+  // On-device choices win over any live BLE test overrides.
+  clearPowerManagementOverrides();
   configurePowerManagementFromSettings();
   dirty_ = false;
 }
