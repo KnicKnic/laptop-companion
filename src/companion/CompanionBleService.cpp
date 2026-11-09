@@ -20,13 +20,15 @@
 
 namespace {
 constexpr unsigned long kHandshakeTimeoutMs = 15000;
+constexpr unsigned long kStaleHandshakeRetryMs = 5000;
 constexpr unsigned long kAdvertisingRestartIntervalMs = 5000;
 constexpr unsigned long kConnParamRequestMinIntervalMs = 2500;
 constexpr unsigned long kButtonResponsiveWindowMs = 5000;
 constexpr unsigned long kParticipationWindowMs = 5000;
-// The worker sleeps until its next deadline or until an event wakes it; this
-// is only a backstop in case a wake is ever missed.
-constexpr unsigned long kWorkerMaxSleepMs = 60000;
+// The worker sleeps until its next deadline or until an event wakes it. This
+// cap is also how often a connected link is checked against NimBLE's own
+// connection table, which recovers from a lost disconnect event.
+constexpr unsigned long kWorkerMaxSleepMs = 30000;
 constexpr unsigned long kSleepDiagnosticsPeriodMs = 5000;
 constexpr unsigned long kMaxCommandedLightSleepDisconnectedMs = 120000;
 // Auto light sleep enabled over BLE turns itself off unless the test host
@@ -220,7 +222,7 @@ class CompanionServerCallbacks : public NimBLEServerCallbacks {
               static_cast<unsigned>(connInfo.getConnHandle()), reason);
     if (g_service) {
       g_service->onDisconnectReason(reason);
-      g_service->onHostDisconnected();
+      g_service->onHostDisconnected(connInfo.getConnHandle());
     }
   }
 
@@ -302,6 +304,12 @@ ButtonEventCallbacks buttonEventCallbacks;
 ParticipationCallbacks participationCallbacks;
 
 class SleepDiagnosticsCallbacks : public NimBLECharacteristicCallbacks {
+  // Any reader (not just ble_sleep_soak's writes) switches on the periodic refresh.
+  // This read returns the last built value; later reads stay at most 5 s old.
+  void onRead(NimBLECharacteristic*, NimBLEConnInfo&) override {
+    if (g_service) g_service->onSleepDiagnosticsRead();
+  }
+
   void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
     if (g_service && characteristic) g_service->onSleepDiagnosticsCommand(characteristic->getValue());
   }
@@ -427,17 +435,18 @@ bool CompanionBleService::begin() {
   advertising->setMaxInterval(kAdvIntervalLowPowerMax);
   advertising->setPreferredParams(kConnIntervalIdleMin, kConnIntervalIdleMax);
   advertising->setName("X3 Companion");
-  if (!advertising->start()) {
-    logPrintf("Companion BLE: failed to start advertising\n");
-    end();
-    return false;
-  }
+  const bool advertisingStarted = advertising->start();
 
   running_ = true;
   lastMaintenanceAtMs_ = millis();
-  lastAdvertisingRestartAtMs_ = 0;
+  lastAdvertisingRestartAtMs_ = advertisingStarted ? 0 : lastMaintenanceAtMs_;
   markStatusChanged();
   startWorker();
+  if (!advertisingStarted) {
+    // Keep the service up: the worker's advertising watchdog retries every
+    // kAdvertisingRestartIntervalMs instead of waiting for a button press.
+    logPrintf("Companion BLE: failed to start advertising; will retry\n");
+  }
   logPrintf("Companion BLE GATT server started\n");
   return true;
 }
@@ -675,8 +684,15 @@ void CompanionBleService::onHostConnected(uint16_t connHandle) {
   requestConnectionParams(ConnectionPowerProfile::Responsive, "connect");
 }
 
-void CompanionBleService::onHostDisconnected() {
+void CompanionBleService::onHostDisconnected(uint16_t connHandle) {
   lockState();
+  // A late event for an older link (or a second one for a link the worker
+  // already reset) must not clear a newer session or count twice.
+  if (!hostConnected_ || connHandle != hostConnHandle_) {
+    unlockState();
+    restartAdvertising("stale_disconnect");
+    return;
+  }
   resetSessionState();
   publishHostStateValues();
   activityStats_.gapDisconnects++;
@@ -1135,10 +1151,12 @@ void CompanionBleService::update() {
   // A toggle whose new state is never echoed back must still settle; that is handled every
   // tick by settlePendingButtonsLocked().
   const bool hostSubscribed = buttonEventSubscribed_ || participationSubscribed_;
+  // Retried until the link actually drops: a terminate can fail transiently.
   const bool staleHandshake = hostConnectedAtMs_ != 0 && !hostStateReceived_ && !hostSubscribed &&
-                              !staleHandshakeDisconnectRequested_ &&
-                              now - hostConnectedAtMs_ > kHandshakeTimeoutMs && server_;
-  if (staleHandshake) staleHandshakeDisconnectRequested_ = true;
+                              now - hostConnectedAtMs_ > kHandshakeTimeoutMs && server_ &&
+                              (staleHandshakeDisconnectAtMs_ == 0 ||
+                               now - staleHandshakeDisconnectAtMs_ >= kStaleHandshakeRetryMs);
+  if (staleHandshake) staleHandshakeDisconnectAtMs_ = now;
   const uint16_t staleHandle = hostConnHandle_;
   const StatusChangedCallback timeoutCallback = desktopSwitchTimedOut ? markStatusChangedLocked() : nullptr;
   unlockState();
@@ -1156,6 +1174,16 @@ void CompanionBleService::update() {
     return;
   }
 
+  // If NimBLE no longer knows the link (a disconnect event was lost, or the
+  // host stack reset), stop treating it as connected so advertising resumes.
+  // Otherwise the device would stay invisible until rebooted.
+  if (staleHandle == 0xFFFF || ble_gap_conn_find(staleHandle, nullptr) != 0) {
+    logPrintf("Companion BLE: link handle=%u no longer exists; resetting connection state\n",
+              static_cast<unsigned>(staleHandle));
+    onHostDisconnected(staleHandle);
+    return;
+  }
+
   if (responsiveDue) {
     lockState();
     responsiveUntilMs_ = 0;
@@ -1165,7 +1193,9 @@ void CompanionBleService::update() {
 
   if (staleHandshake && server_) {
     logPrintf("Companion BLE: disconnecting stale host handshake\n");
-    server_->disconnect(staleHandle);
+    if (!server_->disconnect(staleHandle)) {
+      logPrintf("Companion BLE: stale handshake disconnect failed; retrying in %lu ms\n", kStaleHandshakeRetryMs);
+    }
   }
 }
 
@@ -1190,7 +1220,7 @@ void CompanionBleService::resetSessionState() {
   responsiveUntilMs_ = 0;
   participationUntilMs_ = 0;
   lastParticipationNotifyAtMs_ = 0;
-  staleHandshakeDisconnectRequested_ = false;
+  staleHandshakeDisconnectAtMs_ = 0;
   sleepDiagnosticsActive_ = false;
   lastSleepDiagnosticsAtMs_ = 0;
   hasNegotiatedConnParams_ = false;
@@ -1631,8 +1661,9 @@ unsigned long CompanionBleService::workerSleepMsLocked(unsigned long now) const 
   }
   if (responsiveUntilMs_ != 0) dueAt(responsiveUntilMs_);
   const bool hostSubscribed = buttonEventSubscribed_ || participationSubscribed_;
-  if (hostConnectedAtMs_ != 0 && !hostStateReceived_ && !hostSubscribed && !staleHandshakeDisconnectRequested_) {
-    dueAt(hostConnectedAtMs_ + kHandshakeTimeoutMs + 1);
+  if (hostConnectedAtMs_ != 0 && !hostStateReceived_ && !hostSubscribed) {
+    dueAt(staleHandshakeDisconnectAtMs_ == 0 ? hostConnectedAtMs_ + kHandshakeTimeoutMs + 1
+                                             : staleHandshakeDisconnectAtMs_ + kStaleHandshakeRetryMs);
   }
   if (participationSubscribed_ && participationUntilMs_ != 0) {
     const uint16_t interval = negotiatedConnInterval_ != 0 ? negotiatedConnInterval_
@@ -1684,6 +1715,14 @@ void CompanionBleService::onDisconnectReason(int reason) {
   // connection (supervision) timeout, i.e. too many consecutive missed events.
   if (reason == 0x208) supervisionTimeouts_++;
   unlockState();
+}
+
+void CompanionBleService::onSleepDiagnosticsRead() {
+  lockState();
+  const bool wasActive = sleepDiagnosticsActive_;
+  sleepDiagnosticsActive_ = true;
+  unlockState();
+  if (!wasActive) wakeWorker();
 }
 
 void CompanionBleService::onSleepDiagnosticsCommand(const std::string& command) {

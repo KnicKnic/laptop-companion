@@ -76,8 +76,13 @@ script, change `custom_sdkconfig` or the `# TASMOTA__<hash>` first line of sdkco
 
 ### Testing
 1. Flash: `pio run -e x4pro -t upload` (set `PLATFORMIO_BUILD_DIR` to a short path such as `C:\pb` if the
-   worktree path is long; libsodium objects otherwise exceed Windows MAX_PATH).
-2. Stop laptop_host (or keep it and pass `--no-handshake`), then run the soak test from the repo root:
+   worktree path is long; libsodium objects otherwise exceed Windows MAX_PATH). If pio's output is piped or
+   redirected, also set `PYTHONUTF8=1`: otherwise esptool's Unicode progress bar crashes pio's output thread on a
+   cp1252 console, the pipe fills, and esptool hangs mid-write, leaving no bootable app (the bootloader keeps
+   rebooting with "No bootable app partitions"; flashing again recovers it).
+2. Stop laptop_host before running the soak test from the repo root. (`--no-handshake` alongside laptop_host is
+   unreliable: while the soak tool holds its GATT session, laptop_host's service rediscovery after any reconnect
+   fails with AccessDenied, it never subscribes, and the device drops it as a stale handshake every 15 s):
    `dotnet run --project ble_sleep_soak -- --minutes 60 --set "pm=1 als=1"`
    It connects like laptop_host, reads the `...0000f0` diagnostics characteristic every 30s, logs disconnects,
    and writes a `ble_sleep_soak_*.log`. The `pm/als/tune/rtcf` commands apply live and are not saved to SD.
@@ -157,7 +162,8 @@ sleeping: twice it left the device unreachable (no advertising, no ROM response)
 * Done: the companion BLE worker is event-driven. It sleeps until its next deadline (pending-button settle,
   participation pulse, handshake/responsive timeouts, 5 s advertising watchdog while disconnected) or until a
   BLE event wakes it, instead of polling every 500 ms. Sleep diagnostics are built once per connection and
-  refreshed every 5 s only after a client writes the characteristic (ble_sleep_soak does on every read).
+  refreshed every 5 s once a client reads or writes the characteristic (the first read after connecting returns
+  the value built at connect time).
 * Debounce the X4 Pro power button (single `digitalRead` edge) in case a wake glitch caused the earlier
   "device unreachable" episodes.
 * Settings page: 11 rows fit with 16 px to spare on the 480x800 portrait layout and there is no scrolling;
