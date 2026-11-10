@@ -81,6 +81,7 @@ namespace X3LaptopCompanion
         // Last-known meeting state, held so the companion keeps showing the meeting (and cached camera/hand)
         // while a full-screen Remote Desktop session DWM-cloaks the local Teams window and its UIA tree.
         private readonly object meetingStateCacheLock = new object();
+        private volatile string lastLoggedSnapshotDetail;
         private bool haveCachedMeetingState;
         private string lastKnownMeetingName = string.Empty;
         private CompanionTriState lastKnownMicrophone = CompanionTriState.Unknown;
@@ -673,7 +674,12 @@ namespace X3LaptopCompanion
                 " activeAudio=True" +
                 " meeting=\"" + meetingName + "\" " + controls.DescribeState();
 
-            HostLog.Write("Teams UIA snapshot. " + detail);
+            if (!string.Equals(detail, lastLoggedSnapshotDetail, StringComparison.Ordinal))
+            {
+                lastLoggedSnapshotDetail = detail;
+                HostLog.Write("Teams UIA snapshot. " + detail);
+            }
+
             return new TeamsMeetingSnapshot(true, true, meetingName, microphone, camera, hand, detail,
                 handLocked: hand == CompanionTriState.Unknown);
         }

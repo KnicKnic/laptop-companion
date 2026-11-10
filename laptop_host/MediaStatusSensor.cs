@@ -11,7 +11,6 @@ namespace X3LaptopCompanion
         private const int HResultNotFound = unchecked((int)0x80070490);
         private const string WebcamConsentStoreKey =
             @"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
-        private static DateTime lastWasapiDumpUtc = DateTime.MinValue;
         private readonly object teamsAudioProcessIdsLock = new object();
         private IReadOnlyCollection<int> teamsAudioProcessIds = Array.Empty<int>();
 
@@ -30,9 +29,7 @@ namespace X3LaptopCompanion
         {
             try
             {
-                var state = GetTeamsMicrophoneState(processIds);
-                DumpWasapiCaptureState(processIds, state);
-                return state;
+                return GetTeamsMicrophoneState(processIds);
             }
             catch (Exception ex)
             {
@@ -126,74 +123,6 @@ namespace X3LaptopCompanion
             return key.GetValue("LastUsedTimeStop") is long endTime && endTime <= 0;
         }
 
-        private static void DumpWasapiCaptureState(IReadOnlyCollection<int> processIds, CompanionTriState result)
-        {
-            if ((DateTime.UtcNow - lastWasapiDumpUtc) < TimeSpan.FromSeconds(8))
-            {
-                return;
-            }
-
-            lastWasapiDumpUtc = DateTime.UtcNow;
-            var processSet = new HashSet<int>(processIds ?? Array.Empty<int>());
-            HostLog.Write("WASAPI dump begin. result=" + result + " teamsPids=" +
-                (processSet.Count == 0 ? "(none)" : string.Join(",", processSet)));
-
-            object enumeratorObject = null;
-
-            try
-            {
-                enumeratorObject = new MMDeviceEnumerator();
-                var enumerator = (IMMDeviceEnumerator)enumeratorObject;
-                var roles = new[] { ERole.Communications, ERole.Multimedia, ERole.Console };
-
-                foreach (var role in roles)
-                {
-                    IMMDevice device = null;
-
-                    try
-                    {
-                        var hr = enumerator.GetDefaultAudioEndpoint(EDataFlow.Capture, role, out device);
-                        if (hr == HResultNotFound)
-                        {
-                            HostLog.Write("WASAPI endpoint role=" + role + " not found.");
-                            continue;
-                        }
-
-                        if (hr != 0)
-                        {
-                            HostLog.Write("WASAPI endpoint role=" + role + " hr=0x" + hr.ToString("X8") + ".");
-                            continue;
-                        }
-
-                        var deviceId = TryGetDeviceId(device);
-                        var endpointMuteText = TryGetEndpointMuted(device, out var endpointMuted)
-                            ? endpointMuted.ToString()
-                            : "unavailable";
-                        HostLog.Write("WASAPI endpoint role=" + role + " id=" + deviceId +
-                            " endpointMuted=" + endpointMuteText + ".");
-                        DumpDeviceSessions(device, processSet, role.ToString());
-                    }
-                    catch (Exception ex)
-                    {
-                        HostLog.Write("WASAPI endpoint role=" + role + " dump failed: " + ex.Message);
-                    }
-                    finally
-                    {
-                        ReleaseComObject(device);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                HostLog.Write("WASAPI dump failed: " + ex.Message);
-            }
-            finally
-            {
-                ReleaseComObject(enumeratorObject);
-                HostLog.Write("WASAPI dump end.");
-            }
-        }
-
         private CompanionTriState GetTeamsMicrophoneState(IReadOnlyCollection<int> processIds)
         {
             var matchedAudioProcessIds = new HashSet<int>();
@@ -283,75 +212,6 @@ namespace X3LaptopCompanion
             }
             finally
             {
-                ReleaseComObject(sessionManagerObject);
-            }
-        }
-
-        private static void DumpDeviceSessions(IMMDevice device, HashSet<int> processSet, string roleName)
-        {
-            object sessionManagerObject = null;
-            IAudioSessionEnumerator sessionEnumerator = null;
-
-            try
-            {
-                var sessionManagerId = typeof(IAudioSessionManager2).GUID;
-                Marshal.ThrowExceptionForHR(device.Activate(ref sessionManagerId, ClsCtxAll, IntPtr.Zero,
-                    out sessionManagerObject));
-                var sessionManager = (IAudioSessionManager2)sessionManagerObject;
-                Marshal.ThrowExceptionForHR(sessionManager.GetSessionEnumerator(out sessionEnumerator));
-                Marshal.ThrowExceptionForHR(sessionEnumerator.GetCount(out var sessionCount));
-                HostLog.Write("WASAPI sessions role=" + roleName + " count=" + sessionCount + ".");
-
-                for (var i = 0; i < sessionCount; i++)
-                {
-                    IAudioSessionControl sessionControl = null;
-
-                    try
-                    {
-                        Marshal.ThrowExceptionForHR(sessionEnumerator.GetSession(i, out sessionControl));
-                        var stateText = TryGetSessionState(sessionControl, out var state)
-                            ? state.ToString()
-                            : "unavailable";
-                        var processIdText = TryGetSessionProcessId(sessionControl, out var processId)
-                            ? processId.ToString()
-                            : "unavailable";
-                        var displayName = GetSessionDisplayName(sessionControl);
-                        var instanceId = GetSessionInstanceIdentifier(sessionControl);
-                        var sessionMutedText = TryGetSessionMuted(sessionControl, out var sessionMuted)
-                            ? sessionMuted.ToString()
-                            : "unavailable";
-                        var sessionVolumeText = TryGetSessionVolume(sessionControl, out var sessionVolume)
-                            ? sessionVolume.ToString("0.000")
-                            : "unavailable";
-                        var matchesTeams = SessionMatchesTeams(sessionControl, processSet);
-
-                        HostLog.Write("WASAPI session role=" + roleName + " index=" + i +
-                            " state=" + stateText +
-                            " pid=" + processIdText +
-                            " matchesTeams=" + matchesTeams +
-                            " muted=" + sessionMutedText +
-                            " volume=" + sessionVolumeText +
-                            " displayName=\"" + displayName + "\"" +
-                            " instanceId=\"" + instanceId + "\".");
-                    }
-                    catch (Exception ex)
-                    {
-                        HostLog.Write("WASAPI session role=" + roleName + " index=" + i +
-                            " dump failed: " + ex.Message);
-                    }
-                    finally
-                    {
-                        ReleaseComObject(sessionControl);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                HostLog.Write("WASAPI sessions role=" + roleName + " dump failed: " + ex.Message);
-            }
-            finally
-            {
-                ReleaseComObject(sessionEnumerator);
                 ReleaseComObject(sessionManagerObject);
             }
         }
@@ -485,27 +345,6 @@ namespace X3LaptopCompanion
             }
         }
 
-        private static bool TryGetSessionVolume(IAudioSessionControl sessionControl, out float volume)
-        {
-            volume = 0;
-            var simpleAudioVolume = sessionControl as ISimpleAudioVolume;
-            if (simpleAudioVolume == null)
-            {
-                return false;
-            }
-
-            try
-            {
-                Marshal.ThrowExceptionForHR(simpleAudioVolume.GetMasterVolume(out volume));
-                return true;
-            }
-            catch
-            {
-                volume = 0;
-                return false;
-            }
-        }
-
         private static bool TryGetEndpointMuted(IMMDevice device, out bool muted)
         {
             object endpointVolumeObject = null;
@@ -536,24 +375,6 @@ namespace X3LaptopCompanion
             if (value != null && Marshal.IsComObject(value))
             {
                 Marshal.ReleaseComObject(value);
-            }
-        }
-
-        private static string TryGetDeviceId(IMMDevice device)
-        {
-            if (device == null)
-            {
-                return "(null)";
-            }
-
-            try
-            {
-                Marshal.ThrowExceptionForHR(device.GetId(out var id));
-                return id ?? string.Empty;
-            }
-            catch (Exception ex)
-            {
-                return "unavailable:" + ex.Message;
             }
         }
 

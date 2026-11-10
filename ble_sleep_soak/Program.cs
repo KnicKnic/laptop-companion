@@ -184,7 +184,7 @@ internal static class Program
         writer.WriteString(command);
         var status = await diagnostics.WriteValueWithResultAsync(writer.DetachBuffer(), GattWriteOption.WriteWithResponse);
         Log($"> {command} ({status.Status})");
-        // The device applies commands from its worker loop (<= 0.5 s).
+        // The device's worker wakes on the write and applies the command right away.
         await Task.Delay(1500);
     }
 

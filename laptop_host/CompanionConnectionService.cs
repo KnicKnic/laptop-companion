@@ -34,6 +34,11 @@ namespace X3LaptopCompanion
         private readonly SemaphoreSlim hostStateWriteLock = new SemaphoreSlim(1, 1);
         private Timer scanWatchdogTimer;
         private int connecting;
+        // Each connect attempt gets a generation; the watchdog abandons a hung attempt by
+        // bumping it, so a late completion can tell it no longer owns the connection state.
+        private int connectGeneration;
+        private long connectStartedTicks;
+        private static readonly TimeSpan ConnectAttemptTimeout = TimeSpan.FromSeconds(90);
         private bool intentionallyPausedAdvertisementWatcher;
         private bool disposed;
         private uint lastParticipationCounter;
@@ -106,6 +111,9 @@ namespace X3LaptopCompanion
 
             scanWatchdogTimer?.Dispose();
             scanWatchdogTimer = null;
+            // Orphan any in-flight connect so it cannot adopt state after the service stopped.
+            Interlocked.Increment(ref connectGeneration);
+            Interlocked.Exchange(ref connecting, 0);
             ResetGattState();
             HostLog.Write("BLE watcher/service stopped.");
             PublishStatus(false, "BLE scanning stopped.");
@@ -388,7 +396,7 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            if (disposed || Interlocked.Exchange(ref connecting, 1) == 1)
+            if (!TryBeginConnect(out var generation))
             {
                 HostLog.Write("BLE device add ignored. disposed=" + disposed + " connecting=" + connecting);
                 return;
@@ -396,22 +404,32 @@ namespace X3LaptopCompanion
 
             try
             {
-                await ConnectAsync(args);
+                await ConnectAsync(args, generation);
             }
             catch (Exception ex)
             {
                 HostLog.Write("BLE connect failed with exception.", ex);
-                PublishStatus(false, "BLE connect exception: " + ex.Message);
+                if (IsCurrentAttempt(generation))
+                {
+                    PublishStatus(false, "BLE connect exception: " + ex.Message);
+                }
             }
             finally
             {
-                if (!IsConnected())
+                if (IsCurrentAttempt(generation))
                 {
-                    ResetGattState();
-                    RestartAdvertisementWatcherIfNeeded("device add not connected");
-                }
+                    if (!IsConnected())
+                    {
+                        ResetGattState();
+                        RestartAdvertisementWatcherIfNeeded("device add not connected");
+                    }
 
-                Interlocked.Exchange(ref connecting, 0);
+                    Interlocked.Exchange(ref connecting, 0);
+                }
+                else
+                {
+                    HostLog.Write("Abandoned BLE device connect attempt finished. generation=" + generation);
+                }
             }
         }
 
@@ -452,35 +470,48 @@ namespace X3LaptopCompanion
                 ResetGattState();
             }
 
-            if (Interlocked.Exchange(ref connecting, 1) == 1)
+            if (!TryBeginConnect(out var generation))
             {
                 return;
             }
 
             try
             {
-                await ConnectFromAdvertisementAsync(args.BluetoothAddress, args.BluetoothAddressType);
+                await ConnectFromAdvertisementAsync(args.BluetoothAddress, args.BluetoothAddressType, generation);
             }
             catch (COMException ex)
             {
                 HostLog.Write("BLE advertisement connect failed with COM exception. HResult=0x" +
                     ex.HResult.ToString("X8"), ex);
-                PublishStatus(false, "BLE GATT connect failed: 0x" + ex.HResult.ToString("X8"));
+                if (IsCurrentAttempt(generation))
+                {
+                    PublishStatus(false, "BLE GATT connect failed: 0x" + ex.HResult.ToString("X8"));
+                }
             }
             catch (Exception ex)
             {
                 HostLog.Write("BLE advertisement connect failed with exception.", ex);
-                PublishStatus(false, "BLE advertisement connect exception: " + ex.Message);
+                if (IsCurrentAttempt(generation))
+                {
+                    PublishStatus(false, "BLE advertisement connect exception: " + ex.Message);
+                }
             }
             finally
             {
-                if (!IsConnected())
+                if (IsCurrentAttempt(generation))
                 {
-                    ResetGattState();
-                }
+                    if (!IsConnected())
+                    {
+                        ResetGattState();
+                    }
 
-                Interlocked.Exchange(ref connecting, 0);
-                RestartAdvertisementWatcherIfNeeded("advertisement connect finally");
+                    Interlocked.Exchange(ref connecting, 0);
+                    RestartAdvertisementWatcherIfNeeded("advertisement connect finally");
+                }
+                else
+                {
+                    HostLog.Write("Abandoned BLE advertisement connect attempt finished. generation=" + generation);
+                }
             }
         }
 
@@ -511,7 +542,7 @@ namespace X3LaptopCompanion
             PublishStatus(false, "X3 companion GATT session closed.");
         }
 
-        private async Task ConnectAsync(DeviceInformation deviceInfo)
+        private async Task ConnectAsync(DeviceInformation deviceInfo, int generation)
         {
             PublishStatus(false, "Found X3 companion service. Connecting...");
             HostLog.Write("Opening GATT service. Name=" + deviceInfo.Name + " Id=" + deviceInfo.Id);
@@ -524,10 +555,11 @@ namespace X3LaptopCompanion
                 return;
             }
 
-            await UseGattServiceAsync(service);
+            await UseGattServiceAsync(service, generation);
         }
 
-        private async Task ConnectFromAdvertisementAsync(ulong bluetoothAddress, BluetoothAddressType addressType)
+        private async Task ConnectFromAdvertisementAsync(ulong bluetoothAddress, BluetoothAddressType addressType,
+            int generation)
         {
             PublishStatus(false, "Found X3 companion advertisement. Connecting...");
             HostLog.Write("Opening BLE device from advertisement. Address=" + FormatBluetoothAddress(bluetoothAddress) +
@@ -540,49 +572,72 @@ namespace X3LaptopCompanion
                 HostLog.Write("BLE advertisement watcher paused for GATT connection attempt.");
             }
 
-            var device = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress, addressType);
-            if (device == null)
+            BluetoothLEDevice device = null;
+            GattSession session = null;
+            var transferred = false;
+            try
             {
-                HostLog.Write("BluetoothLEDevice.FromBluetoothAddressAsync returned null for " +
-                    FormatBluetoothAddress(bluetoothAddress) + " AddressType=" + addressType);
-                PublishStatus(false, "Unable to open X3 BLE device from advertisement.");
-                RestartAdvertisementWatcherIfNeeded("advertisement device null");
-                return;
+                device = await BluetoothLEDevice.FromBluetoothAddressAsync(bluetoothAddress, addressType);
+                if (device == null)
+                {
+                    HostLog.Write("BluetoothLEDevice.FromBluetoothAddressAsync returned null for " +
+                        FormatBluetoothAddress(bluetoothAddress) + " AddressType=" + addressType);
+                    PublishStatus(false, "Unable to open X3 BLE device from advertisement.");
+                    RestartAdvertisementWatcherIfNeeded("advertisement device null");
+                    return;
+                }
+
+                HostLog.Write("BLE device opened. Name=" + device.Name + " Address=" +
+                    FormatBluetoothAddress(device.BluetoothAddress) + " AddressType=" + device.BluetoothAddressType +
+                    " ConnectionStatus=" + device.ConnectionStatus + " CanPair=" + device.DeviceInformation.Pairing.CanPair +
+                    " IsPaired=" + device.DeviceInformation.Pairing.IsPaired);
+
+                session = await CreateMaintainedGattSessionAsync(device);
+                var services = await GetGattServicesWithRetryAsync(device);
+                HostLog.Write("Advertisement GATT service lookup status=" + services.Status + " count=" + services.Services.Count);
+                if (!IsCurrentAttempt(generation))
+                {
+                    foreach (var abandonedService in services.Services)
+                    {
+                        abandonedService.Dispose();
+                    }
+
+                    return;
+                }
+
+                if (services.Status != GattCommunicationStatus.Success || services.Services.Count == 0)
+                {
+                    PublishStatus(false, "X3 advertisement found, but GATT service could not be opened: " +
+                        services.Status + " count=" + services.Services.Count);
+                    RestartAdvertisementWatcherIfNeeded("gatt service lookup failed");
+                    return;
+                }
+
+                if (gattSession != null)
+                {
+                    gattSession.SessionStatusChanged -= OnGattSessionStatusChanged;
+                    gattSession.Dispose();
+                }
+
+                gattSession = session;
+                if (gattSession != null)
+                {
+                    gattSession.SessionStatusChanged += OnGattSessionStatusChanged;
+                }
+
+                companionDevice?.Dispose();
+                companionDevice = device;
+                transferred = true;
+                await UseGattServiceAsync(services.Services[0], generation);
             }
-
-            HostLog.Write("BLE device opened. Name=" + device.Name + " Address=" +
-                FormatBluetoothAddress(device.BluetoothAddress) + " AddressType=" + device.BluetoothAddressType +
-                " ConnectionStatus=" + device.ConnectionStatus + " CanPair=" + device.DeviceInformation.Pairing.CanPair +
-                " IsPaired=" + device.DeviceInformation.Pairing.IsPaired);
-
-            var session = await CreateMaintainedGattSessionAsync(device);
-            var services = await GetGattServicesWithRetryAsync(device);
-            HostLog.Write("Advertisement GATT service lookup status=" + services.Status + " count=" + services.Services.Count);
-            if (services.Status != GattCommunicationStatus.Success || services.Services.Count == 0)
+            finally
             {
-                session?.Dispose();
-                device.Dispose();
-                PublishStatus(false, "X3 advertisement found, but GATT service could not be opened: " +
-                    services.Status + " count=" + services.Services.Count);
-                RestartAdvertisementWatcherIfNeeded("gatt service lookup failed");
-                return;
+                if (!transferred)
+                {
+                    session?.Dispose();
+                    device?.Dispose();
+                }
             }
-
-            if (gattSession != null)
-            {
-                gattSession.SessionStatusChanged -= OnGattSessionStatusChanged;
-                gattSession.Dispose();
-            }
-
-            gattSession = session;
-            if (gattSession != null)
-            {
-                gattSession.SessionStatusChanged += OnGattSessionStatusChanged;
-            }
-
-            companionDevice?.Dispose();
-            companionDevice = device;
-            await UseGattServiceAsync(services.Services[0]);
         }
 
         private static async Task<GattSession> CreateMaintainedGattSessionAsync(BluetoothLEDevice device)
@@ -664,116 +719,221 @@ namespace X3LaptopCompanion
             }
         }
 
-        private async Task UseGattServiceAsync(GattDeviceService service)
+        private async Task UseGattServiceAsync(GattDeviceService service, int generation)
         {
-            if (buttonEventCharacteristic != null)
+            // Everything is built in locals and only adopted once fully subscribed, so a failed or
+            // abandoned attempt never leaves half-initialized state behind.
+            var adopted = false;
+            GattCharacteristic buttonEvent = null;
+            GattCharacteristic participation = null;
+            var buttonHandlerAdded = false;
+            var participationHandlerAdded = false;
+            try
             {
-                buttonEventCharacteristic.ValueChanged -= OnButtonEventValueChanged;
-                buttonEventCharacteristic = null;
-            }
-            if (participationCharacteristic != null)
-            {
-                participationCharacteristic.ValueChanged -= OnParticipationValueChanged;
-                participationCharacteristic = null;
-            }
+                HostLog.Write("GATT service opened. Uuid=" + service.Uuid);
 
-            companionService?.Dispose();
-            companionService = service;
-            HostLog.Write("GATT service opened. Uuid=" + service.Uuid);
+                var teams = await GetCharacteristicAsync(service, CompanionProtocol.HostTeamsStateUuid, "host teams state");
+                var microphone = await GetCharacteristicAsync(service, CompanionProtocol.HostMicrophoneStateUuid, "host microphone state");
+                var camera = await GetCharacteristicAsync(service, CompanionProtocol.HostCameraStateUuid, "host camera state");
+                var message = await GetCharacteristicAsync(service, CompanionProtocol.HostStatusMessageUuid, "host status message");
+                var meeting = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingStateUuid, "host meeting state");
+                var hand = await GetCharacteristicAsync(service, CompanionProtocol.HostHandStateUuid, "host hand state");
+                var meetingName = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingNameUuid, "host meeting name");
+                var desktops = await GetCharacteristicAsync(service, CompanionProtocol.HostDesktopStateUuid, "host desktop state");
+                var meetingList = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingListUuid, "host meeting list");
+                buttonEvent = await GetCharacteristicAsync(service, CompanionProtocol.ButtonEventUuid, "button event");
+                participation = await GetCharacteristicAsync(service,
+                    CompanionProtocol.ConnectionParticipationUuid, "connection participation");
+                var deviceInfo = await GetCharacteristicAsync(service, CompanionProtocol.DeviceInfoUuid, "device info");
+                if (!IsCurrentAttempt(generation))
+                {
+                    return;
+                }
 
-            hostTeamsStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostTeamsStateUuid, "host teams state");
-            hostMicrophoneStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMicrophoneStateUuid, "host microphone state");
-            hostCameraStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostCameraStateUuid, "host camera state");
-            hostStatusMessageCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostStatusMessageUuid, "host status message");
-            hostMeetingStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingStateUuid, "host meeting state");
-            hostHandStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostHandStateUuid, "host hand state");
-            hostMeetingNameCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingNameUuid, "host meeting name");
-            hostDesktopStateCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostDesktopStateUuid, "host desktop state");
-            hostMeetingListCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.HostMeetingListUuid, "host meeting list");
-            buttonEventCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.ButtonEventUuid, "button event");
-            participationCharacteristic = await GetCharacteristicAsync(service,
-                CompanionProtocol.ConnectionParticipationUuid, "connection participation");
-            deviceInfoCharacteristic = await GetCharacteristicAsync(service, CompanionProtocol.DeviceInfoUuid, "device info");
+                if (teams == null || microphone == null || camera == null || message == null || meeting == null ||
+                    meetingName == null || desktops == null || meetingList == null || hand == null ||
+                    buttonEvent == null || participation == null || deviceInfo == null)
+                {
+                    HostLog.Write("Required characteristic missing. teams=" + (teams != null) +
+                        " microphone=" + (microphone != null) +
+                        " camera=" + (camera != null) +
+                        " message=" + (message != null) +
+                        " meeting=" + (meeting != null) +
+                        " meetingName=" + (meetingName != null) +
+                        " desktops=" + (desktops != null) +
+                        " meetingList=" + (meetingList != null) +
+                        " hand=" + (hand != null) +
+                        " button=" + (buttonEvent != null) +
+                        " participation=" + (participation != null) +
+                        " deviceInfo=" + (deviceInfo != null));
+                    PublishStatus(false, "X3 companion service is missing required characteristics.");
+                    ResetGattState();
+                    RestartAdvertisementWatcherIfNeeded("missing characteristics");
+                    return;
+                }
 
-            if (hostTeamsStateCharacteristic == null || hostMicrophoneStateCharacteristic == null ||
-                hostCameraStateCharacteristic == null || hostStatusMessageCharacteristic == null ||
-                hostMeetingStateCharacteristic == null || hostMeetingNameCharacteristic == null ||
-                hostDesktopStateCharacteristic == null || hostMeetingListCharacteristic == null ||
-                hostHandStateCharacteristic == null || buttonEventCharacteristic == null ||
-                participationCharacteristic == null || deviceInfoCharacteristic == null)
-            {
-                HostLog.Write("Required characteristic missing. teams=" + (hostTeamsStateCharacteristic != null) +
-                    " microphone=" + (hostMicrophoneStateCharacteristic != null) +
-                    " camera=" + (hostCameraStateCharacteristic != null) +
-                    " message=" + (hostStatusMessageCharacteristic != null) +
-                    " meeting=" + (hostMeetingStateCharacteristic != null) +
-                    " meetingName=" + (hostMeetingNameCharacteristic != null) +
-                    " desktops=" + (hostDesktopStateCharacteristic != null) +
-                    " hand=" + (hostHandStateCharacteristic != null) +
-                    " button=" + (buttonEventCharacteristic != null) +
-                    " participation=" + (participationCharacteristic != null) +
-                    " deviceInfo=" + (deviceInfoCharacteristic != null));
-                PublishStatus(false, "X3 companion service is missing required characteristics.");
-                ResetGattState();
-                RestartAdvertisementWatcherIfNeeded("missing characteristics");
-                return;
-            }
+                var protocolVersion = await ReadProtocolVersionAsync(deviceInfo);
+                if (!IsCurrentAttempt(generation))
+                {
+                    return;
+                }
 
-            var protocolVersion = await ReadProtocolVersionAsync(deviceInfoCharacteristic);
-            if (protocolVersion != CompanionProtocol.ProtocolVersion)
-            {
-                HostLog.Write("Protocol version mismatch. expected=" + CompanionProtocol.ProtocolVersion +
-                    " actual=" + (protocolVersion.HasValue ? protocolVersion.Value.ToString() : "unreadable"));
-                PublishStatus(false, "X3 companion protocol version mismatch.");
-                ResetGattState();
-                RestartAdvertisementWatcherIfNeeded("protocol mismatch");
-                return;
-            }
+                if (protocolVersion != CompanionProtocol.ProtocolVersion)
+                {
+                    HostLog.Write("Protocol version mismatch. expected=" + CompanionProtocol.ProtocolVersion +
+                        " actual=" + (protocolVersion.HasValue ? protocolVersion.Value.ToString() : "unreadable"));
+                    PublishStatus(false, "X3 companion protocol version mismatch.");
+                    ResetGattState();
+                    RestartAdvertisementWatcherIfNeeded("protocol mismatch");
+                    return;
+                }
 
-            HostLog.Write("Characteristic properties. teams=" + hostTeamsStateCharacteristic.CharacteristicProperties +
-                " microphone=" + hostMicrophoneStateCharacteristic.CharacteristicProperties +
-                " camera=" + hostCameraStateCharacteristic.CharacteristicProperties +
-                " message=" + hostStatusMessageCharacteristic.CharacteristicProperties +
-                " meeting=" + hostMeetingStateCharacteristic.CharacteristicProperties +
-                " meetingName=" + hostMeetingNameCharacteristic.CharacteristicProperties +
-                " desktops=" + hostDesktopStateCharacteristic.CharacteristicProperties +
-                " hand=" + hostHandStateCharacteristic.CharacteristicProperties +
-                " button=" + buttonEventCharacteristic.CharacteristicProperties +
-                " participation=" + participationCharacteristic.CharacteristicProperties +
-                " deviceInfo=" + deviceInfoCharacteristic.CharacteristicProperties +
-                " protocolVersion=" + protocolVersion.Value);
+                HostLog.Write("Characteristic properties. teams=" + teams.CharacteristicProperties +
+                    " microphone=" + microphone.CharacteristicProperties +
+                    " camera=" + camera.CharacteristicProperties +
+                    " message=" + message.CharacteristicProperties +
+                    " meeting=" + meeting.CharacteristicProperties +
+                    " meetingName=" + meetingName.CharacteristicProperties +
+                    " desktops=" + desktops.CharacteristicProperties +
+                    " hand=" + hand.CharacteristicProperties +
+                    " button=" + buttonEvent.CharacteristicProperties +
+                    " participation=" + participation.CharacteristicProperties +
+                    " deviceInfo=" + deviceInfo.CharacteristicProperties +
+                    " protocolVersion=" + protocolVersion.Value);
 
-            buttonEventCharacteristic.ValueChanged += OnButtonEventValueChanged;
-            var status = await buttonEventCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
-                GattClientCharacteristicConfigurationDescriptorValue.Notify);
-            HostLog.Write("Button event notification subscribe status=" + status);
-            if (status != GattCommunicationStatus.Success)
-            {
-                PublishStatus(false, "Could not subscribe to X3 button notifications.");
-                ResetGattState();
-                RestartAdvertisementWatcherIfNeeded("button subscribe failed");
-                return;
-            }
-
-            participationCharacteristic.ValueChanged += OnParticipationValueChanged;
-            var participationStatus =
-                await participationCharacteristic.WriteClientCharacteristicConfigurationDescriptorAsync(
+                buttonEvent.ValueChanged += OnButtonEventValueChanged;
+                buttonHandlerAdded = true;
+                var status = await buttonEvent.WriteClientCharacteristicConfigurationDescriptorAsync(
                     GattClientCharacteristicConfigurationDescriptorValue.Notify);
-            HostLog.Write("Participation notification subscribe status=" + participationStatus);
-            if (participationStatus != GattCommunicationStatus.Success)
+                HostLog.Write("Button event notification subscribe status=" + status);
+                if (!IsCurrentAttempt(generation))
+                {
+                    return;
+                }
+
+                if (status != GattCommunicationStatus.Success)
+                {
+                    PublishStatus(false, "Could not subscribe to X3 button notifications.");
+                    ResetGattState();
+                    RestartAdvertisementWatcherIfNeeded("button subscribe failed");
+                    return;
+                }
+
+                participation.ValueChanged += OnParticipationValueChanged;
+                participationHandlerAdded = true;
+                var participationStatus =
+                    await participation.WriteClientCharacteristicConfigurationDescriptorAsync(
+                        GattClientCharacteristicConfigurationDescriptorValue.Notify);
+                HostLog.Write("Participation notification subscribe status=" + participationStatus);
+                if (!IsCurrentAttempt(generation))
+                {
+                    return;
+                }
+
+                if (participationStatus != GattCommunicationStatus.Success)
+                {
+                    PublishStatus(false, "Could not subscribe to X3 sync notifications.");
+                    ResetGattState();
+                    RestartAdvertisementWatcherIfNeeded("participation subscribe failed");
+                    return;
+                }
+
+                if (buttonEventCharacteristic != null)
+                {
+                    buttonEventCharacteristic.ValueChanged -= OnButtonEventValueChanged;
+                }
+
+                if (participationCharacteristic != null)
+                {
+                    participationCharacteristic.ValueChanged -= OnParticipationValueChanged;
+                }
+
+                companionService?.Dispose();
+                companionService = service;
+                hostTeamsStateCharacteristic = teams;
+                hostMicrophoneStateCharacteristic = microphone;
+                hostCameraStateCharacteristic = camera;
+                hostStatusMessageCharacteristic = message;
+                hostMeetingStateCharacteristic = meeting;
+                hostHandStateCharacteristic = hand;
+                hostMeetingNameCharacteristic = meetingName;
+                hostDesktopStateCharacteristic = desktops;
+                hostMeetingListCharacteristic = meetingList;
+                buttonEventCharacteristic = buttonEvent;
+                participationCharacteristic = participation;
+                deviceInfoCharacteristic = deviceInfo;
+                adopted = true;
+                PublishStatus(true, "Connected to X3 companion.");
+            }
+            finally
             {
-                PublishStatus(false, "Could not subscribe to X3 sync notifications.");
-                ResetGattState();
-                RestartAdvertisementWatcherIfNeeded("participation subscribe failed");
-                return;
+                if (!adopted)
+                {
+                    if (buttonHandlerAdded)
+                    {
+                        buttonEvent.ValueChanged -= OnButtonEventValueChanged;
+                    }
+
+                    if (participationHandlerAdded)
+                    {
+                        participation.ValueChanged -= OnParticipationValueChanged;
+                    }
+
+                    service.Dispose();
+                    if (!IsCurrentAttempt(generation))
+                    {
+                        HostLog.Write("Abandoned GATT service setup discarded. generation=" + generation);
+                    }
+                }
+            }
+        }
+
+        private bool TryBeginConnect(out int generation)
+        {
+            generation = 0;
+            if (disposed || Interlocked.Exchange(ref connecting, 1) == 1)
+            {
+                return false;
             }
 
-            PublishStatus(true, "Connected to X3 companion.");
+            Interlocked.Exchange(ref connectStartedTicks, DateTime.UtcNow.Ticks);
+            generation = Interlocked.Increment(ref connectGeneration);
+            return true;
+        }
+
+        private bool IsCurrentAttempt(int generation)
+        {
+            return !disposed && Volatile.Read(ref connectGeneration) == generation;
         }
 
         private void OnScanWatchdogTick(object state)
         {
-            if (disposed || IsConnected() || connecting != 0)
+            if (disposed)
+            {
+                return;
+            }
+
+            if (connecting != 0)
+            {
+                // WinRT BLE calls can hang forever (radio off, device rebooted mid-handshake). Without
+                // this the connecting flag stays set and every scan/retry path stays disabled.
+                var startedUtc = new DateTime(Interlocked.Read(ref connectStartedTicks), DateTimeKind.Utc);
+                if (DateTime.UtcNow - startedUtc < ConnectAttemptTimeout)
+                {
+                    return;
+                }
+
+                var abandoned = Interlocked.Increment(ref connectGeneration) - 1;
+                HostLog.Write("BLE connect attempt did not finish within " + ConnectAttemptTimeout.TotalSeconds +
+                    " s; abandoning it. generation=" + abandoned);
+                ResetGattState();
+                Interlocked.Exchange(ref connecting, 0);
+                PublishStatus(false, "BLE connect attempt timed out; scanning again.");
+                EnsureScanningActive("connect timeout");
+                return;
+            }
+
+            if (IsConnected())
             {
                 return;
             }

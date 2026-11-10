@@ -2,6 +2,8 @@
 
 #include <esp_err.h>
 #include <esp_pm.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <cstdint>
 
@@ -74,3 +76,5 @@ void setPowerManagementMinFreqMhz(int mhz);
 int powerManagementMinFreqMhz();
 void setPmStatsDumpEnabled(bool enabled);
 bool pmStatsDumpIsEnabled();
+// The dump task blocks indefinitely while disabled; enabling wakes it.
+void setPmStatsDumpTask(TaskHandle_t task);

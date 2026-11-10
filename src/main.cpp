@@ -22,7 +22,6 @@
 #include "DisplayWorker.h"
 #include "Frontlight.h"
 #include "IsrInput.h"
-#include "InterruptStats.h"
 #include "LinkerQuirks.h"
 #include "PageManager.h"
 #include "PowerManagement.h"
@@ -45,29 +44,19 @@ uint32_t nextBatteryPollMs = 0;
 
 #if CONFIG_PM_PROFILING
 void pmStatsDumpTask(void*) {
-  InterruptStatsSnapshot previousInterruptStats;
   uint32_t previousTouchIrqCount = 0;
   uint32_t previousButtonIrqCount = 0;
   uint32_t previousEpdBusyIrqCount = 0;
   bool havePreviousInterruptStats = false;
   for (;;) {
-    vTaskDelay(pdMS_TO_TICKS(kPmStatsDumpPeriodMs));
+    // Sleeps indefinitely while disabled; setPmStatsDumpEnabled(true) wakes it.
+    ulTaskNotifyTake(pdTRUE, pmStatsDumpIsEnabled() ? pdMS_TO_TICKS(kPmStatsDumpPeriodMs) : portMAX_DELAY);
     if (!pmStatsDumpIsEnabled()) continue;
-    const InterruptStatsSnapshot interruptStats = copyInterruptStats();
     const uint32_t touchIrqCount = inputTouchInterruptCount();
     const uint32_t buttonIrqCount = inputButtonInterruptCount();
     const uint32_t epdBusyIrqCount = freeink::epdBusyInterruptCount();
     Serial.println("--- interrupt counters ---");
     Serial.printf("Input backend: %s\n", inputBackendName());
-    Serial.printf("FreeRTOS tick CPU0 total %lu delta +%lu; CPU1 total %lu delta +%lu\n",
-                  static_cast<unsigned long>(interruptStats.freertosTickCpu0),
-                  static_cast<unsigned long>(havePreviousInterruptStats
-                                                 ? interruptStats.freertosTickCpu0 - previousInterruptStats.freertosTickCpu0
-                                                 : 0),
-                  static_cast<unsigned long>(interruptStats.freertosTickCpu1),
-                  static_cast<unsigned long>(havePreviousInterruptStats
-                                                 ? interruptStats.freertosTickCpu1 - previousInterruptStats.freertosTickCpu1
-                                                 : 0));
     Serial.printf("X4 touch GPIO IRQ total %lu delta +%lu; button GPIO IRQ total %lu delta +%lu\n",
                   static_cast<unsigned long>(touchIrqCount),
                   static_cast<unsigned long>(havePreviousInterruptStats ? touchIrqCount - previousTouchIrqCount : 0),
@@ -75,7 +64,6 @@ void pmStatsDumpTask(void*) {
                   static_cast<unsigned long>(havePreviousInterruptStats ? buttonIrqCount - previousButtonIrqCount : 0));
     Serial.printf("EPD BUSY GPIO IRQ total %lu delta +%lu\n", static_cast<unsigned long>(epdBusyIrqCount),
                   static_cast<unsigned long>(havePreviousInterruptStats ? epdBusyIrqCount - previousEpdBusyIrqCount : 0));
-    previousInterruptStats = interruptStats;
     previousTouchIrqCount = touchIrqCount;
     previousButtonIrqCount = buttonIrqCount;
     previousEpdBusyIrqCount = epdBusyIrqCount;
@@ -108,8 +96,13 @@ void pmStatsDumpTask(void*) {
 }
 
 void startPmStatsDumpTask() {
-  const BaseType_t result = xTaskCreate(pmStatsDumpTask, "pm-stats", 4096, nullptr, 1, nullptr);
-  if (result != pdPASS) Serial.println("Failed to start PM stats dump task");
+  TaskHandle_t task = nullptr;
+  const BaseType_t result = xTaskCreate(pmStatsDumpTask, "pm-stats", 4096, nullptr, 1, &task);
+  if (result != pdPASS) {
+    Serial.println("Failed to start PM stats dump task");
+    return;
+  }
+  setPmStatsDumpTask(task);
 }
 #else
 void startPmStatsDumpTask() {}

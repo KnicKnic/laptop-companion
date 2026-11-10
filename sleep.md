@@ -58,6 +58,14 @@ implemented through linker fragments was silently ignored. `scripts/install_idf_
 the x4pro env) installs the generated `sections.ld` during the IDF phase. To force that phase after changing the
 script, change `custom_sdkconfig` or the `# TASMOTA__<hash>` first line of sdkconfig.defaults.
 
+**Building another environment wipes the custom libs.** The ESP-IDF libs are one shared package per machine.
+Building `xteink` reinstalls it, which silently puts stock esp32s3 libs back (PM off, dual core, RC slow clock).
+The x4pro hash in sdkconfig.defaults still matches, so pioarduino does not rebuild them, and the firmware then
+links without power management: auto light sleep never happens and the sleep stats stay 0 (a ` RC` on the RTC
+line is the tell). `scripts/install_idf_sections_ld.py` now fails the x4pro build when the linked libs lack any
+enabled `custom_sdkconfig` option. To fix it, change the `# TASMOTA__<hash>` line, build x4pro (20+ min), then
+restore the line.
+
 ### Instrumentation (`src/BtSleepTiming.*`, linker `--wrap` of esp_timer_create/start_once/stop and rtc_clk_cal)
 * **BTW line** (power stats page, serial, BLE): for every `btSlp`-scheduled wake, the margin between the CPU
   taking the `bt` lock and the controller's wake. `late` = margin < 0, `miss` = margin < -2.5ms (past the modem
@@ -76,8 +84,13 @@ script, change `custom_sdkconfig` or the `# TASMOTA__<hash>` first line of sdkco
 
 ### Testing
 1. Flash: `pio run -e x4pro -t upload` (set `PLATFORMIO_BUILD_DIR` to a short path such as `C:\pb` if the
-   worktree path is long; libsodium objects otherwise exceed Windows MAX_PATH).
-2. Stop laptop_host (or keep it and pass `--no-handshake`), then run the soak test from the repo root:
+   worktree path is long; libsodium objects otherwise exceed Windows MAX_PATH). If pio's output is piped or
+   redirected, also set `PYTHONUTF8=1`: otherwise esptool's Unicode progress bar crashes pio's output thread on a
+   cp1252 console, the pipe fills, and esptool hangs mid-write, leaving no bootable app (the bootloader keeps
+   rebooting with "No bootable app partitions"; flashing again recovers it).
+2. Stop laptop_host before running the soak test from the repo root. (`--no-handshake` alongside laptop_host is
+   unreliable: while the soak tool holds its GATT session, laptop_host's service rediscovery after any reconnect
+   fails with AccessDenied, it never subscribes, and the device drops it as a stale handshake every 15 s):
    `dotnet run --project ble_sleep_soak -- --minutes 60 --set "pm=1 als=1"`
    It connects like laptop_host, reads the `...0000f0` diagnostics characteristic every 30s, logs disconnects,
    and writes a `ble_sleep_soak_*.log`. The `pm/als/tune/rtcf` commands apply live and are not saved to SD.
@@ -136,7 +149,7 @@ script, change `custom_sdkconfig` or the `# TASMOTA__<hash>` first line of sdkco
   switch, PLL ramp to 240 MHz all at 10 MHz). The DFS floor is now 40 MHz (XTAL, no divider), as in IDF's
   BLE power-save example. Live A/B over BLE: `minf=10|20|40|80`.
 * The 15 s PM-stats dump task (formats PM/timer tables, writes to the dead USB console) costs ~0.3 ms of the
-  tail; `dump=0` disables it live.
+  tail. It is now off by default (the task blocks until enabled); `dump=1` turns it on live.
 * The 8MD256 calibration error (-600..+1000 ppm here, ~1 ms at 1.3 s sleeps) is invisible to these margins
   (esp_timer is corrected with the same calibration). `tune=1` keeps a guard for it; with `tune=0` the link held
   for 14 minutes but has no margin for it.
@@ -152,8 +165,13 @@ To use it day to day, turn on "Auto light sleep" on the Settings page (saved to 
 sleeping: twice it left the device unreachable (no advertising, no ROM response) until a manual reset.
 
 ### Possible follow-ups
-* Turn the PM-stats dump task and PM/esp_timer profiling off by default for normal use.
-* The companion BLE worker polls every 500 ms (~2 wakes/s, more than BLE itself); make it event-driven.
+* Done: the PM-stats dump task is off by default (`dump=1` enables it). Still open: turn PM/esp_timer
+  profiling (`CONFIG_PM_PROFILING`, `CONFIG_ESP_TIMER_PROFILING`) and the stats `--wrap` hooks off for normal use.
+* Done: the companion BLE worker is event-driven. It sleeps until its next deadline (pending-button settle,
+  participation pulse, handshake/responsive timeouts, 5 s advertising watchdog while disconnected) or until a
+  BLE event wakes it, instead of polling every 500 ms. Sleep diagnostics are built once per connection and
+  refreshed every 5 s once a client reads or writes the characteristic (the first read after connecting returns
+  the value built at connect time).
 * Debounce the X4 Pro power button (single `digitalRead` edge) in case a wake glitch caused the earlier
   "device unreachable" episodes.
 * Settings page: 11 rows fit with 16 px to spare on the 480x800 portrait layout and there is no scrolling;

@@ -127,7 +127,7 @@ class CompanionBleService {
   std::string formatActivityDeltaDiagnostics();
 
   void onHostConnected(uint16_t connHandle);
-  void onHostDisconnected();
+  void onHostDisconnected(uint16_t connHandle);
   void onConnParamsUpdated(uint16_t interval, uint16_t latency, uint16_t timeout);
   void onHostTeamsStateWritten(NimBLECharacteristic* characteristic);
   void onHostMeetingStateWritten(NimBLECharacteristic* characteristic);
@@ -142,6 +142,7 @@ class CompanionBleService {
   void onParticipationSubscribed(bool subscribed);
   void onDisconnectReason(int reason);
   void onSleepDiagnosticsCommand(const std::string& command);
+  void onSleepDiagnosticsRead();
 
  private:
   CompanionBleService() = default;
@@ -166,6 +167,8 @@ class CompanionBleService {
   void stopWorker();
   static void workerTrampoline(void* self);
   void workerLoop();
+  void wakeWorker();
+  unsigned long workerSleepMsLocked(unsigned long now) const;
   void publishSleepDiagnostics();
   void applyPendingSleepDiagnosticsCommand();
   void revertCommandedLightSleepIfLinkUnhealthy();
@@ -186,6 +189,11 @@ class CompanionBleService {
   NimBLECharacteristic* sleepDiagnosticsCharacteristic_ = nullptr;
   std::string pendingSleepDiagnosticsCommand_;
   unsigned long lastSleepDiagnosticsAtMs_ = 0;
+  // Set once a client reads or writes the sleep diagnostics characteristic on
+  // this connection; until then the value is only built once per connection.
+  bool sleepDiagnosticsActive_ = false;
+  // When the stale-handshake disconnect was last attempted (0 = not yet).
+  unsigned long staleHandshakeDisconnectAtMs_ = 0;
   int lastDisconnectReason_ = 0;
   uint32_t supervisionTimeouts_ = 0;
   // Safety net for live "als=1" commands: auto light sleep that was switched on
